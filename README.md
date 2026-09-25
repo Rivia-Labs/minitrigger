@@ -41,13 +41,47 @@ is lost — see [Operation](#operation).
 
 ## Install
 
+`minitrigger` isn't published to a registry. Install a `.tgz` from GitHub Releases (recommended) or
+straight from GitHub (works, but needs one opt-in on your side). Either way, `bullmq`, `ioredis` and
+`pg` are **peer dependencies** — never bundled — so install them alongside `minitrigger`.
+
+### Recommended: `.tgz` from GitHub Releases
+
 ```bash
-pnpm add minitrigger bullmq ioredis pg
+pnpm add https://github.com/<owner>/minitrigger/releases/download/vX.Y.Z/minitrigger-X.Y.Z.tgz \
+  bullmq ioredis pg
 pnpm add -D @types/pg   # optional, only needed if you use TypeScript
 ```
 
-`bullmq`, `ioredis` and `pg` are **peer dependencies** — you control their exact versions.
-Compatible ranges:
+A release tarball already contains the built `dist/` (`pnpm pack`'s `files: ["dist"]`), so nothing
+builds on install: no pnpm `allowBuilds` opt-in, and no fresh, possibly-differently-resolved
+`ioredis`/`msgpackr-extract` pulled in transitively just to run a build script. It's also pinned and
+reproducible — a fixed artifact per version, not "whatever `HEAD` currently contains." `pnpm
+check:pack` (see [Benchmark](#benchmark)) exercises exactly this pack → install → import path in CI.
+
+### Fallback: install straight from GitHub
+
+```bash
+pnpm add github:<owner>/minitrigger bullmq ioredis pg
+```
+
+`dist/` is `.gitignore`d and only produced by minitrigger's own `prepare` script, and pnpm 10+
+blocks a git dependency's lifecycle scripts by default — so a plain `pnpm add github:...` fails with
+`ERR_PNPM_GIT_DEP_PREPARE_NOT_ALLOWED` until you opt in, in **your own** `pnpm-workspace.yaml`:
+
+```yaml
+# your project's pnpm-workspace.yaml
+allowBuilds:
+  minitrigger@github.com/<owner>/minitrigger#<commit-or-tag>: true
+  msgpackr-extract: true # ioredis's optional native accelerator; blocked by the same pnpm mechanism
+```
+
+The `minitrigger@...` key must match the exact resolved git spec pnpm prints in its own
+`ERR_PNPM_GIT_DEP_PREPARE_NOT_ALLOWED` error (package name + normalized git URL + resolved commit) —
+copy it from that error rather than guessing, and expect to update it whenever you bump to a newer
+commit/tag. Full reproduction and reasoning: `docs/research/github-install.md`.
+
+### Peer dependencies & requirements
 
 | Package | Range |
 |---|---|
@@ -56,13 +90,8 @@ Compatible ranges:
 | `pg` | `^8.13.0` |
 | `@types/pg` | `^8.11.0` (optional peer — only needed because the public types reference `pg.Pool`) |
 
-Requires **Node >= 24**.
-
-<!-- TODO(phase 10): verify against implementation -->
-Installing directly from GitHub (`pnpm add github:you/minitrigger`) is expected to work since the
-package ships a `prepare` script that builds `dist`, but pnpm's handling of `prepare` scripts for
-git dependencies needs to be validated before relying on it; a `.tgz` published to GitHub Releases
-is the documented fallback.
+Also requires **Node >= 24**, **Postgres >= 13** (checked by `checkEnvironment`/`engine.start()`),
+and **Redis with `maxmemory-policy noeviction`** — see [Infrastructure](#infrastructure) below.
 
 ## Infrastructure
 
@@ -209,8 +238,10 @@ retry: {
 ```
 
 `type` is `"exponential"` (`baseMs * 2^(attempt - 1)`, capped at `maxMs`) or `"fixed"` (`baseMs`,
-capped at `maxMs`). Throwing `AbortTaskRunError` from inside a task (or a `step.run` callback)
-fails the run permanently — **no retry is scheduled**, regardless of `maxAttempts`.
+capped at `maxMs`). A task with no `retry` option defaults to `{ maxAttempts: 3, backoff: {
+type: "exponential", baseMs: 1_000, maxMs: 60_000 } }`. Throwing `AbortTaskRunError` from inside a
+task (or a `step.run` callback) fails the run permanently — **no retry is scheduled**, regardless
+of `maxAttempts`.
 
 ### `maxDurationMs`
 
@@ -302,6 +333,10 @@ interface Engine {
 	};
 }
 ```
+
+`payload` is required unless the task's `run` takes none (then it's optional and must be omitted
+or `undefined`) — the exact type is `PayloadArgs<TaskPayload<T>, [options?: TriggerOptions]>`, not
+the simplified `payload?` shown above.
 
 `TriggerOptions`: `{ idempotencyKey?: string; idempotencyKeyTtl?: Duration; delay?: Duration }`.
 
@@ -561,6 +596,17 @@ interface StepApi {
 - **Redis can be wiped.** After a `FLUSHALL` (or any lost job), the reconciler re-enqueues every
   run from Postgres within about `reconciler.graceMs + reconciler.intervalMs`.
 
+## Benchmark
+
+`pnpm bench` (`bench/run.ts`) runs against a disposable Postgres schema/Redis prefix and measures
+end-to-end throughput (1,000 runs of a 3-step task) and resume latency (sleep, token). Order of
+magnitude on a recent laptop: ~1.3k-1.4k runs/s throughput, ~50-100 ms sleep-resume p50, ~3-5 ms
+token-resume p50 — treat these as ballpark, not an SLA; see `CLAUDE.md` ("Benchmark") for the full
+methodology, machine and result table. `pnpm check:pack` builds, `pnpm pack`s and installs the
+resulting `.tgz` in a clean temp directory, confirming ESM `import`, CJS `require`, and a `tsc
+--strict` check against the shipped `.d.ts` all work — the same path a [GitHub Releases
+install](#install) exercises.
+
 ## Known limitations
 
 - **Lost-enqueue recovery latency.** A `trigger()` whose Redis enqueue is lost is only picked back
@@ -610,3 +656,19 @@ interface StepApi {
    `NestedStepError` — steps don't nest.
 8. **Move CPU-heavy work off the main thread.** Long synchronous work inside a step blocks the
    heartbeat and can look like a stall to the reconciler; use `worker_threads` for CPU-bound work.
+9. **Don't call steps after an `await` inside concurrent branches.** Steps are recorded in
+   **completion** order, not call order, once a branch keeps awaiting and calling more steps (e.g.
+   `Promise.all(items.map(async i => { await ctx.step.run(a); await ctx.step.run(b); }))`); that
+   order can differ between the original run and a replay and risks `NonDeterminismError`. Call
+   steps before any `await` in a branch, or run them sequentially instead.
+10. **A `void`/`undefined` step or task output is stored as `null`.** Don't rely on getting back
+    exactly `undefined` from a memoized `step.run` or from `runs.get(...).output` — it round-trips
+    as JSON `null`.
+11. **A genuinely generic task needs a cast at the call site.** `defineTask` infers `Payload`/
+    `Output` from `run`; a task typed `<T extends Json>` can't have `T` inferred from `trigger()`
+    alone.
+12. **`stop()` is at-least-once, not exactly-once.** A run still active past `shutdownTimeoutMs` is
+    handed back and retried without an attempt increment; a side effect that already happened
+    outside a memoized step may run again unless it's idempotent.
+13. **Missed cron ticks are not backfilled.** If every process is down when a scheduled tick would
+    have fired, that occurrence is skipped for good — it doesn't run late and doesn't accumulate.

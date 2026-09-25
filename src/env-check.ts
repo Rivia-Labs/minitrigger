@@ -12,9 +12,7 @@
  *   policy not `noeviction`, migrations pending while not auto-applied) **throws**
  *   {@link ConfigError} with an actionable message (what's wrong, how to fix it).
  *
- * This module is intentionally standalone: it does not import `./engine.js` and is not wired
- * into `createEngine`/`start()` yet (see the module-level doc comment on {@link checkEnvironment}
- * for the recommended integration point once another change wires it in).
+ * Called by `engine.start()` (see {@link checkEnvironment}); it does not import `./engine.js`.
  */
 
 import type { Pool } from "pg";
@@ -83,26 +81,9 @@ export interface CheckEnvironmentOptions {
  * every definitive failure found in this call. Warnings are still surfaced (via `logger.warn` and
  * the report) for checks that did *not* fail, even when another check throws.
  *
- * **Recommended integration point** (once wired into the engine, not done by this task): the
- * start of `engine.start()` in `src/engine.ts`, replacing/extending the existing
- * `transport.checkRedis()` call (`src/engine.ts` around line 620) which already runs before
- * `transport.startWorkers(...)` and already follows the "warn instead of throw" half of decision
- * 22 for the Redis check alone:
- *
- * ```ts
- * const report = await checkEnvironment({
- *   pool,
- *   redis: connections.shared(),
- *   schema: resolved.schema,
- *   logger,
- *   autoMigrate: false, // or a new StartOptions flag, if start() should call migrate() itself
- * });
- * for (const warning of report.warnings) logger.warn({ check: warning.check }, warning.message);
- * ```
- *
- * placed before `transport.startWorkers(...)` so a misconfigured environment fails fast, before
- * any worker starts pulling jobs. `transport.checkRedis()`/`checkRedisEvictionPolicy` keep working
- * standalone either way (this function only wraps them).
+ * Called by `engine.start()` before any worker starts, with `autoMigrate: false` (pending
+ * migrations fail fast and tell the user to call `engine.migrate()`). Also exported for callers
+ * that want to run the checks themselves (e.g. a readiness probe).
  */
 export async function checkEnvironment(options: CheckEnvironmentOptions): Promise<EnvCheckReport> {
 	const { pool, redis, schema, logger, autoMigrate = false, minPostgresVersionNum } = options;

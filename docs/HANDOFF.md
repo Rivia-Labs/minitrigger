@@ -56,7 +56,7 @@ O `RunNotifier` recebe `RunStatusInfo` dos resultados da store; teste `test/inte
 - Token que expirou sozinho numa run que depois terminou reporta `run_finished`.
 - Task que lança com steps ainda em voo não espera por eles (gravações tardias são rejeitadas pelo ownership).
 - Filtros de data de `runs.list` se chamam `createdFrom`/`createdTo` (spec não fixa nomes).
-- `step.run` com retorno em união precisa de genérico explícito (`ctx.step.run<T>(...)`): a inferência pelo guard `StepRunResult<T>` colapsa a união (visto no exemplo).
+- ✅ `step.run` com retorno em união agora infere sem genérico explícito.
 - Argumentos inválidos de step (fn não-função, duração inválida) ainda contam tentativa; só nome inválido é fatal.
 
 ## Como retomar
