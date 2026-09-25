@@ -176,9 +176,7 @@ const researchAgent = defineTask({
 	run: async (payload: { question: string }, ctx) => {
 		const history: ToolCallRecord[] = [];
 		for (let i = 0; i < MAX_AGENT_ITERATIONS; i++) {
-			const decision = await ctx.step.run<AgentDecision>(`llm-${i}`, () =>
-				fakeLlm(payload.question, history)
-			);
+			const decision = await ctx.step.run(`llm-${i}`, () => fakeLlm(payload.question, history));
 			if (decision.type === "final") {
 				return { answer: decision.answer, toolCalls: history.length };
 			}

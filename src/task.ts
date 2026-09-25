@@ -212,19 +212,41 @@ export type StepTriggerOptions = {
 };
 
 /**
- * A step's return value, guarded the same way as {@link defineTask}'s `P`/`O`
- * (an intersection that adds a required, differently-named property when `T`
- * isn't {@link Serializable}), but applied to `fn`'s **return** type instead
- * of a parameter: `T extends Serializable<T>` as a type parameter's own
- * constraint would work here too in principle (`T` is inferred from a
- * covariant position, so there's no contravariance issue), but TS rejects
- * that self-referential constraint outright (`TS2313: circular constraint`),
- * so the guard is applied at the return-type call site instead, exactly like
- * `defineTask`.
+ * Guard for `step.run`'s `fn` argument, checked the same way as
+ * {@link defineTask}'s `P`/`O` (an intersection that adds a required,
+ * differently-named property when `T` isn't {@link Serializable}) -- but
+ * intersected with `fn`'s own type instead of wrapping its **return** type
+ * (which is what this used to do, as `type StepRunResult<T> =
+ * [Serializable<T>] extends [T] ? T : T & { __stepOutputNotSerializable: ... }`,
+ * used in `fn: () => Promise<StepRunResult<T>> | StepRunResult<T>`).
+ *
+ * That older shape broke inference of `T` whenever `fn` returned a union
+ * (e.g. `{ kind: "a" } | { kind: "b" }`): every occurrence of the naked `T`
+ * was inside a conditional type instance (`StepRunResult<T>`), and TS
+ * doesn't reliably infer a naked type parameter from a union source through
+ * a conditional type's branches -- it collapsed to a single branch instead
+ * of the full union, forcing callers to write `step.run<Decision>(...)`
+ * explicitly (see `test/unit/task-types.test.ts`, "step.run: T inference").
+ *
+ * The fix: keep `T` inferred from a *plain* call signature, `() => T |
+ * Promise<T>` -- a naked `T` directly in a union, the ordinary/reliable
+ * inference shape -- and apply this guard as a second, structurally
+ * unrelated intersection member on `fn` itself. TS doesn't draw inference
+ * candidates for `T` from this second member (conditional-type positions
+ * aren't inference sites), so it never disturbs the inference above; it
+ * only performs a final assignability check once `T` is already resolved.
+ * A rejected `fn` fails because the actual function value passed at the
+ * call site never has the extra `__stepOutputNotSerializable` property this
+ * branch requires, exactly like `defineTask`'s options-object guard.
+ *
+ * (`T extends Serializable<T>` as the type parameter's own constraint would
+ * still work in principle here -- `T` is inferred from a covariant
+ * position, so there's no contravariance issue -- but TS rejects that
+ * self-referential constraint outright, `TS2313: circular constraint`.)
  */
-type StepRunResult<T> = [Serializable<T>] extends [T]
-	? T
-	: T & { readonly __stepOutputNotSerializable: Serializable<T> };
+type StepReturnGuard<T> = [Serializable<T>] extends [T]
+	? unknown
+	: { readonly __stepOutputNotSerializable: Serializable<T> };
 
 /** A child task's payload as accepted by `ctx.step.*` (checked for {@link Serializable}). */
 type StepPayload<T extends AnyTask> = [TaskPayload<T>] extends [NoPayload]
@@ -233,8 +255,13 @@ type StepPayload<T extends AnyTask> = [TaskPayload<T>] extends [NoPayload]
 
 /** Full type surface of `ctx.step`, implemented across Phases 4-5. */
 export type StepApi = {
-	/** `T` must be {@link Serializable} (`void` allowed). */
-	run<T>(name: string, fn: () => Promise<StepRunResult<T>> | StepRunResult<T>): Promise<T>;
+	/**
+	 * `T` is inferred from `fn`'s return type (unions included -- see
+	 * {@link StepReturnGuard}) or can be given explicitly
+	 * (`step.run<T>(name, fn)`); it must be {@link Serializable} (`void`
+	 * allowed).
+	 */
+	run<T>(name: string, fn: (() => T | Promise<T>) & StepReturnGuard<T>): Promise<T>;
 	sleep(name: string, duration: Duration): Promise<void>;
 	createToken(name: string, opts?: { timeout?: Duration }): Promise<TokenHandle>;
 	waitForToken<T = Json>(tokenOrName: TokenHandle | string): Promise<WaitResult<T>>;

@@ -179,6 +179,107 @@ describe("TaskScheduleOptions: schedule.payload required/Serializable when the t
 	});
 });
 
+describe("StepApi.run: T inference from fn's return type", () => {
+	type ToolName = "search" | "calculate";
+	type AgentDecision =
+		| { type: "tool_call"; tool: ToolName; args: string }
+		| { type: "final"; answer: string };
+
+	it("infers a union return type without an explicit generic (regression: used to collapse to one branch)", () => {
+		function useStep(step: StepApi) {
+			return step.run("decide", (): AgentDecision => ({ type: "final", answer: "x" }));
+		}
+		expectTypeOf(useStep).returns.toEqualTypeOf<Promise<AgentDecision>>();
+	});
+
+	it("infers a union return type from an async fn", () => {
+		function useStep(step: StepApi) {
+			return step.run(
+				"decide",
+				async (): Promise<AgentDecision> => ({ type: "final", answer: "x" })
+			);
+		}
+		expectTypeOf(useStep).returns.toEqualTypeOf<Promise<AgentDecision>>();
+	});
+
+	it("still accepts an explicit generic (equivalent, no longer necessary)", () => {
+		function useStep(step: StepApi) {
+			return step.run<AgentDecision>("decide", () => ({ type: "final", answer: "x" }));
+		}
+		expectTypeOf(useStep).returns.toEqualTypeOf<Promise<AgentDecision>>();
+	});
+
+	it("infers a plain (non-union) sync return type", () => {
+		function useStep(step: StepApi) {
+			return step.run("sync", () => 42);
+		}
+		expectTypeOf(useStep).returns.toEqualTypeOf<Promise<number>>();
+	});
+
+	it("infers a plain (non-union) async return type", () => {
+		function useStep(step: StepApi) {
+			return step.run("async", async () => "hi");
+		}
+		expectTypeOf(useStep).returns.toEqualTypeOf<Promise<string>>();
+	});
+
+	it("allows a void-returning fn (stored as null by the engine)", () => {
+		function useStep(step: StepApi) {
+			return step.run("void", async () => {});
+		}
+		expectTypeOf(useStep).returns.toEqualTypeOf<Promise<void>>();
+	});
+
+	it("rejects a Date return", () => {
+		function useStep(step: StepApi) {
+			// @ts-expect-error Date is not JSON-serializable
+			step.run("bad", () => new Date());
+		}
+		expectTypeOf(useStep).returns.toBeVoid();
+	});
+
+	it("rejects a function return", () => {
+		function useStep(step: StepApi) {
+			// @ts-expect-error functions are not JSON-serializable
+			step.run("bad", () => () => {});
+		}
+		expectTypeOf(useStep).returns.toBeVoid();
+	});
+
+	it("rejects a class instance return", () => {
+		class Point {
+			constructor(
+				public x: number,
+				public y: number
+			) {}
+			distanceToOrigin(): number {
+				return Math.hypot(this.x, this.y);
+			}
+		}
+		function useStep(step: StepApi) {
+			// @ts-expect-error class instance is not JSON-serializable
+			step.run("bad", () => new Point(1, 2));
+		}
+		expectTypeOf(useStep).returns.toBeVoid();
+	});
+
+	it("rejects a Map return", () => {
+		function useStep(step: StepApi) {
+			// @ts-expect-error Map is not JSON-serializable
+			step.run("bad", () => new Map([["a", 1]]));
+		}
+		expectTypeOf(useStep).returns.toBeVoid();
+	});
+
+	it("rejects a union return with one non-serializable branch", () => {
+		function useStep(step: StepApi) {
+			// @ts-expect-error one branch of the union is a Date
+			step.run("bad", (): { ok: true } | Date => ({ ok: true }));
+		}
+		expectTypeOf(useStep).returns.toBeVoid();
+	});
+});
+
 describe("engine.schedules.upsert: payload required/Serializable when the task requires one (fix 5)", () => {
 	const withPayload = defineTask({
 		id: "sched-upsert-with-payload",
