@@ -1,4 +1,4 @@
-// Consumer example for the `minitrigger` package.
+// Consumer example for the `@rivia-labs/minitrigger` package.
 // Only ever import from the package's public entry point — never internal paths.
 import { randomUUID } from "node:crypto";
 import {
@@ -10,7 +10,7 @@ import {
 	parseDuration,
 	type Run,
 	type RunHandle,
-} from "minitrigger";
+} from "@rivia-labs/minitrigger";
 
 // ---------------------------------------------------------------------------
 // Connection settings — override via env vars, default to `docker-compose.yml`.

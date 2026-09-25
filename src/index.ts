@@ -23,6 +23,7 @@ export {
 	type RunStep,
 	type StartOptions,
 	type SubscribeOptions,
+	type TransactionClient,
 	type TriggerOptions,
 } from "./engine.js";
 export {
@@ -66,16 +67,10 @@ export type {
 	WaitResult,
 } from "./task.js";
 export { defineTask } from "./task.js";
-export {
-	createTestEngine,
-	type InlineRunResult,
-	type PendingToken,
-	type TestClock,
-	type TestClockOptions,
-	type TestEngine,
-	type TestEngineConfig,
-	type TestEngineTokens,
-} from "./testing/index.js";
+// Test-mode (`createTestEngine`) lives at the `@rivia-labs/minitrigger/testing` subpath, not
+// here: it shares this entry's chunks (errors, engine core) under `splitting: true`, so
+// `instanceof NonDeterminismError` etc. still work for errors thrown by the testing entry, but a
+// consumer who never imports `/testing` doesn't pay for it in this entry's load time/size.
 export type { BackoffOptions, RetryOptions } from "./utils/backoff.js";
 export { type Duration, parseDuration } from "./utils/duration.js";
 export type { Json, Serializable } from "./utils/serialization.js";

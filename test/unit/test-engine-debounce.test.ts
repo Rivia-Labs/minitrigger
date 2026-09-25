@@ -5,16 +5,14 @@
  * row of the key directly in the memory store.
  */
 import { afterEach, describe, expect, it, vi } from "vitest";
-import {
-	ConfigError,
-	createTestEngine,
-	defineTask,
-	type EngineLogger,
-	type TestEngine,
-	type TestEngineConfig,
-} from "../../src/index.js";
+import { ConfigError, defineTask, type EngineLogger } from "../../src/index.js";
 import * as memoryStoreModule from "../../src/store/memory/index.js";
 import type { Store } from "../../src/store/types.js";
+import {
+	createTestEngine,
+	type TestEngine,
+	type TestEngineConfig,
+} from "../../src/testing/index.js";
 
 const quietLogger: EngineLogger = { debug() {}, info() {}, warn() {}, error() {} };
 const engines: TestEngine[] = [];

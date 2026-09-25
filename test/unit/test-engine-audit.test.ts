@@ -4,15 +4,12 @@
  * shared with the real engine (low a).
  */
 import { afterEach, describe, expect, it } from "vitest";
+import { ConfigError, defineTask, type EngineLogger, MinitriggerError } from "../../src/index.js";
 import {
-	ConfigError,
 	createTestEngine,
-	defineTask,
-	type EngineLogger,
-	MinitriggerError,
 	type TestEngine,
 	type TestEngineConfig,
-} from "../../src/index.js";
+} from "../../src/testing/index.js";
 import { createMemoryStreams } from "../../src/testing/memory-pubsub.js";
 
 const quietLogger: EngineLogger = {

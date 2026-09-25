@@ -1,19 +1,22 @@
 /**
  * Phase 9.2 acceptance: testing a user's task code with `createTestEngine`, no Redis and no
  * Postgres (runs in the `unit` project, without docker). Written the way a user would, importing
- * only the public entry point.
+ * only the two public entry points (`createTestEngine` from `./testing/index.js`, everything else
+ * from the main entry).
  */
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
 	ConfigError,
-	createTestEngine,
 	defineTask,
 	type EngineLogger,
 	TaskNotRegisteredError,
-	type TestEngine,
-	type TestEngineConfig,
 } from "../../src/index.js";
 import * as registryModule from "../../src/registry.js";
+import {
+	createTestEngine,
+	type TestEngine,
+	type TestEngineConfig,
+} from "../../src/testing/index.js";
 
 const warnings: string[] = [];
 const quietLogger: EngineLogger = {

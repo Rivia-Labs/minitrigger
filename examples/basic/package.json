@@ -9,7 +9,7 @@
     "start": "node --experimental-strip-types src/index.ts && node src/cjs-check.cjs"
   },
   "dependencies": {
-    "minitrigger": "file:../..",
+    "@rivia-labs/minitrigger": "file:../..",
     "bullmq": "^6.3.0",
     "ioredis": "^5.11.1",
     "pg": "^8.13.0"

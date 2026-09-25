@@ -1,7 +1,7 @@
-// Validates that the CJS build of `minitrigger` is usable via require().
+// Validates that the CJS build of `@rivia-labs/minitrigger` is usable via require().
 "use strict";
 
-const { parseDuration } = require("minitrigger");
+const { parseDuration } = require("@rivia-labs/minitrigger");
 
 if (typeof parseDuration !== "function") {
 	console.error(`CJS check failed: parseDuration is not a function (got ${typeof parseDuration})`);
@@ -14,4 +14,6 @@ if (ms !== 5 * 60_000) {
 	process.exit(1);
 }
 
-console.log('CJS check passed: require("minitrigger") works and parseDuration is a function');
+console.log(
+	'CJS check passed: require("@rivia-labs/minitrigger") works and parseDuration is a function'
+);

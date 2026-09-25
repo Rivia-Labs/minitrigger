@@ -5,15 +5,17 @@
 import { afterEach, describe, expect, it } from "vitest";
 import {
 	ConfigError,
-	createTestEngine,
 	defineTask,
 	type EngineLogger,
 	MinitriggerError,
 	type RunEvent,
 	type RunStatusUpdate,
+} from "../../src/index.js";
+import {
+	createTestEngine,
 	type TestEngine,
 	type TestEngineConfig,
-} from "../../src/index.js";
+} from "../../src/testing/index.js";
 import { createMemoryTransport } from "../../src/testing/memory-transport.js";
 
 const logged: { level: string; message: string }[] = [];

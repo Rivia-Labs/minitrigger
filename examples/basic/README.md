@@ -1,9 +1,9 @@
 # examples/basic
 
-A real consumer project for `minitrigger`, installed the way an end user would
-(`"minitrigger": "file:../.."`), not a workspace package of the library.
-`src/index.ts` only ever imports from `"minitrigger"` (the package's public
-entry point) — never an internal path.
+A real consumer project for `@rivia-labs/minitrigger`, installed the way an end
+user would (`"@rivia-labs/minitrigger": "file:../.."`), not a workspace package
+of the library. `src/index.ts` only ever imports from `"@rivia-labs/minitrigger"`
+(the package's public entry point) — never an internal path.
 
 ## What it demonstrates
 
