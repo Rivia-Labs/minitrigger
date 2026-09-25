@@ -43,7 +43,15 @@ describe("migrate()", () => {
 		);
 
 		expect(rows.map(row => row.tablename)).toEqual(
-			["idempotency_keys", "run_logs", "runs", "schema_migrations", "steps", "waitpoints"].sort()
+			[
+				"idempotency_keys",
+				"run_logs",
+				"runs",
+				"schedules",
+				"schema_migrations",
+				"steps",
+				"waitpoints",
+			].sort()
 		);
 	});
 

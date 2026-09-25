@@ -103,10 +103,34 @@ snapshot by `step_name`: the step name for child/batch, the name without `#wait`
   SELECT * FROM unnest($1::uuid[], $2::text[], $3::text[], $4::jsonb[], $5::timestamptz[])` with
   `coalesce(ts, now())`. `list`: `WHERE run_id AND id > $after ORDER BY id LIMIT n`.
 
+## ScheduleStore
+
+| Method | Decision | SQL shape |
+|---|---|---|
+| `upsert` | 8, 21 | One tx: `SELECT cron, timezone FROM schedules WHERE id=$1 FOR UPDATE` (locks any existing row against a concurrent upsert of the same id), then `INSERT ... ON CONFLICT (id) DO UPDATE SET task_id, cron, timezone, payload, source, updated_at=now() RETURNING *`. `created` = no row found by the SELECT; `cronChanged`/`timezoneChanged` compare the new input against that row (both true when `created`). Never `xmax`. |
+| `delete` | 21 | `DELETE FROM schedules WHERE id=$1`; `rowCount > 0`. |
+| `get` | 8 | Plain lookup by `id`. |
+| `list` | 8 | `[WHERE source=$1] ORDER BY id`; `listDeclarative()` = `list({ source: 'declarative' })`. |
+| `deleteDeclarativeExcept` | 21 | `DELETE FROM schedules WHERE source='declarative' AND NOT (id = ANY($1::text[]))`; an empty `ids` deletes every declarative schedule (`id = ANY('{}')` is false for every row, so `NOT (...)` is true for all). `api` schedules are never touched. Returns the deleted count. |
+
+`id` is validated (`^[a-zA-Z0-9_.-]{1,128}$`, no `:`) by `upsert` only -- the write path that
+introduces new ids; `get`/`delete`/`list` accept any string (a non-matching id just isn't found).
+Postgres is authoritative for `cron`/`timezone`/`payload` (decision 8): the `-system` tick handler
+(engine-owned, not this store) always reads them fresh instead of trusting the BullMQ job
+scheduler's own copy, and ticks create runs through `RunStore.create` with idempotency key
+`__schedule:${id}:${ts}` and `ttlMs: null` -- that flow is the engine's, not `ScheduleStore`'s.
+
 ## Schema assumptions for 001_init.sql
 
 `steps.run_id`, `waitpoints.run_id`, `run_logs.run_id` reference `runs(id) ON DELETE CASCADE`
 (retention relies on it). `pending_count` is NULL for `token`/`child_run`.
+
+## Schema assumptions for 002_schedules.sql
+
+`schedules.task_id` is plain `text`, NOT a foreign key: tasks are registered in application code
+(`defineTask`), not in a database table. `schedules.id` has no length/charset CHECK constraint --
+`ScheduleStore.upsert` enforces the id shape in application code, matching how `runs.task_id` and
+other id-shaped columns are validated outside the schema throughout this store.
 
 ## TODO
 

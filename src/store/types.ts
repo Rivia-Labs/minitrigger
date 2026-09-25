@@ -660,9 +660,82 @@ export interface LogStore {
 // Schedules (Phase 8)
 // ---------------------------------------------------------------------------
 
-// TODO(phase 8): `ScheduleStore` (upsert/delete/get/list over a `schedules`
-// table added by a new migration). Ticks create runs through RunStore.create
-// with key `__schedule:${id}:${ts}` and `ttlMs: null`.
+/** Distinguishes schedules declared via `engine.schedules.upsert()` from ones synced from `defineTask({ schedule })`. */
+export type ScheduleSource = "api" | "declarative";
+
+/** One row of `schedules`. Postgres is authoritative (decision 8): the tick handler always reads
+ * `cron`/`timezone`/`payload` from here, never trusts the BullMQ job scheduler's own copy. */
+export interface ScheduleRecord {
+	id: string;
+	taskId: string;
+	cron: string;
+	timezone: string | null;
+	payload: Json | null;
+	source: ScheduleSource;
+	createdAt: Date;
+	updatedAt: Date;
+}
+
+export interface NewSchedule {
+	/** Chosen by the caller; validated as `^[a-zA-Z0-9_.-]{1,128}$` (no `:`; decision 7's spirit --
+	 * it is embedded in the idempotency key `__schedule:${id}:${ts}` and used as the BullMQ job
+	 * scheduler id). */
+	id: string;
+	taskId: string;
+	cron: string;
+	timezone: string | null;
+	payload: Json | null;
+	source: ScheduleSource;
+}
+
+export interface UpsertScheduleResult {
+	schedule: ScheduleRecord;
+	/** True when this call inserted a new row (no previous `cron`/`timezone` to compare against). */
+	created: boolean;
+	/** True when `cron` differs from what was previously stored; always true when `created`. */
+	cronChanged: boolean;
+	/** True when `timezone` differs from what was previously stored; always true when `created`. */
+	timezoneChanged: boolean;
+}
+
+export interface ListSchedulesFilter {
+	source?: ScheduleSource;
+}
+
+/**
+ * Schedules (Phase 8, decisions 8 and 21). Ticks create runs through {@link RunStore.create} with
+ * idempotency key `__schedule:${id}:${ts}` and `ttlMs: null`; that flow lives in the engine, not
+ * here. `id` is validated by every method that can introduce a new one ({@link upsert}); `get`,
+ * `delete` and `list` accept any string (a non-matching id simply won't be found).
+ */
+export interface ScheduleStore {
+	/**
+	 * Insert-or-replace by `id` (single statement `ON CONFLICT (id) DO UPDATE`, inside one
+	 * transaction that first reads the previous `cron`/`timezone` to compute the `*Changed` flags).
+	 * The caller (engine) uses those flags to decide whether the BullMQ job scheduler needs a
+	 * matching `upsertJobScheduler` call.
+	 */
+	upsert(input: NewSchedule): Promise<UpsertScheduleResult>;
+
+	/** True if a row with `id` existed and was deleted. */
+	delete(id: string): Promise<boolean>;
+
+	get(id: string): Promise<ScheduleRecord | null>;
+
+	/** All schedules, optionally filtered by `source`, ordered by `id`. */
+	list(filter?: ListSchedulesFilter): Promise<ScheduleRecord[]>;
+
+	/** Shorthand for `list({ source: "declarative" })`. */
+	listDeclarative(): Promise<ScheduleRecord[]>;
+
+	/**
+	 * `pruneDeclarative` (decision 21): deletes every `source = 'declarative'` schedule whose `id`
+	 * is not in `ids` (the ones `defineTask({ schedule })` currently declares across the engine's
+	 * registered tasks). An empty `ids` deletes every declarative schedule. Never touches `api`
+	 * schedules. Returns the number of rows deleted.
+	 */
+	deleteDeclarativeExcept(ids: readonly string[]): Promise<number>;
+}
 
 // ---------------------------------------------------------------------------
 // Store and transactions
@@ -675,6 +748,7 @@ export interface StoreTx {
 	waitpoints: WaitpointStore;
 	idempotency: IdempotencyStore;
 	logs: LogStore;
+	schedules: ScheduleStore;
 }
 
 /** Repositories bound to the pool, plus the transaction entry point. */
@@ -684,6 +758,7 @@ export interface Store {
 	waitpoints: WaitpointStore;
 	idempotency: IdempotencyStore;
 	logs: LogStore;
+	schedules: ScheduleStore;
 	/**
 	 * Runs `fn` in one transaction: COMMIT if it resolves, ROLLBACK and rethrow if it
 	 * rejects; the client is always released. `tx` must not be used after `fn`

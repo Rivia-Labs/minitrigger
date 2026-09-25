@@ -5,6 +5,7 @@ import { createSqlContext, type SqlExecutor } from "./db.js";
 import { createIdempotencyStore } from "./idempotency.js";
 import { createLogStore } from "./logs.js";
 import { createRunStore } from "./runs.js";
+import { createScheduleStore } from "./schedules.js";
 import { createStepStore } from "./steps.js";
 import { createWaitpointStore } from "./waitpoints.js";
 
@@ -27,6 +28,7 @@ export function createSqlStore(pool: Pool, schema: string): Store {
 		waitpoints: createWaitpointStore(poolExec, ctx),
 		idempotency: createIdempotencyStore(poolExec, ctx),
 		logs: createLogStore(poolExec, ctx),
+		schedules: createScheduleStore(poolExec, ctx),
 
 		async withTransaction<T>(fn: (tx: StoreTx) => Promise<T>): Promise<T> {
 			const client = await pool.connect();
@@ -40,6 +42,7 @@ export function createSqlStore(pool: Pool, schema: string): Store {
 					waitpoints: createWaitpointStore(txExec, ctx),
 					idempotency: createIdempotencyStore(txExec, ctx),
 					logs: createLogStore(txExec, ctx),
+					schedules: createScheduleStore(txExec, ctx),
 				};
 
 				const result = await fn(tx);

@@ -19,7 +19,8 @@ export type TableName =
 	| "waitpoints"
 	| "idempotency_keys"
 	| "run_logs"
-	| "schema_migrations";
+	| "schema_migrations"
+	| "schedules";
 
 export function createSqlContext(schema: string): SqlContext {
 	const escaped = escapeIdentifier(schema);
