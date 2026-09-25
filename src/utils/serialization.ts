@@ -135,7 +135,9 @@ export function assertSerializable(
 	const bytes = Buffer.byteLength(json, "utf8");
 	if (bytes > opts.maxBytes) {
 		throw new SerializationError(
-			`${opts.label} is ${formatBytes(bytes)}, exceeding the configured size limit (${formatBytes(opts.maxBytes)})`
+			`${opts.label} is ${formatBytes(bytes)}, exceeding the configured size limit ` +
+				`(${formatBytes(opts.maxBytes)}); reduce its size or raise the corresponding ` +
+				"engine limit (config.limits)"
 		);
 	}
 	return bytes;
@@ -158,31 +160,41 @@ function findSerializationProblem(
 			return undefined;
 		case "number":
 			if (Number.isNaN(value))
-				return `${describePath(path)} is NaN, which is not JSON-serializable`;
+				return `${describePath(path)} is NaN, which is not JSON-serializable; use a finite number`;
 			if (!Number.isFinite(value))
-				return `${describePath(path)} is Infinity, which is not JSON-serializable`;
+				return `${describePath(path)} is Infinity, which is not JSON-serializable; use a finite number`;
 			return undefined;
 		case "undefined":
-			return `${describePath(path)} is undefined`;
+			return path === ""
+				? `${describePath(path)} is undefined; pass an actual value, or \`null\``
+				: `${describePath(path)} is undefined; arrays can't contain undefined elements, use \`null\` instead`;
 		case "bigint":
-			return `${describePath(path)} is a bigint`;
+			return `${describePath(path)} is a bigint, which is not JSON-serializable; convert it to a number or string`;
 		case "symbol":
-			return `${describePath(path)} is a symbol`;
+			return `${describePath(path)} is a symbol, which is not JSON-serializable`;
 		case "function":
-			return `${describePath(path)} is a function`;
+			return `${describePath(path)} is a function, which is not JSON-serializable`;
 		default:
 			break;
 	}
 
 	const obj = value as object;
 
-	if (obj instanceof Date) return `${describePath(path)} is a Date`;
-	if (obj instanceof Map) return `${describePath(path)} is a Map`;
-	if (obj instanceof Set) return `${describePath(path)} is a Set`;
-	if (obj instanceof RegExp) return `${describePath(path)} is a RegExp`;
+	if (obj instanceof Date) {
+		return `${describePath(path)} is a Date, which is not JSON-serializable; convert it to an ISO string (\`date.toISOString()\`)`;
+	}
+	if (obj instanceof Map) {
+		return `${describePath(path)} is a Map, which is not JSON-serializable; convert it to a plain object or an array of [key, value] entries`;
+	}
+	if (obj instanceof Set) {
+		return `${describePath(path)} is a Set, which is not JSON-serializable; convert it to an array`;
+	}
+	if (obj instanceof RegExp) {
+		return `${describePath(path)} is a RegExp, which is not JSON-serializable; convert it to a string`;
+	}
 
 	if (ancestors.has(obj)) {
-		return `${describePath(path)} contains a circular reference`;
+		return `${describePath(path)} contains a circular reference; remove the cycle before passing it in (e.g. store an id instead of the object)`;
 	}
 
 	if (Array.isArray(obj)) {
@@ -202,7 +214,7 @@ function findSerializationProblem(
 	if (proto !== null && proto !== Object.prototype) {
 		const ctor = (obj as { constructor?: { name?: string } }).constructor;
 		const label = ctor?.name !== undefined && ctor.name.length > 0 ? ctor.name : "class";
-		return `${describePath(path)} is a ${label} instance, which is not JSON-serializable; use a plain object`;
+		return `${describePath(path)} is a ${label} instance, which is not JSON-serializable; use a plain object (e.g. spread its fields with { ...value })`;
 	}
 
 	ancestors.add(obj);
@@ -240,10 +252,10 @@ function describePath(path: string): string {
  */
 function findStringProblem(value: string, describe: () => string): string | undefined {
 	if (value.includes("\u0000")) {
-		return `${describe()} contains a NUL byte (U+0000), which Postgres jsonb rejects`;
+		return `${describe()} contains a NUL byte (U+0000), which Postgres jsonb rejects; remove or replace it`;
 	}
 	if (!value.isWellFormed()) {
-		return `${describe()} is not well-formed Unicode (contains an unpaired surrogate), which Postgres jsonb rejects`;
+		return `${describe()} is not well-formed Unicode (contains an unpaired surrogate), which Postgres jsonb rejects; remove or replace the invalid character`;
 	}
 	return undefined;
 }

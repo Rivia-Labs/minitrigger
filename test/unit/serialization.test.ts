@@ -70,6 +70,9 @@ describe("assertSerializable", () => {
 		expect(() => assertSerializable(new Point(1, 2), { label: "output", maxBytes: 1_000 })).toThrow(
 			SerializationError
 		);
+		expect(() => assertSerializable(new Point(1, 2), { label: "output", maxBytes: 1_000 })).toThrow(
+			/is a Point instance, which is not JSON-serializable; use a plain object/
+		);
 	});
 
 	it("reports a precise nested path for the offending field", () => {
@@ -81,11 +84,35 @@ describe("assertSerializable", () => {
 		).toThrow(/output of step "llm" is not serializable: field `data\.date` is a Date/);
 	});
 
-	it("detects circular references", () => {
+	it("tells the caller how to fix each non-serializable leaf type", () => {
+		expect(() => assertSerializable(new Date(), { label: "output", maxBytes: 1_000 })).toThrow(
+			/is a Date, which is not JSON-serializable; convert it to an ISO string/
+		);
+		expect(() => assertSerializable(new Map(), { label: "output", maxBytes: 1_000 })).toThrow(
+			/is a Map, which is not JSON-serializable; convert it to a plain object or an array/
+		);
+		expect(() => assertSerializable(new Set(), { label: "output", maxBytes: 1_000 })).toThrow(
+			/is a Set, which is not JSON-serializable; convert it to an array/
+		);
+		expect(() => assertSerializable(/x/, { label: "output", maxBytes: 1_000 })).toThrow(
+			/is a RegExp, which is not JSON-serializable; convert it to a string/
+		);
+		expect(() => assertSerializable(10n, { label: "output", maxBytes: 1_000 })).toThrow(
+			/is a bigint, which is not JSON-serializable; convert it to a number or string/
+		);
+		expect(() => assertSerializable(Number.NaN, { label: "output", maxBytes: 1_000 })).toThrow(
+			/is NaN, which is not JSON-serializable; use a finite number/
+		);
+		expect(() =>
+			assertSerializable([1, undefined, 3], { label: "output", maxBytes: 1_000 })
+		).toThrow(/is undefined; arrays can't contain undefined elements, use `null` instead/);
+	});
+
+	it("detects circular references and suggests a fix", () => {
 		const obj: Record<string, unknown> = { a: 1 };
 		obj.self = obj;
 		expect(() => assertSerializable(obj, { label: "output", maxBytes: 1_000 })).toThrow(
-			/circular reference/
+			/circular reference; remove the cycle before passing it in/
 		);
 	});
 
@@ -100,6 +127,9 @@ describe("assertSerializable", () => {
 		const big = { data: "x".repeat(2_000) };
 		expect(() => assertSerializable(big, { label: 'payload of task "x"', maxBytes: 100 })).toThrow(
 			/payload of task "x" is .+ exceeding the configured size limit/
+		);
+		expect(() => assertSerializable(big, { label: 'payload of task "x"', maxBytes: 100 })).toThrow(
+			/reduce its size or raise the corresponding engine limit \(config\.limits\)/
 		);
 	});
 

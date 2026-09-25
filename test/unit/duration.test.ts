@@ -42,5 +42,23 @@ describe("parseDuration", () => {
 		const huge400Digits = `${"9".repeat(400)}w`;
 		expect(() => parseDuration(huge400Digits as never)).toThrow(ConfigError);
 		expect(() => parseDuration(huge400Digits as never)).toThrow(/invalid duration/);
+		expect(() => parseDuration(huge400Digits as never)).toThrow(/overflows to Infinity/);
+	});
+
+	it("lists the accepted formats when a string is malformed", () => {
+		expect(() => parseDuration("five minutes" as never)).toThrow(
+			/expected a number of milliseconds, or a string like "500ms", "5s", "5m", "1\.5h", "2d" or "1w"/
+		);
+	});
+
+	it("truncates a very long malformed string instead of echoing it in full", () => {
+		const huge = `${"x".repeat(5_000)}` as never;
+		try {
+			parseDuration(huge);
+			expect.unreachable();
+		} catch (err) {
+			const message = (err as Error).message;
+			expect(message.length).toBeLessThan(300);
+		}
 	});
 });

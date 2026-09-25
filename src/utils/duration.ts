@@ -1,4 +1,5 @@
 import { ConfigError } from "../errors.js";
+import { truncateUtf8 } from "./error-format.js";
 
 /**
  * A duration expressed either as a number of milliseconds, or as a string
@@ -59,24 +60,32 @@ export function parseDuration(duration: Duration): number {
 	if (typeof duration === "number") {
 		if (!Number.isFinite(duration) || duration < 0) {
 			throw new ConfigError(
-				`invalid duration: ${duration} (numeric durations must be finite and >= 0)`
+				`invalid duration: ${duration} (numeric durations are milliseconds and must be ` +
+					"finite and >= 0)"
 			);
 		}
 		return Math.round(duration);
 	}
 
+	const echoed = truncateUtf8(duration, 100);
 	const match = DURATION_PATTERN.exec(duration);
 	const amount = match?.[1];
 	const unit = match?.[2];
 	if (!match || amount === undefined || unit === undefined || !isDurationUnit(unit)) {
-		throw new ConfigError(`invalid duration: "${duration}" (use ms, s, m, h, d or w)`);
+		throw new ConfigError(
+			`invalid duration: "${echoed}" (expected a number of milliseconds, or a string like ` +
+				'"500ms", "5s", "5m", "1.5h", "2d" or "1w")'
+		);
 	}
 
 	const ms = Number(amount) * unitToMs(unit);
 	if (!Number.isFinite(ms)) {
 		// A numeric string with enough digits (e.g. hundreds of digits) still matches
 		// `DURATION_PATTERN`, but `Number(amount)` overflows to `Infinity`.
-		throw new ConfigError(`invalid duration: "${duration}" (numeric part is too large)`);
+		throw new ConfigError(
+			`invalid duration: "${echoed}" (the numeric part overflows to Infinity; use a smaller ` +
+				"number or a bigger unit)"
+		);
 	}
 
 	return Math.round(ms);

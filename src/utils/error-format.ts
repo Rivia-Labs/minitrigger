@@ -66,6 +66,28 @@ function describeNonError(value: unknown): string {
 }
 
 /**
+ * Describes an arbitrary value for a user-facing error message ("got ${describeOffendingValue(x)}").
+ * Primitives are shown directly (strings quoted and UTF-8-truncated, so a huge or binary string
+ * can never blow up the message or dump megabytes into a log); anything else (object, array,
+ * function, ...) collapses to a short type description instead of `String(value)`, which for a
+ * plain object silently produces the useless `"[object Object]"` and for an array or class
+ * instance could interpolate arbitrary nested content -- including, for something like an
+ * accidentally-passed connection object, values the message must never echo.
+ */
+export function describeOffendingValue(value: unknown, maxStringBytes = 200): string {
+	if (value === null) return "null";
+	if (value === undefined) return "undefined";
+	if (typeof value === "string") return JSON.stringify(truncateUtf8(value, maxStringBytes));
+	if (typeof value === "number" || typeof value === "boolean" || typeof value === "bigint") {
+		return String(value);
+	}
+	if (Array.isArray(value)) return "an array";
+	if (typeof value === "function") return "a function";
+	if (typeof value === "symbol") return "a symbol";
+	return "an object";
+}
+
+/**
  * Truncates `text` to at most `maxBytes` UTF-8 bytes, in O(n): a single `Buffer` encode/cut/
  * decode, rather than the previous approach of shrinking a JS-string slice one UTF-16 code unit
  * at a time and re-measuring its UTF-8 byte length on every step (O(n^2) for a long string with

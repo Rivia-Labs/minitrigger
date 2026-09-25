@@ -10,6 +10,7 @@ import { ConfigError } from "./errors.js";
 import type { LogLevel } from "./store/types.js";
 import type { AnyTask } from "./task.js";
 import { type Duration, parseDuration } from "./utils/duration.js";
+import { describeOffendingValue } from "./utils/error-format.js";
 import { validateSqlIdentifier } from "./utils/identifiers.js";
 
 /**
@@ -184,12 +185,18 @@ export const defaultLogger: EngineLogger = {
 /** Validates `config` and returns it with every default applied. Throws {@link ConfigError}. */
 export function resolveConfig(config: EngineConfig): ResolvedConfig {
 	if (config === null || typeof config !== "object") {
-		throw new ConfigError("createEngine: config must be an object");
+		throw new ConfigError(
+			`createEngine(config): config must be an object with { postgres, redis, tasks }, got ` +
+				describeOffendingValue(config)
+		);
 	}
 	validateConnection("postgres", config.postgres, "pool");
 	validateConnection("redis", config.redis, "connection");
 	if (!Array.isArray(config.tasks)) {
-		throw new ConfigError("config.tasks must be an array of tasks created with defineTask()");
+		throw new ConfigError(
+			"config.tasks must be an array of tasks created with defineTask(), got " +
+				describeOffendingValue(config.tasks)
+		);
 	}
 
 	const schema = validateSqlIdentifier("schema", config.schema ?? DEFAULTS.schema);
@@ -211,7 +218,8 @@ export function resolveConfig(config: EngineConfig): ResolvedConfig {
 	if (heartbeatIntervalMs >= stallTimeoutMs) {
 		throw new ConfigError(
 			`heartbeatIntervalMs (${heartbeatIntervalMs}) must be smaller than stallTimeoutMs ` +
-				`(${stallTimeoutMs}), otherwise every healthy run would look stalled`
+				`(${stallTimeoutMs}), otherwise every healthy run would look stalled; lower ` +
+				"heartbeatIntervalMs or raise stallTimeoutMs"
 		);
 	}
 	const shutdownTimeoutMs = assertTimerMs(
@@ -235,7 +243,7 @@ export function resolveConfig(config: EngineConfig): ResolvedConfig {
 		config.schedules?.pruneDeclarative ?? DEFAULTS.schedules.pruneDeclarative;
 	if (typeof pruneDeclarative !== "boolean") {
 		throw new ConfigError(
-			`schedules.pruneDeclarative must be a boolean, got ${String(pruneDeclarative)}`
+			`schedules.pruneDeclarative must be a boolean, got ${describeOffendingValue(pruneDeclarative)}`
 		);
 	}
 	const schedules = { pruneDeclarative };
@@ -260,7 +268,13 @@ export function resolveConfig(config: EngineConfig): ResolvedConfig {
 			: parseDuration(config.idempotencyKeyTtl);
 	assertTtlWithinRetention(idempotencyKeyTtlMs, retentionDays, "idempotencyKeyTtl");
 	if (idempotencyKeyTtlMs <= 0) {
-		throw new ConfigError("idempotencyKeyTtl must be greater than 0");
+		const from =
+			config.idempotencyKeyTtl === undefined
+				? ""
+				: ` (parsed from ${describeOffendingValue(config.idempotencyKeyTtl)})`;
+		throw new ConfigError(
+			`idempotencyKeyTtl must resolve to more than 0 ms, got ${idempotencyKeyTtlMs} ms${from}`
+		);
 	}
 
 	const limits: Required<EngineLimits> = {
@@ -285,12 +299,15 @@ export function resolveConfig(config: EngineConfig): ResolvedConfig {
 	const minLevel = config.logging?.minLevel ?? DEFAULTS.logging.minLevel;
 	if (!LOG_LEVELS.includes(minLevel)) {
 		throw new ConfigError(
-			`logging.minLevel must be one of ${LOG_LEVELS.join(", ")}, got ${String(minLevel)}`
+			`logging.minLevel must be one of ${LOG_LEVELS.join(", ")}, got ` +
+				describeOffendingValue(minLevel)
 		);
 	}
 	const mirror = config.logging?.mirror ?? DEFAULTS.logging.mirror;
 	if (typeof mirror !== "boolean") {
-		throw new ConfigError(`logging.mirror must be a boolean, got ${String(mirror)}`);
+		throw new ConfigError(
+			`logging.mirror must be a boolean, got ${describeOffendingValue(mirror)}`
+		);
 	}
 	const logging = { minLevel, mirror };
 
@@ -302,7 +319,10 @@ export function resolveConfig(config: EngineConfig): ResolvedConfig {
 	const logger = config.logger ?? defaultLogger;
 	for (const level of ["debug", "info", "warn", "error"] as const) {
 		if (typeof logger[level] !== "function") {
-			throw new ConfigError(`config.logger.${level} must be a function`);
+			throw new ConfigError(
+				`config.logger.${level} must be a function, got ${describeOffendingValue(logger[level])} ` +
+					"(config.logger must implement { debug, info, warn, error }, pino- or console-compatible)"
+			);
 		}
 	}
 
@@ -339,30 +359,71 @@ export function assertTtlWithinRetention(
 	if (ttlMs > retentionDays * DAY_MS) {
 		throw new ConfigError(
 			`${label} (${ttlMs} ms) must not be larger than retention.days (${retentionDays} days): ` +
-				"the run a key points to would be deleted by retention while the key is still alive"
+				"the run a key points to would be deleted by retention while the key is still alive; " +
+				`shorten ${label} or raise retention.days`
 		);
 	}
 }
 
-function validateConnection(name: string, value: unknown, injectedField: string): void {
+/**
+ * Validates `config.postgres`/`config.redis`: never echoes the value itself (a connection string
+ * commonly carries a password) -- only its shape/type, per the phase 9 "actionable errors" task.
+ * `marker` is a method both accepted shapes' raw instances have (`pg.Pool#query`,
+ * `ioredis#duplicate`), used only to name what's missing/present in the message, never called.
+ */
+function validateConnection(
+	name: "postgres" | "redis",
+	value: unknown,
+	injectedField: "pool" | "connection"
+): void {
+	const instanceLabel = name === "postgres" ? "pg.Pool" : "ioredis Redis";
+	const marker = name === "postgres" ? "query" : "duplicate";
+
 	if (typeof value === "string") {
-		if (value.length === 0) throw new ConfigError(`config.${name} must not be empty`);
-		return;
-	}
-	if (value !== null && typeof value === "object" && injectedField in value) {
-		if ((value as Record<string, unknown>)[injectedField] == null) {
-			throw new ConfigError(`config.${name}.${injectedField} must be provided`);
+		if (value.length === 0) {
+			throw new ConfigError(
+				`config.${name} must not be an empty string; pass a non-empty connection string, or ` +
+					`{ ${injectedField}: <existing ${instanceLabel} instance> }`
+			);
 		}
 		return;
 	}
+
+	if (value !== null && typeof value === "object" && injectedField in value) {
+		if ((value as Record<string, unknown>)[injectedField] == null) {
+			throw new ConfigError(
+				`config.${name}.${injectedField} must be an existing ${instanceLabel} instance, got ` +
+					describeOffendingValue((value as Record<string, unknown>)[injectedField])
+			);
+		}
+		return;
+	}
+
+	// Common mistake: passing the raw Pool/Redis instance directly instead of wrapping it.
+	const looksLikeRawInstance =
+		value !== null &&
+		typeof value === "object" &&
+		!Array.isArray(value) &&
+		typeof (value as Record<string, unknown>)[marker] === "function";
+	if (looksLikeRawInstance) {
+		throw new ConfigError(
+			`config.${name} looks like a raw ${instanceLabel} instance (has .${marker}()), not a ` +
+				`connection string or { ${injectedField} } wrapper; pass it as ` +
+				`{ ${injectedField}: <that instance> }`
+		);
+	}
+
 	throw new ConfigError(
-		`config.${name} must be a connection string or { ${injectedField} } with an existing instance`
+		`config.${name} must be a non-empty connection string or { ${injectedField}: <existing ` +
+			`${instanceLabel} instance> }, got ${describeOffendingValue(value)}`
 	);
 }
 
 function positiveInt(name: string, value: number): number {
 	if (!Number.isInteger(value) || value <= 0) {
-		throw new ConfigError(`${name} must be a positive integer, got ${String(value)}`);
+		throw new ConfigError(
+			`${name} must be a positive integer, got ${describeOffendingValue(value)}`
+		);
 	}
 	return value;
 }
@@ -376,7 +437,7 @@ function timerMs(name: string, value: number): number {
 export function assertTimerMs(name: string, value: number): number {
 	if (value > MAX_TIMER_MS) {
 		throw new ConfigError(
-			`${name} must be at most ${MAX_TIMER_MS} ms (the setTimeout limit, ~24.8 days), got ${String(value)}`
+			`${name} must be at most ${MAX_TIMER_MS} ms (the setTimeout limit, ~24.8 days), got ${value} ms`
 		);
 	}
 	return value;
@@ -384,14 +445,18 @@ export function assertTimerMs(name: string, value: number): number {
 
 function nonNegativeInt(name: string, value: number): number {
 	if (!Number.isInteger(value) || value < 0) {
-		throw new ConfigError(`${name} must be a non-negative integer, got ${String(value)}`);
+		throw new ConfigError(
+			`${name} must be a non-negative integer, got ${describeOffendingValue(value)}`
+		);
 	}
 	return value;
 }
 
 function positiveNumber(name: string, value: number): number {
 	if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) {
-		throw new ConfigError(`${name} must be a positive number, got ${String(value)}`);
+		throw new ConfigError(
+			`${name} must be a positive number, got ${describeOffendingValue(value)}`
+		);
 	}
 	return value;
 }

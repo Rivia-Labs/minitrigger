@@ -11,6 +11,7 @@
 
 import { ConfigError, TaskNotRegisteredError } from "./errors.js";
 import type { AnyTask, TaskQueueOptions } from "./task.js";
+import { describeOffendingValue } from "./utils/error-format.js";
 import { validateQueueName } from "./utils/identifiers.js";
 
 /** A queue name's settings, resolved from every task that declares or references it. */
@@ -46,7 +47,8 @@ function buildTaskMap(tasks: readonly AnyTask[]): Map<string, AnyTask> {
 		if (existing) {
 			throw new ConfigError(
 				`duplicate task id "${task.id}": registered by two tasks ` +
-					`(queue "${queueNameOf(existing)}" and queue "${queueNameOf(task)}")`
+					`(queue "${queueNameOf(existing)}" and queue "${queueNameOf(task)}"); ` +
+					"task ids must be unique across every task passed to createEngine({ tasks })"
 			);
 		}
 		taskMap.set(task.id, task);
@@ -128,7 +130,8 @@ function validateQueueNumbers(queueName: string, taskId: string, declared: TaskQ
 	const check = (field: string, value: unknown) => {
 		if (typeof value !== "number" || !Number.isInteger(value) || value < 1) {
 			throw new ConfigError(
-				`queue "${queueName}" (declared by task "${taskId}"): ${field} must be an integer >= 1, got ${String(value)}`
+				`queue "${queueName}" (declared by task "${taskId}"): ${field} must be an integer ` +
+					`>= 1, got ${describeOffendingValue(value)}`
 			);
 		}
 	};
@@ -161,7 +164,9 @@ function resolveField<T>(
 		if (!equals(entry.value, first.value)) {
 			const list = entries.map(e => `"${e.taskId}" (${format(e.value)})`).join(", ");
 			throw new ConfigError(
-				`queue "${queueName}" has conflicting "${fieldName}" declared across tasks: ${list}`
+				`queue "${queueName}" has conflicting "${fieldName}" declared across tasks: ${list}; ` +
+					`declare the same "${fieldName}" on every task assigned to queue "${queueName}", ` +
+					"or set it on only one task and let the others just reference the queue name"
 			);
 		}
 	}
@@ -188,7 +193,10 @@ export function getTask(registry: Registry, taskOrId: AnyTask | string): AnyTask
 	const id = typeof taskOrId === "string" ? taskOrId : taskOrId.id;
 	const task = registry.tasks.get(id);
 	if (!task) {
-		throw new TaskNotRegisteredError(`task "${id}" is not registered in this engine`);
+		throw new TaskNotRegisteredError(
+			`task "${id}" is not registered in this engine; add it to createEngine({ tasks: [...] }) ` +
+				"(a running process without the task registered treats it as a retryable failure)"
+		);
 	}
 	return task;
 }

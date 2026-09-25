@@ -173,4 +173,64 @@ describe("resolveConfig", () => {
 			})
 		).toThrow(/logger\.error/);
 	});
+
+	it("names the missing field and how to fix an empty connection string", () => {
+		expect(() => resolveConfig({ ...base, postgres: "" })).toThrow(
+			/config\.postgres must not be an empty string; pass a non-empty connection string, or \{ pool: <existing pg\.Pool instance> \}/
+		);
+	});
+
+	it("reports the type/shape (never the value) of a malformed connection option", () => {
+		// A bare number isn't a secret, so the resolved value itself is fine to show.
+		expect(() =>
+			resolveConfig({ ...base, postgres: 42 as unknown as EngineConfig["postgres"] })
+		).toThrow(/config\.postgres must be a non-empty connection string or \{ pool: .* got 42/);
+		// An object shape is described structurally, never `String(value)` ("[object Object]").
+		expect(() => resolveConfig({ ...base, redis: {} as unknown as EngineConfig["redis"] })).toThrow(
+			/config\.redis must be a non-empty connection string or \{ connection: .* got an object/
+		);
+	});
+
+	it("never echoes the actual connection string value in the error (only its type)", () => {
+		const secret = "postgres://user:super-secret-password@host:5432/db";
+		try {
+			resolveConfig({ ...base, postgres: 12345 as unknown as EngineConfig["postgres"] });
+			expect.unreachable();
+		} catch (err) {
+			expect((err as Error).message).not.toContain("super-secret-password");
+		}
+		// Sanity: a valid string with a password is still accepted (never inspected/echoed).
+		expect(() => resolveConfig({ ...base, postgres: secret })).not.toThrow();
+	});
+
+	it("detects a raw pg.Pool/ioredis instance passed directly and suggests wrapping it", () => {
+		const fakePool = { query: () => {} };
+		expect(() =>
+			resolveConfig({ ...base, postgres: fakePool as unknown as EngineConfig["postgres"] })
+		).toThrow(
+			/config\.postgres looks like a raw pg\.Pool instance \(has \.query\(\)\).*wrap.*\{ pool: <that instance> \}/
+		);
+
+		const fakeRedis = { duplicate: () => {} };
+		expect(() =>
+			resolveConfig({ ...base, redis: fakeRedis as unknown as EngineConfig["redis"] })
+		).toThrow(
+			/config\.redis looks like a raw ioredis Redis instance \(has \.duplicate\(\)\).*wrap.*\{ connection: <that instance> \}/
+		);
+	});
+
+	it("reports the wrapped field's type when { pool } / { connection } is provided but empty", () => {
+		expect(() =>
+			resolveConfig({ ...base, postgres: { pool: null } as unknown as EngineConfig["postgres"] })
+		).toThrow(/config\.postgres\.pool must be an existing pg\.Pool instance, got null/);
+	});
+
+	it("includes the resolved value when idempotencyKeyTtl resolves to 0 (was previously silent)", () => {
+		expect(() => resolveConfig({ ...base, idempotencyKeyTtl: 0 })).toThrow(
+			/idempotencyKeyTtl must resolve to more than 0 ms, got 0 ms \(parsed from 0\)/
+		);
+		expect(() => resolveConfig({ ...base, idempotencyKeyTtl: "0ms" })).toThrow(
+			/idempotencyKeyTtl must resolve to more than 0 ms, got 0 ms \(parsed from "0ms"\)/
+		);
+	});
 });

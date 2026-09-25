@@ -82,6 +82,7 @@ describe("buildRegistry: shared queue settings (Phase 3 acceptance)", () => {
 			expect(message).toContain('"b"');
 			expect(message).toContain("2");
 			expect(message).toContain("5");
+			expect(message).toContain("declare the same");
 		}
 	});
 
@@ -189,5 +190,6 @@ describe("getTask", () => {
 		expect(() => getTask(registry, "missing")).toThrow(
 			'task "missing" is not registered in this engine'
 		);
+		expect(() => getTask(registry, "missing")).toThrow(/createEngine\(\{ tasks: \[\.\.\.\] \}\)/);
 	});
 });
