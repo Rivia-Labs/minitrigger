@@ -210,6 +210,47 @@ describe("StepContext", () => {
 		expect(store.inserted).toEqual([]);
 	});
 
+	it("rejects a non-function fn as a fatal error without consuming a seq_index", async () => {
+		const { step, state, store } = setup();
+		// @ts-expect-error -- exercising the runtime check for non-TS callers.
+		await expect(step.run("a", "not a function")).rejects.toThrow(/fn must be a function/);
+		expect(state.fatalError).toBeInstanceOf(ConfigError);
+		expect(store.inserted).toEqual([]);
+	});
+
+	it("rejects an invalid sleep duration as a fatal error without consuming a seq_index", async () => {
+		const { step, state, store } = setup();
+		// @ts-expect-error -- exercising the runtime check for non-TS callers.
+		await expect(step.sleep("nap", "not-a-duration")).rejects.toThrow(/invalid duration/);
+		expect(state.fatalError).toBeInstanceOf(ConfigError);
+		expect(store.sleeps).toEqual([]);
+	});
+
+	it("rejects non-array payloads for batchTriggerAndWait as a fatal error", async () => {
+		const { step, state } = setup();
+		await expect(
+			// @ts-expect-error -- exercising the runtime check for non-TS callers.
+			step.batchTriggerAndWait("kids", {} as never, "not-an-array")
+		).rejects.toThrow(/payloads must be an array/);
+		expect(state.fatalError).toBeInstanceOf(ConfigError);
+	});
+
+	it("after a fatal invalid-argument error, later step calls rethrow it without running fn", async () => {
+		const { step, state } = setup();
+		// @ts-expect-error -- exercising the runtime check for non-TS callers.
+		const error = await step.run("a", "not a function").catch((e: unknown) => e);
+		expect(error).toBeInstanceOf(ConfigError);
+		let called = false;
+		await expect(
+			step.run("b", () => {
+				called = true;
+				return 1;
+			})
+		).rejects.toBe(error);
+		expect(called).toBe(false);
+		expect(state.fatalError).toBe(error);
+	});
+
 	it("after a fatal error, later step calls rethrow it without running fn", async () => {
 		const { step, state } = setup([done("a", 0)]);
 		const error = await step.run("b", () => 1).catch((e: unknown) => e);

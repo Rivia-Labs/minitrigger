@@ -78,6 +78,7 @@ describe("migrate()", () => {
 		expect(byName.get("idx_waitpoints_expires_pending")).toContain(
 			"WHERE (status = 'pending'::text)"
 		);
+		expect(byName.get("idx_runs_created")).toContain("(created_at DESC, id DESC)");
 	});
 
 	it("creates runs with fillfactor=80", async () => {

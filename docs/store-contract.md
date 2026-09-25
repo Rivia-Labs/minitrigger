@@ -181,7 +181,8 @@ scheduler's own copy, and ticks create runs through `RunStore.create` with idemp
 `ScheduleStore.upsert` enforces the id shape in application code, matching how `runs.task_id` and
 other id-shaped columns are validated outside the schema throughout this store.
 
-## TODO
+## Schema assumptions for 003_runs_created_idx.sql
 
-- Phase 7: consider an index `runs(created_at DESC, id DESC)` for `runs.list` without `taskId`
-  (today only `runs(task_id, created_at DESC, id DESC)` exists).
+Adds `idx_runs_created ON runs (created_at DESC, id DESC)`, matching `RunStore.list`'s
+`ORDER BY created_at DESC, id DESC` when called without `taskId` (see the `get`, `list` row above)
+-- `idx_runs_task_created` (001_init.sql) only helps when `taskId` is part of the filter.

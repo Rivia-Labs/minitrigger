@@ -30,14 +30,14 @@ function input(overrides: Partial<NewSchedule> = {}): NewSchedule {
 	};
 }
 
-describe("migrate() applies 001 and 002", () => {
-	it("applies both migrations to a fresh schema", async () => {
+describe("migrate() applies 001, 002 and 003", () => {
+	it("applies every migration to a fresh schema", async () => {
 		const fresh = `${ns.schema}_fresh`;
 		await ns.pool.query(`CREATE SCHEMA ${escapeIdentifier(fresh)}`);
 		try {
 			const result = await migrate(ns.pool, fresh);
 			expect(result.applied).toEqual(MIGRATIONS.map(m => m.version));
-			expect(result.applied).toEqual([1, 2]);
+			expect(result.applied).toEqual([1, 2, 3]);
 
 			const { rows } = await ns.pool.query<{ tablename: string }>(
 				"SELECT tablename FROM pg_tables WHERE schemaname = $1 AND tablename = 'schedules'",
@@ -49,7 +49,7 @@ describe("migrate() applies 001 and 002", () => {
 		}
 	});
 
-	it("adds only migration 2 to a schema already at version 1", async () => {
+	it("adds only migrations 2 and 3 to a schema already at version 1", async () => {
 		const legacy = `${ns.schema}_legacy`;
 		await ns.pool.query(`CREATE SCHEMA ${escapeIdentifier(legacy)}`);
 		const client = new Client({ connectionString: ns.databaseUrl });
@@ -69,7 +69,7 @@ describe("migrate() applies 001 and 002", () => {
 			await client.query("INSERT INTO schema_migrations (version, name) VALUES (1, 'init')");
 
 			const result = await migrate(ns.pool, legacy);
-			expect(result.applied).toEqual([2]);
+			expect(result.applied).toEqual([2, 3]);
 
 			const { rows } = await ns.pool.query<{ tablename: string }>(
 				"SELECT tablename FROM pg_tables WHERE schemaname = $1 AND tablename = 'schedules'",
@@ -80,7 +80,7 @@ describe("migrate() applies 001 and 002", () => {
 			const { rows: versions } = await ns.pool.query<{ version: number }>(
 				`SELECT version FROM ${escapeIdentifier(legacy)}.schema_migrations ORDER BY version`
 			);
-			expect(versions.map(r => r.version)).toEqual([1, 2]);
+			expect(versions.map(r => r.version)).toEqual([1, 2, 3]);
 		} finally {
 			await client.end();
 			await ns.pool.query(`DROP SCHEMA IF EXISTS ${escapeIdentifier(legacy)} CASCADE`);

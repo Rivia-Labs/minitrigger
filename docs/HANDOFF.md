@@ -4,9 +4,9 @@ Atualizado em 2026-09-25. Leia junto com `CLAUDE.md` (decisões e notas de imple
 
 ## Estado atual
 
-- **Verificação completa verde:** `pnpm typecheck && pnpm lint && pnpm test` → 706 testes (unit + integration) + 1 (flushall); `pnpm build` ok (ESM, CJS, DTS).
-- Fases **1 a 7 concluídas**. Fase 9.1 (store em memória) pronta. Fase 8 parcial. Fases 9 (restante) e 10 pendentes.
-- Árvore git limpa; 13 commits convencionais.
+- **Verificação completa verde:** `pnpm typecheck && pnpm lint && pnpm test` → 877 testes (unit + integration) + 1 (flushall); `pnpm build` ok (ESM, CJS, DTS).
+- **Fases 1 a 10 concluídas.** `pnpm check:pack` ok; `examples/basic` roda de ponta a ponta.
+- Árvore git limpa; commits convencionais por fase/frente.
 
 ### O que existe (resumo)
 
@@ -30,38 +30,27 @@ Atualizado em 2026-09-25. Leia junto com `CLAUDE.md` (decisões e notas de imple
 
 ## O que falta
 
-### 1. Pendência de desempenho — ✅ resolvida
-O `RunNotifier` recebe `RunStatusInfo` dos resultados da store; teste `test/integration/notify-perf.test.ts`.
+### Próximos passos (fora das fases do kickoff)
+- **Publicar o primeiro release:** `pnpm check:pack`, criar tag `v0.1.0` e anexar o `.tgz` ao GitHub Release (caminho recomendado no README). Depois disso, mudanças de schema só em migrations novas (a 001 não pode mais ser editada).
+- Opcional: `TestEngine.start()` que drena em segundo plano (hoje o test engine só roda quando o teste chama `drain`/`runInline`/`drive`).
 
-### 2. Fase 8 — ✅ concluída
-`src/schedules.ts` (API, tick, sync declarativo, hook do reconciler); revisão opus aplicada (ordem de leitura do reconciler, retries do tick, guarda de `source`, tag de schema, tipos do payload). Notas no `CLAUDE.md`.
-
-### 3. Fase 9 — modo de teste e DX (opus para 9.2a, sonnet para o resto)
-- `createTestEngine()` / `engine.runInline(task, payload)` usando `createMemoryStore` (`src/store/memory`), `sleep` instantâneo (relógio injetável), tokens completáveis manualmente, sem Redis. Exige um transporte em memória no lugar do BullMQ (interface de `src/queue/transport.ts`).
-- Observação: a engine lê o relógio do banco direto via `pool.query` para a janela de retenção — no modo de teste usar o relógio da store em memória.
-- ✅ Checagens na inicialização: `src/env-check.ts` (`checkEnvironment`, Postgres ≥ 13, `maxmemory-policy`, migrations pendentes), ligado ao `start()` e exportado.
-- Mensagens de erro acionáveis (revisar as existentes).
-- Testes de tipo de `Serializable<T>` com erros legíveis (já há boa cobertura em `test/unit/serializable-types.test.ts` e `task-types.test.ts`; completar).
-- Aceite: exemplo de teste de task do usuário sem infra; teste da checagem de Redis simulando `CONFIG` bloqueado.
-
-### 4. Fase 10 — exemplo, docs, empacotamento (sonnet)
-- ✅ `examples/basic` completo (`pnpm start` em `examples/basic`, sai com 0 em ~3 s).
-- `pnpm pack` → instalar o `.tgz` num diretório limpo, importar em ESM e CJS, rodar o exemplo.
-- Instalação via GitHub (`pnpm add github:usuario/minitrigger`): o `prepare` roda o tsup e o pnpm pode bloquear scripts de dependências git; validar ou documentar e adotar `.tgz` em GitHub Releases.
-- README: remover os `TODO(phase N)` restantes (linha ~61 é a instalação via GitHub), conferir toda a API pública contra `src/index.ts`.
-- ✅ `pnpm bench` e `pnpm check:pack` (resultados no `CLAUDE.md`); instalação via GitHub investigada em `docs/research/github-install.md` (falta levar a recomendação ao README).
-
-### 5. Pontos menores registrados (sem urgência)
-- `runs.list` sem `taskId` ordena todas as linhas: considerar índice `runs(created_at DESC, id DESC)` (nota em `docs/store-contract.md`).
+### Pontos em aberto registrados (sem urgência, comportamento documentado)
 - Token que expirou sozinho numa run que depois terminou reporta `run_finished`.
 - Task que lança com steps ainda em voo não espera por eles (gravações tardias são rejeitadas pelo ownership).
 - Filtros de data de `runs.list` se chamam `createdFrom`/`createdTo` (spec não fixa nomes).
-- ✅ `step.run` com retorno em união agora infere sem genérico explícito.
-- Argumentos inválidos de step (fn não-função, duração inválida) ainda contam tentativa; só nome inválido é fatal.
+- Payload de filha não serializável e task filha não registrada continuam retryable (os demais argumentos inválidos de step são fatais).
+- `sideEffects: false` só ajuda bundlers: em Node o `dist/index.js` único é carregado inteiro (inclui o modo de teste).
+
+### Concluído nesta sessão (2026-09-25)
+- Notificador sem `runs.get` extra por transição (`test/integration/notify-perf.test.ts`).
+- Fase 8: `src/schedules.ts` (API, tick com idempotência por ocorrência e retries, sync declarativo com guarda de `source`, reconciliação bidirecional com tag de schema).
+- Fase 9: `checkEnvironment` no `start()`; `createTestEngine` (`src/testing/`); mensagens de erro acionáveis; inferência de `step.run` com união.
+- Fase 10: `examples/basic` completo, README final, `pnpm bench`, `pnpm check:pack`, `docs/research/github-install.md`.
+- Menores: migration 003 (`idx_runs_created`), argumentos inválidos de step fatais, flake do teste de retenção.
 
 ## Como retomar
 
 1. `pnpm infra:up` (Docker Desktop precisa estar aberto) e `pnpm install`.
 2. `pnpm typecheck && pnpm lint && pnpm test` para confirmar o verde.
-3. Seguir a ordem acima (1 → 2 → 3 → 4). Por fase: implementador → revisão `mt-reviewer` (opus) → correções → verificação completa → commit convencional → atualizar `CLAUDE.md` e este arquivo.
+3. Por frente de trabalho: implementador → revisão `mt-reviewer` (opus) → correções → verificação completa → commit convencional → atualizar `CLAUDE.md` e este arquivo.
 4. Agents do projeto em `.claude/agents/` (`mt-implementer`, `mt-reviewer`, `mt-fixer`). Em sessões novas eles aparecem como tipos de agent; nesta sessão foram usados via `general-purpose` com o arquivo do agent como instrução.

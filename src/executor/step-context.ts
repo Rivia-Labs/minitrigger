@@ -2,6 +2,7 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import { randomUUID } from "node:crypto";
 import { performance } from "node:perf_hooks";
 import {
+	ConfigError,
 	DuplicateStepError,
 	ExecutionLostError,
 	MinitriggerError,
@@ -365,6 +366,21 @@ export class StepContext {
 		return error;
 	}
 
+	/**
+	 * Parses a `Duration` argument passed to a `ctx.step.*` call (`sleep`'s duration, `timeout`,
+	 * `delay`), marking a bad one as this execution's fatal error. Like an invalid step name
+	 * (`validateStepName`), a malformed duration is a bug in the calling code, not a transient
+	 * condition: retrying the same call would fail identically, so the run fails without retry
+	 * instead of counting a wasted attempt.
+	 */
+	private parseDurationArg(value: Duration): number {
+		try {
+			return parseDuration(value);
+		} catch (error) {
+			throw this.fatal(error as Error);
+		}
+	}
+
 	// -------------------------------------------------------------------------
 	// Phase 4 step kinds
 	// -------------------------------------------------------------------------
@@ -376,7 +392,9 @@ export class StepContext {
 			name,
 			() => {
 				if (typeof fn !== "function") {
-					throw new MinitriggerError(`ctx.step.run("${name}", fn): fn must be a function`);
+					throw this.fatal(
+						new ConfigError(`ctx.step.run("${name}", fn): fn must be a function, got ${typeof fn}`)
+					);
 				}
 			},
 			async reg => {
@@ -413,7 +431,7 @@ export class StepContext {
 			"sleep",
 			name,
 			() => {
-				durationMs = parseDuration(duration);
+				durationMs = this.parseDurationArg(duration);
 			},
 			async reg => {
 				const saved = reg.saved;
@@ -457,7 +475,7 @@ export class StepContext {
 			"token",
 			name,
 			() => {
-				if (opts?.timeout !== undefined) timeoutMs = parseDuration(opts.timeout);
+				if (opts?.timeout !== undefined) timeoutMs = this.parseDurationArg(opts.timeout);
 			},
 			async reg => {
 				registered = true;
@@ -593,7 +611,7 @@ export class StepContext {
 			() => {
 				spec = this.deps.waits.resolveTask(task);
 				json = this.childPayload(spec.id, payload);
-				if (opts?.delay !== undefined) delayMs = parseDuration(opts.delay);
+				if (opts?.delay !== undefined) delayMs = this.parseDurationArg(opts.delay);
 			},
 			async reg => {
 				if (reg.saved !== undefined) {
@@ -627,7 +645,7 @@ export class StepContext {
 			() => {
 				spec = this.deps.waits.resolveTask(task);
 				json = this.childPayload(spec.id, payload);
-				if (opts?.timeout !== undefined) timeoutMs = parseDuration(opts.timeout);
+				if (opts?.timeout !== undefined) timeoutMs = this.parseDurationArg(opts.timeout);
 			},
 			async reg => {
 				if (reg.saved === undefined) {
@@ -661,13 +679,16 @@ export class StepContext {
 			name,
 			() => {
 				if (!Array.isArray(payloads)) {
-					throw new MinitriggerError(
-						`ctx.step.batchTriggerAndWait("${name}"): payloads must be an array`
+					throw this.fatal(
+						new ConfigError(
+							`ctx.step.batchTriggerAndWait("${name}"): payloads must be an array, ` +
+								`got ${typeof payloads}`
+						)
 					);
 				}
 				spec = this.deps.waits.resolveTask(task);
 				jsons = payloads.map(p => this.childPayload(spec.id, p));
-				if (opts?.timeout !== undefined) timeoutMs = parseDuration(opts.timeout);
+				if (opts?.timeout !== undefined) timeoutMs = this.parseDurationArg(opts.timeout);
 			},
 			async reg => {
 				if (jsons.length === 0) return [];

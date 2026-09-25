@@ -114,6 +114,54 @@ async function leaderPid(): Promise<number | undefined> {
 const becameLeader = (engine: string) =>
 	logs.some(l => l.engine === engine && l.message.includes("is now the leader"));
 
+/** `scheduleRetention`'s dedup window (`src/engine.ts`): `floor(now_ms / intervalMs)`, decision 17. */
+const RETENTION_WINDOW_INTERVAL_MS = 60_000;
+
+/**
+ * `scheduleRetention` derives its "one job per window" dedup from the real DB clock -- there is no
+ * injectable clock for the real engine (only the test engine has one, Phase 9). A test asserting
+ * "no second sweep happens" over some observation period is only deterministic if that whole
+ * period fits inside a single window: otherwise the window can tick over mid-test by wall-clock
+ * luck alone, and a perfectly correct engine enqueues a second (empty) sweep -- a real event, not
+ * a bug, but exactly the flake this guards against (it hit once in ~a hundred runs, matching the
+ * ~1% chance of the old fixed 600ms check straddling a 60s boundary). Polls the DB clock (never a
+ * blind sleep) until at least `marginMs` remains before the next boundary, so everything that runs
+ * after this resolves -- bounded by this test's own timeouts below -- is guaranteed to land inside
+ * the same window.
+ */
+async function waitUntilSafeRetentionWindow(marginMs: number): Promise<void> {
+	await waitFor(
+		async () => {
+			const { rows } = await ns.pool.query<{ now_ms: string }>(
+				"SELECT floor(extract(epoch FROM now()) * 1000)::bigint AS now_ms"
+			);
+			const nowMs = Number(rows[0]?.now_ms);
+			const msIntoWindow = nowMs % RETENTION_WINDOW_INTERVAL_MS;
+			return msIntoWindow >= marginMs && msIntoWindow <= RETENTION_WINDOW_INTERVAL_MS - marginMs;
+		},
+		{ timeoutMs: RETENTION_WINDOW_INTERVAL_MS, intervalMs: 25 }
+	);
+}
+
+/**
+ * Polls `check` every `intervalMs` across `durationMs`, failing as soon as it turns false -- unlike
+ * a single check after a fixed sleep, a regression is caught close to when it actually happened
+ * instead of only at the very end.
+ */
+async function assertStableFor(
+	check: () => boolean,
+	durationMs: number,
+	intervalMs = 50
+): Promise<void> {
+	const deadline = Date.now() + durationMs;
+	for (;;) {
+		expect(check()).toBe(true);
+		const remaining = deadline - Date.now();
+		if (remaining <= 0) return;
+		await new Promise(resolve => setTimeout(resolve, Math.min(intervalMs, remaining)));
+	}
+}
+
 beforeAll(async () => {
 	const engine = createEngine({
 		postgres: ns.databaseUrl,
@@ -328,6 +376,11 @@ describe("leadership", () => {
 
 describe("retention", () => {
 	it("deletes old finished runs in batches through the -system job, keeping recent ones", async () => {
+		// Comfortably covers the waitFor + assertStableFor budgets below (up to ~5.6s) plus engine
+		// startup, so the window can't tick over mid-test by wall-clock luck (see
+		// waitUntilSafeRetentionWindow).
+		await waitUntilSafeRetentionWindow(10_000);
+
 		const { task, queue } = doubler();
 		const old: string[] = [];
 		for (let i = 0; i < 7; i++) {
@@ -355,7 +408,7 @@ describe("retention", () => {
 
 		await makeEngine([task], {
 			idempotencyKeyTtl: "1d",
-			retention: { days: 1, batchSize: 3, intervalMs: 60_000 },
+			retention: { days: 1, batchSize: 3, intervalMs: RETENTION_WINDOW_INTERVAL_MS },
 		}).start();
 
 		await waitFor(
@@ -364,8 +417,12 @@ describe("retention", () => {
 		);
 		const { rows } = await ns.pool.query<{ id: string }>(`SELECT id FROM ${t("runs")}`);
 		expect(rows.map(r => r.id).sort()).toEqual([recent.id, active.id].sort());
-		// One retention job per window: later ticks don't enqueue another sweep.
-		await new Promise(resolve => setTimeout(resolve, 600));
-		expect(logs.filter(l => l.message.startsWith("retention: deleted"))).toHaveLength(1);
+		// One retention job per window: later reconciler ticks (every 200ms here) don't enqueue
+		// another sweep. `waitUntilSafeRetentionWindow` above guarantees this whole observation
+		// fits inside the same window, so a second log here would be a real regression, not luck.
+		await assertStableFor(
+			() => logs.filter(l => l.message.startsWith("retention: deleted")).length === 1,
+			600
+		);
 	});
 });

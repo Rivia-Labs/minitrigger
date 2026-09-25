@@ -422,6 +422,101 @@ describe("steps: determinism", () => {
 		expect(await stepRows(handle.id)).toEqual([]);
 	});
 
+	it("ctx.step.run with a non-function fn fails the run without retry (fatal, like an invalid name)", async () => {
+		let error: unknown;
+		let goodCalled = false;
+		const task = defineTask({
+			id: uniqueTaskId("badfn"),
+			queue: { name: uniqueQueue() },
+			retry: fastRetry(3),
+			run: async (_p: { v: number }, ctx) => {
+				try {
+					// @ts-expect-error -- exercising the runtime check for non-TS callers.
+					await ctx.step.run("bad-fn", "not a function");
+				} catch (e) {
+					error = e;
+				}
+				return ctx.step.run("good", () => {
+					goodCalled = true;
+					return 2;
+				});
+			},
+		});
+		const engine = await startedEngine([task]);
+		const handle = await engine.trigger(task, { v: 1 });
+		const run = await waitForStatus(engine, handle.id, "failed");
+		expect((error as Error).message).toMatch(/fn must be a function/);
+		expect(run.attempt).toBe(1);
+		expect(run.error).toMatchObject({ name: "ConfigError", retryable: false });
+		expect(goodCalled).toBe(false);
+		expect(await stepRows(handle.id)).toEqual([]);
+	});
+
+	it("ctx.step.sleep with an invalid duration fails the run without retry (fatal, like an invalid name)", async () => {
+		let error: unknown;
+		let goodCalled = false;
+		const task = defineTask({
+			id: uniqueTaskId("badduration"),
+			queue: { name: uniqueQueue() },
+			retry: fastRetry(3),
+			run: async (_p: { v: number }, ctx) => {
+				try {
+					// @ts-expect-error -- exercising the runtime check for non-TS callers.
+					await ctx.step.sleep("nap", "not-a-duration");
+				} catch (e) {
+					error = e;
+				}
+				return ctx.step.run("good", () => {
+					goodCalled = true;
+					return 2;
+				});
+			},
+		});
+		const engine = await startedEngine([task]);
+		const handle = await engine.trigger(task, { v: 1 });
+		const run = await waitForStatus(engine, handle.id, "failed");
+		expect((error as Error).message).toMatch(/invalid duration/);
+		expect(run.attempt).toBe(1);
+		expect(run.error).toMatchObject({ name: "ConfigError", retryable: false });
+		expect(goodCalled).toBe(false);
+		expect(await stepRows(handle.id)).toEqual([]);
+	});
+
+	it("ctx.step.batchTriggerAndWait with non-array payloads fails the run without retry (fatal)", async () => {
+		let error: unknown;
+		let goodCalled = false;
+		const child = defineTask({
+			id: uniqueTaskId("badbatch-child"),
+			queue: { name: uniqueQueue() },
+			run: async () => "child",
+		});
+		const task = defineTask({
+			id: uniqueTaskId("badbatch"),
+			queue: { name: uniqueQueue() },
+			retry: fastRetry(3),
+			run: async (_p: { v: number }, ctx) => {
+				try {
+					// @ts-expect-error -- exercising the runtime check for non-TS callers.
+					await ctx.step.batchTriggerAndWait("kids", child, "not-an-array");
+				} catch (e) {
+					error = e;
+				}
+				return ctx.step.run("good", () => {
+					goodCalled = true;
+					return 2;
+				});
+			},
+		});
+		const engine = await startedEngine([child, task]);
+		const handle = await engine.trigger(task, { v: 1 });
+		const run = await waitForStatus(engine, handle.id, "failed");
+		expect((error as Error).message).toMatch(/payloads must be an array/);
+		expect(run.attempt).toBe(1);
+		expect(run.error).toMatchObject({ name: "ConfigError", retryable: false });
+		expect(goodCalled).toBe(false);
+		expect(await stepRows(handle.id)).toEqual([]);
+	});
+
 	it("a step called inside a step.run fn fails the run with NestedStepError, without retry", async () => {
 		const calls = { before: 0, outer: 0, innerFn: 0, sideEffect: 0 };
 		const task = defineTask({
