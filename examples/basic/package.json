@@ -1,0 +1,22 @@
+{
+  "name": "minitrigger-example-basic",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Real consumer project for minitrigger, installed via file:../..",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "start": "node --experimental-strip-types src/index.ts && node src/cjs-check.cjs"
+  },
+  "dependencies": {
+    "minitrigger": "file:../..",
+    "bullmq": "^6.3.0",
+    "ioredis": "^5.11.1",
+    "pg": "^8.13.0"
+  },
+  "devDependencies": {
+    "typescript": "6.0.3",
+    "@types/node": "^24",
+    "@types/pg": "^8.13.0"
+  }
+}

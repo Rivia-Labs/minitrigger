@@ -1,0 +1,7 @@
+# Marks examples/basic as its own workspace root so `pnpm install` here
+# is a fully independent project, isolated from the library's root
+# pnpm-workspace.yaml (which only configures the library's own build tooling).
+# pnpm stops walking up the directory tree once it finds this file.
+allowBuilds:
+  esbuild: true
+  msgpackr-extract: true
