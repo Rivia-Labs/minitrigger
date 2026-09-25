@@ -33,11 +33,13 @@ interface OpenTx {
 	aborted: boolean;
 }
 
-/** Tracks the transaction whose callback is running, to reject pool-bound use inside it. */
-const currentTx = new AsyncLocalStorage<OpenTx>();
-
-/** Test-only access to a memory store's internals (see {@link memoryStoreTestHooks}). */
-const hooks = new WeakMap<Store, MemoryStoreTestHooks>();
+/**
+ * Key of a memory store's own {@link MemoryStoreTestHooks} on the `Store` object it returns
+ * (decision 13: no global state -- a module-level `WeakMap<Store, ...>` would hold every store's
+ * hooks in one shared table; a `Symbol` is just a unique property name, not state, so keying the
+ * hooks directly on the instance keeps them per-store).
+ */
+const hooksKey = Symbol("memoryStoreTestHooks");
 
 export interface MemoryStoreTestHooks {
 	/**
@@ -58,7 +60,7 @@ export interface MemoryStoreTestHooks {
 
 /** Internals of a store built by {@link createMemoryStore}, for tests; null for other stores. */
 export function memoryStoreTestHooks(store: Store): MemoryStoreTestHooks | null {
-	return hooks.get(store) ?? null;
+	return (store as Partial<Record<typeof hooksKey, MemoryStoreTestHooks>>)[hooksKey] ?? null;
 }
 
 function buildRepos(exec: Exec) {
@@ -77,6 +79,12 @@ export function createMemoryStore(opts: MemoryStoreOptions = {}): Store {
 	const db = new MemDb();
 	const mutex = new Mutex();
 	const identity = {};
+	/**
+	 * Tracks the transaction whose callback is running, to reject pool-bound use inside it
+	 * (decision 13: per-store instance, not a module-level `AsyncLocalStorage` shared by every
+	 * `createMemoryStore()` call).
+	 */
+	const currentTx = new AsyncLocalStorage<OpenTx>();
 
 	function assertNotInsideTx(): void {
 		const tx = currentTx.getStore();
@@ -149,14 +157,16 @@ export function createMemoryStore(opts: MemoryStoreOptions = {}): Store {
 		},
 	};
 
-	hooks.set(store, {
-		async patchRun(runId, patch) {
-			await poolExec.run(tx => {
-				const row = tx.db.runs.get(runId);
-				if (!row) throw new Error(`patchRun: run ${runId} not found`);
-				tx.set(tx.db.runs, runId, { ...row, ...patch });
-			});
-		},
+	Object.assign(store, {
+		[hooksKey]: {
+			async patchRun(runId: string, patch: Parameters<MemoryStoreTestHooks["patchRun"]>[1]) {
+				await poolExec.run(tx => {
+					const row = tx.db.runs.get(runId);
+					if (!row) throw new Error(`patchRun: run ${runId} not found`);
+					tx.set(tx.db.runs, runId, { ...row, ...patch });
+				});
+			},
+		} satisfies MemoryStoreTestHooks,
 	});
 
 	return store;

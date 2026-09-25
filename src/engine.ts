@@ -39,6 +39,7 @@ import {
 	createPubSub,
 	createPubSubPublisher,
 	type PubSub,
+	type PubSubPublisher,
 	type RunStatusMessage,
 } from "./pubsub.js";
 import { createRedisConnections } from "./queue/connections.js";
@@ -67,10 +68,11 @@ import {
 	TERMINAL_RUN_STATUSES,
 	type WaitpointStatus,
 } from "./store/types.js";
-import { createStreams } from "./streams.js";
+import { createStreams, type Streams } from "./streams.js";
 import type { AnyTask, PayloadArgs, RunHandle, TaskOutput, TaskPayload } from "./task.js";
 import { computeBackoffMs } from "./utils/backoff.js";
 import { type Duration, parseDuration } from "./utils/duration.js";
+import { describeOffendingValue } from "./utils/error-format.js";
 import { validateIdempotencyKey } from "./utils/identifiers.js";
 import { assertSerializable } from "./utils/serialization.js";
 
@@ -322,45 +324,91 @@ export interface Engine {
 	events: EngineEvents;
 }
 
+/**
+ * The surface `Engine` and `TestEngine` (`src/testing/test-engine.ts`, Phase 9.2 L4) share: enough
+ * to trigger tasks and query/react to runs from code that does not care whether it is talking to
+ * the real engine or a test one (e.g. a helper shared by production code and tests). Deliberately
+ * excludes `migrate`/`start`/`stop`, which only `Engine` has in this shape (`TestEngine.stop()`
+ * differs -- it ends open subscriptions/stream reads instead of a graceful worker shutdown).
+ */
+export type EngineClient = Pick<Engine, "trigger" | "runs" | "tokens" | "schedules" | "events">;
+
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
-export function createEngine(config: EngineConfig): Engine {
-	const resolved = resolveConfig(config);
+/**
+ * What differs between the real engine (Postgres + BullMQ + Redis) and the test engine
+ * (`createTestEngine`, everything in memory). Everything else -- `trigger`, `runs.*`, `tokens`,
+ * `events`, `schedules` and the executor deps -- is built once by {@link createEngineCore}, so both
+ * engines run the same code paths (the test engine must not fork execution semantics).
+ * @internal
+ */
+export interface EngineBackend {
+	store: Store;
+	transport: Transport;
+	/** Cross-process status/cancel publishing (best-effort). */
+	publisher: PubSubPublisher;
+	/** Builds the subscriber side; called at most once, lazily. */
+	createPubSub(): PubSub;
+	/** Behind `ctx.stream`. */
+	streams: Pick<Streams, "pipe">;
+	/** Behind `runs.readStream`. */
+	readStream(
+		runId: string,
+		name: string,
+		signal: AbortSignal | undefined
+	): AsyncIterable<string | Json>;
+}
+
+/** Lifecycle state owned by the engine wrapping the core. @internal */
+export interface EngineCoreLifecycle {
+	/** True once `stop()` began (see `ExecutorDeps.isShuttingDown`). */
+	isShuttingDown(): boolean;
+	/** Throws once the engine was stopped. */
+	assertNotStopped(): void;
+}
+
+/** The shared part of an engine (see {@link EngineBackend}). @internal */
+export interface EngineCore {
+	deps: ExecutorDeps;
+	active: ActiveExecutions;
+	notifier: RunNotifier;
+	/** Publishes the status and emits the local event (best-effort). */
+	notifyStatus(info: RunStatusInfo): void;
+	/** Aborts local executions of runs canceled elsewhere. */
+	abortLocal(runIds: readonly string[]): void;
+	trigger: Engine["trigger"];
+	runs: EngineRuns;
+	tokens: EngineTokens;
+	schedules: EngineSchedules;
+	events: EngineEvents;
+	/** The subscriber side, created on first use. */
+	getPubSub(): PubSub;
+	/** The subscriber side if it was already created. */
+	currentPubSub(): PubSub | undefined;
+	/** Ends every open `runs.subscribe` iteration. */
+	endSubscriptions(): void;
+	/** Bounded wait for the best-effort publishes still in flight. */
+	drainNotifications(timeoutMs: number): Promise<void>;
+}
+
+/**
+ * Builds the shared part of an engine on top of `backend`. `resolved` must come from
+ * `resolveConfig` and `registry` from `buildRegistry` + {@link validateTasks}. @internal
+ */
+export function createEngineCore(
+	resolved: ResolvedConfig,
+	registry: Registry,
+	backend: EngineBackend,
+	lifecycle: EngineCoreLifecycle
+): EngineCore {
 	const { logger } = resolved;
-	const registry = buildRegistry(resolved.tasks);
-	validateTasks(registry, resolved);
-
-	const ownsPool = typeof resolved.postgres === "string";
-	const pool =
-		typeof resolved.postgres === "string"
-			? new Pool({ connectionString: resolved.postgres, max: resolved.poolMax })
-			: resolved.postgres.pool;
-	if (ownsPool) {
-		// An idle client error would otherwise crash the process (unhandled "error" event).
-		pool.on("error", error => logger.error({ err: error }, "postgres pool error"));
-	}
-
-	const store: Store = createSqlStore(pool, resolved.schema);
-	const connections = createRedisConnections(resolved.redis);
-	const transport: Transport = createTransport({
-		prefix: resolved.prefix,
-		connections,
-		queues: Array.from(registry.queues.values()),
-		systemConcurrency: resolved.systemConcurrency,
-		schema: resolved.schema,
-	});
-
+	const { store, transport, publisher } = backend;
+	const { assertNotStopped } = lifecycle;
 	const active = new ActiveExecutions();
-	/** Set synchronously by `stop()`; `executeRun` hands back any run it acquires after that. */
-	let shuttingDown = false;
 
 	// --- Pub/sub (Phase 6 cancel broadcast, Phase 7 status seam). Publishing uses the shared
 	// connection, so a trigger-only engine (decision 19) still publishes what it causes; only a
 	// started engine subscribes (dedicated connection, decision 14). ---
-	const publisher = createPubSubPublisher({
-		publisher: connections.shared(),
-		prefix: resolved.prefix,
-	});
 	let pubsub: PubSub | undefined;
 	const pendingNotifications = new Set<Promise<void>>();
 	function trackNotification(promise: Promise<void>, what: string): void {
@@ -451,8 +499,6 @@ export function createEngine(config: EngineConfig): Engine {
 		for (const runId of runIds) active.get(runId)?.abort("canceled");
 	}
 
-	const streams = createStreams({ redis: connections.shared(), prefix: resolved.prefix });
-
 	// --- Schedules (Phase 8, decisions 8, 9, 17, 21). `engine.schedules.*` works without start()
 	// (the `-system` `Queue` already exists once the transport is built); only the tick HANDLER
 	// (which needs the `-system` worker) and the declarative sync require it. ---
@@ -470,104 +516,21 @@ export function createEngine(config: EngineConfig): Engine {
 		registry,
 		config: resolved,
 		active,
-		isShuttingDown: () => shuttingDown,
+		isShuttingDown: lifecycle.isShuttingDown,
 		notify: notifier,
-		streams,
+		streams: backend.streams,
 	};
 
 	/**
-	 * The status/cancel subscriber (dedicated connection, decision 14), created by `start()` or by
-	 * the first `runs.subscribe` (a trigger-only engine can subscribe too). Closed by `stop()`.
+	 * The status/cancel subscriber, created by `start()` or by the first `runs.subscribe` (a
+	 * trigger-only engine can subscribe too). Closed by `stop()`.
 	 */
 	function getPubSub(): PubSub {
-		if (pubsub) return pubsub;
-		const subscriber = connections.dedicated("subscriber");
-		// ioredis reconnects (and re-subscribes) on its own; without a listener it prints every
-		// connection error to the console.
-		subscriber.on("error", (error: unknown) =>
-			logger.debug({ err: error }, "pub/sub subscriber connection error")
-		);
-		pubsub = createPubSub({
-			publisher: connections.shared(),
-			subscriber,
-			prefix: resolved.prefix,
-			logger,
-		});
+		pubsub ??= backend.createPubSub();
 		return pubsub;
 	}
 	/** Ends every open `runs.subscribe` iteration (on `stop()`). */
 	const openSubscriptions = new Set<() => void>();
-	/** Dedicated connections of the open `runs.readStream` iterations (disconnected on `stop()`). */
-	const streamReaders = new Set<Redis>();
-
-	// --- Leader loop (Phase 6, decision 16): reconciler + retention scheduling, leader only. ---
-	const reconciler = createReconciler({
-		store,
-		transport,
-		logger,
-		graceMs: resolved.reconciler.graceMs,
-		stallTimeoutMs: resolved.stallTimeoutMs,
-		batchSize: resolved.reconciler.batchSize,
-		reconcileSchedules: createReconcileSchedulesHook({
-			store,
-			transport,
-			logger,
-			schema: resolved.schema,
-		}),
-		onCanceled: canceled => {
-			const runIds = canceled.map(c => c.runId);
-			abortLocal(runIds);
-			for (const c of canceled) {
-				notifyStatus({
-					runId: c.runId,
-					taskId: c.taskId,
-					status: "canceled",
-					attempt: c.attempt,
-					error: c.error,
-					updatedAt: c.updatedAt,
-					transition: "canceled",
-				});
-			}
-			notifier.canceled(runIds);
-		},
-		// Stall recovery: back to `queued` means a retry (attempt + 1), otherwise it failed.
-		onStatusChange: info =>
-			notifyStatus({
-				runId: info.runId,
-				taskId: info.taskId,
-				status: info.status,
-				attempt: info.attempt,
-				error: info.error,
-				updatedAt: info.updatedAt,
-				transition: info.status === "queued" ? "retrying" : "failed",
-			}),
-	});
-	const retention = createRetention({
-		store,
-		logger,
-		days: resolved.retentionDays,
-		batchSize: resolved.retentionBatchSize,
-	});
-	let leader: LeaderElector | undefined;
-	let leaderTimer: ReturnType<typeof setInterval> | undefined;
-	let leaderTick: Promise<void> | undefined;
-	let leaderLoopStopped = false;
-	/** Set when leadership is lost: the next tick doesn't contend, giving healthier processes a turn. */
-	let skipNextAcquire = false;
-	/** Last retention window this process enqueued (the jobs are removed on completion). */
-	let lastRetentionWindow: number | undefined;
-	/** Every `executeRun` call still in progress (from the acquire to its last enqueue). */
-	const inFlight = new Set<Promise<void>>();
-
-	let lifecycle: "idle" | "starting" | "started" | "stopping" = "idle";
-	let startPromise: Promise<void> | undefined;
-	let stopPromise: Promise<void> | undefined;
-
-	function assertNotStopped(): void {
-		if (lifecycle === "stopping") {
-			throw new MinitriggerError("this engine was stopped; create a new one");
-		}
-	}
 
 	async function createRun(
 		task: AnyTask,
@@ -620,7 +583,11 @@ export function createEngine(config: EngineConfig): Engine {
 				options.idempotencyKeyTtl === undefined
 					? resolved.idempotencyKeyTtlMs
 					: parseDuration(options.idempotencyKeyTtl);
-			if (ttlMs <= 0) throw new ConfigError("idempotencyKeyTtl must be greater than 0");
+			if (ttlMs <= 0) {
+				throw new ConfigError(
+					`trigger options.idempotencyKeyTtl must resolve to more than 0 ms, got ${ttlMs} ms (parsed from ${describeOffendingValue(options.idempotencyKeyTtl)})`
+				);
+			}
 			assertTtlWithinRetention(ttlMs, resolved.retentionDays, "idempotencyKeyTtl");
 			idempotency = { key, ttlMs };
 		} else if (options.idempotencyKeyTtl !== undefined) {
@@ -629,170 +596,6 @@ export function createEngine(config: EngineConfig): Engine {
 		const delayMs = options.delay === undefined ? 0 : parseDuration(options.delay);
 
 		return createRun(task, payload, delayMs, idempotency);
-	}
-
-	function start(options: StartOptions = {}): Promise<void> {
-		try {
-			assertNotStopped();
-		} catch (error) {
-			return Promise.reject(error);
-		}
-		if (lifecycle !== "idle") {
-			return Promise.reject(new MinitriggerError("engine.start() was already called"));
-		}
-		lifecycle = "starting";
-		const attempt = (async () => {
-			// Decision 22: a check that cannot run only warns; a wrong answer throws (Postgres
-			// version, Redis eviction policy, pending migrations -- `autoMigrate: false` because
-			// `start()` does not call `migrate()` itself; a pending migration must be applied via
-			// `engine.migrate()` first, and the thrown `ConfigError` says so).
-			// `checkEnvironment` itself calls `logger.warn` per warning; nothing else to do with the
-			// returned report here.
-			await checkEnvironment({
-				pool,
-				redis: connections.shared(),
-				schema: resolved.schema,
-				logger,
-				autoMigrate: false,
-			});
-
-			// On failure `startWorkers` closes whatever workers it already created.
-			await transport.startWorkers({
-				...(options.queues ? { queues: options.queues } : {}),
-				processRun: async (_queue, data) => {
-					const execution = executeRun(deps, { runId: data.runId, seq: data.seq });
-					inFlight.add(execution);
-					try {
-						await execution;
-					} finally {
-						inFlight.delete(execution);
-					}
-				},
-				processSystem: createSystemDispatcher({
-					config: resolved,
-					store,
-					transport,
-					active,
-					notify: notifier,
-					runRetention: () => retention.runOnce(),
-					registry,
-				}),
-			});
-
-			// Phase 8, decision 21: create/update every `defineTask({ schedule })` in Postgres + BullMQ.
-			await syncDeclarativeSchedules({
-				store,
-				transport,
-				registry,
-				logger,
-				maxPayloadBytes: resolved.limits.maxPayloadBytes,
-				pruneDeclarative: resolved.schedules.pruneDeclarative,
-			});
-
-			const ps = getPubSub();
-			ps.onCancel(abortLocal);
-			await ps.ready;
-
-			startLeaderLoop();
-		})();
-		startPromise = attempt.then(
-			() => {
-				if (lifecycle === "starting") lifecycle = "started";
-			},
-			(error: unknown) => {
-				// Only "started" once everything is up; a failed start can be retried.
-				if (lifecycle === "starting") lifecycle = "idle";
-				throw error;
-			}
-		);
-		return startPromise;
-	}
-
-	function startLeaderLoop(): void {
-		leader = createLeaderElector({
-			...(typeof resolved.postgres === "string"
-				? { connectionString: resolved.postgres }
-				: { clientFactory: () => new Client(pool.options) }),
-			schema: resolved.schema,
-			logger,
-			onAcquire: () =>
-				logger.info(
-					{ schema: resolved.schema },
-					"this engine is now the leader (reconciler, retention)"
-				),
-			onLose: () => {
-				skipNextAcquire = true;
-				logger.warn(
-					{ schema: resolved.schema },
-					"leadership lost (dedicated client died); will try to reacquire on a later tick"
-				);
-			},
-		});
-		const tick = () => {
-			// Never overlap: a slow tick (big backlog, slow DB) makes the next ones skip.
-			if (leaderLoopStopped || leaderTick) return;
-			leaderTick = runLeaderTick()
-				.catch((error: unknown) => logger.error({ err: error }, "leader tick failed"))
-				.finally(() => {
-					leaderTick = undefined;
-				});
-		};
-		leaderTimer = setInterval(tick, resolved.reconciler.intervalMs);
-		leaderTimer.unref();
-		tick();
-	}
-
-	/**
-	 * One leader tick: contend for leadership (decision 16) and, only as leader, run the reconciler
-	 * (decisions 1, 3, 6) and make sure this retention window's `-system` job exists (decision 8).
-	 * If leadership is lost mid-tick the tick still finishes: every reconciler action is safe to run
-	 * concurrently with a new leader's (idempotent enqueues, re-checks under row locks).
-	 */
-	async function runLeaderTick(): Promise<void> {
-		if (!leader) return;
-		if (skipNextAcquire) {
-			skipNextAcquire = false;
-			return;
-		}
-		if (!(await leader.tryAcquire()) || leaderLoopStopped) return;
-		const report = await reconciler.runOnce();
-		const acted =
-			report.staleQueued +
-			report.staleWaiting +
-			report.orphanWaiting +
-			report.stalled.requeued +
-			report.stalled.failed +
-			report.expiredWaitpoints;
-		if (acted > 0 || report.errors > 0) logger.info({ ...report }, "reconciler tick");
-		if (leaderLoopStopped) return;
-		await scheduleRetention();
-	}
-
-	/**
-	 * Enqueues `retention` once per `retention.intervalMs` window, with jobId
-	 * `retention-${window}` where the window is derived from the DB clock (decision 17). The jobId
-	 * dedupes it across processes while the job exists; because jobs are removed on completion, this
-	 * process also remembers the last window it enqueued. A leadership change inside a window can
-	 * still cause a second sweep in it: harmless, retention is idempotent.
-	 */
-	async function scheduleRetention(): Promise<void> {
-		const { rows } = await pool.query<{ now_ms: string }>(
-			"SELECT floor(extract(epoch FROM now()) * 1000)::bigint AS now_ms"
-		);
-		const nowMs = Number(rows[0]?.now_ms);
-		if (!Number.isFinite(nowMs)) return;
-		const window = Math.floor(nowMs / resolved.retentionIntervalMs);
-		if (window === lastRetentionWindow) return;
-		await transport.enqueueSystem("retention", {}, { jobId: `retention-${window}` });
-		lastRetentionWindow = window;
-	}
-
-	/** Stops the leader loop: no new tick, waits for the running one, releases leadership. */
-	async function stopLeaderLoop(): Promise<void> {
-		leaderLoopStopped = true;
-		clearInterval(leaderTimer);
-		await leaderTick;
-		await leader?.close();
 	}
 
 	/** Bounded wait for the best-effort publishes still in flight. */
@@ -806,102 +609,6 @@ export function createEngine(config: EngineConfig): Engine {
 			}),
 		]);
 		clearTimeout(timer);
-	}
-
-	/** Waits (bounded) for every in-flight `executeRun`, including ones that start meanwhile. */
-	async function drainInFlight(timeoutMs: number): Promise<void> {
-		const deadline = Date.now() + timeoutMs;
-		while (inFlight.size > 0) {
-			const remaining = deadline - Date.now();
-			if (remaining <= 0) {
-				logger.warn(
-					{ inFlight: inFlight.size },
-					"stop(): executions still in flight after the drain timeout; closing the queues anyway " +
-						"(the reconciler recovers any enqueue that was lost)"
-				);
-				return;
-			}
-			let timer: ReturnType<typeof setTimeout> | undefined;
-			await Promise.race([
-				Promise.allSettled(Array.from(inFlight)),
-				new Promise<void>(resolve => {
-					timer = setTimeout(resolve, remaining);
-				}),
-			]);
-			clearTimeout(timer);
-		}
-	}
-
-	/** Decision 20: abort, release (no attempt increment, `enqueue_seq + 1`) and re-enqueue. */
-	async function handBackActiveRuns(): Promise<void> {
-		await Promise.all(
-			active.values().map(async execution => {
-				execution.handedBack = true;
-				execution.abort("shutdown");
-				try {
-					const result = await store.runs.release(execution.owner);
-					if (result.kind === "released") {
-						notifier.status({
-							runId: execution.runId,
-							taskId: execution.run.taskId,
-							status: result.enqueue.status,
-							attempt: execution.run.attempt,
-							error: execution.run.error,
-							updatedAt: result.enqueue.updatedAt,
-							transition: "queued",
-						});
-						await enqueue(deps, result.enqueue);
-						logger.info(
-							{ runId: execution.runId, taskId: execution.taskId },
-							"run handed back to the queue on shutdown"
-						);
-					}
-				} catch (error) {
-					logger.error(
-						{ runId: execution.runId, err: error },
-						"failed to release a run on shutdown; the stall reconciler will recover it"
-					);
-				}
-			})
-		);
-	}
-
-	/**
-	 * Decision 20, in order: stop the leader loop (await its tick, release leadership) -> stop
-	 * fetching -> wait for active runs up to `shutdownTimeoutMs` -> abort + release the
-	 * still-active ones -> wait (bounded) for every in-flight `executeRun`, so a run acquired during
-	 * shutdown is handed back and executor-side enqueues (retry, parent resume) land -> detach
-	 * pub/sub and flush pending publishes -> close the queues -> close the connections and the pool.
-	 */
-	function stop(): Promise<void> {
-		if (stopPromise) return stopPromise;
-		lifecycle = "stopping";
-		shuttingDown = true;
-		stopPromise = (async () => {
-			try {
-				// A concurrent start() must finish (or fail) first, or its workers would leak.
-				await startPromise?.catch(() => {});
-				await stopLeaderLoop();
-				await transport.closeWorkers({
-					timeoutMs: resolved.shutdownTimeoutMs,
-					beforeClose: async () => {
-						await handBackActiveRuns();
-						await drainInFlight(IN_FLIGHT_DRAIN_MS);
-						for (const end of Array.from(openSubscriptions)) end();
-						for (const reader of Array.from(streamReaders)) reader.disconnect();
-						await pubsub?.close();
-						await drainNotifications(NOTIFY_DRAIN_MS);
-					},
-				});
-			} finally {
-				if (ownsPool) {
-					await pool.end().catch(error => {
-						logger.warn({ err: error }, "error closing the postgres pool");
-					});
-				}
-			}
-		})();
-		return stopPromise;
 	}
 
 	const runs: EngineRuns = {
@@ -989,7 +696,7 @@ export function createEngine(config: EngineConfig): Engine {
 			options: ReadStreamOptions = {}
 		): AsyncIterable<T> {
 			assertNotStopped();
-			return readRunStream(runIdOf(run), name, options.signal) as AsyncIterable<T>;
+			return backend.readStream(runIdOf(run), name, options.signal) as AsyncIterable<T>;
 		},
 	};
 
@@ -1077,28 +784,6 @@ export function createEngine(config: EngineConfig): Engine {
 		}
 	}
 
-	/** `runs.readStream`: one dedicated connection per reader (decision 14), closed at the end. */
-	async function* readRunStream(
-		runId: string,
-		name: string,
-		signal: AbortSignal | undefined
-	): AsyncGenerator<string | Json, void, undefined> {
-		if (signal?.aborted) return;
-		// A duplicate (not `connections.dedicated`, which keeps every connection until stop()):
-		// readers come and go, so each one is closed as soon as its iteration ends.
-		const reader = connections.shared().duplicate({ maxRetriesPerRequest: null });
-		reader.on("error", (error: unknown) =>
-			logger.debug({ err: error, runId, name }, "stream reader connection error")
-		);
-		streamReaders.add(reader);
-		try {
-			yield* streams.read(runId, name, { redis: reader, ...(signal ? { signal } : {}) });
-		} finally {
-			streamReaders.delete(reader);
-			reader.disconnect();
-		}
-	}
-
 	const tokens: EngineTokens = {
 		async complete(tokenId: string, output?: unknown): Promise<CompleteTokenOutcome> {
 			const value = output === undefined ? null : output;
@@ -1128,14 +813,451 @@ export function createEngine(config: EngineConfig): Engine {
 	};
 
 	return {
-		migrate: () => migrate(pool, resolved.schema),
-		start,
-		stop,
+		deps,
+		active,
+		notifier,
+		notifyStatus,
+		abortLocal,
 		trigger,
 		runs,
 		tokens,
 		schedules,
 		events,
+		getPubSub,
+		currentPubSub: () => pubsub,
+		endSubscriptions() {
+			for (const end of Array.from(openSubscriptions)) end();
+		},
+		drainNotifications,
+	};
+}
+
+export function createEngine(config: EngineConfig): Engine {
+	const resolved = resolveConfig(config);
+	const { logger } = resolved;
+	const registry = buildRegistry(resolved.tasks);
+	validateTasks(registry, resolved);
+
+	const ownsPool = typeof resolved.postgres === "string";
+	const pool =
+		typeof resolved.postgres === "string"
+			? new Pool({ connectionString: resolved.postgres, max: resolved.poolMax })
+			: resolved.postgres.pool;
+	if (ownsPool) {
+		// An idle client error would otherwise crash the process (unhandled "error" event).
+		pool.on("error", error => logger.error({ err: error }, "postgres pool error"));
+	}
+
+	const store: Store = createSqlStore(pool, resolved.schema);
+	const connections = createRedisConnections(resolved.redis);
+	const transport: Transport = createTransport({
+		prefix: resolved.prefix,
+		connections,
+		queues: Array.from(registry.queues.values()),
+		systemConcurrency: resolved.systemConcurrency,
+		schema: resolved.schema,
+	});
+
+	/** Set synchronously by `stop()`; `executeRun` hands back any run it acquires after that. */
+	let shuttingDown = false;
+	let lifecycle: "idle" | "starting" | "started" | "stopping" = "idle";
+	let startPromise: Promise<void> | undefined;
+	let stopPromise: Promise<void> | undefined;
+
+	function assertNotStopped(): void {
+		if (lifecycle === "stopping") {
+			throw new MinitriggerError("this engine was stopped; create a new one");
+		}
+	}
+
+	const streams = createStreams({ redis: connections.shared(), prefix: resolved.prefix });
+	/** Dedicated connections of the open `runs.readStream` iterations (disconnected on `stop()`). */
+	const streamReaders = new Set<Redis>();
+
+	/** `runs.readStream`: one dedicated connection per reader (decision 14), closed at the end. */
+	async function* readRunStream(
+		runId: string,
+		name: string,
+		signal: AbortSignal | undefined
+	): AsyncGenerator<string | Json, void, undefined> {
+		if (signal?.aborted) return;
+		// A duplicate (not `connections.dedicated`, which keeps every connection until stop()):
+		// readers come and go, so each one is closed as soon as its iteration ends.
+		const reader = connections.shared().duplicate({ maxRetriesPerRequest: null });
+		reader.on("error", (error: unknown) =>
+			logger.debug({ err: error, runId, name }, "stream reader connection error")
+		);
+		streamReaders.add(reader);
+		try {
+			yield* streams.read(runId, name, { redis: reader, ...(signal ? { signal } : {}) });
+		} finally {
+			streamReaders.delete(reader);
+			reader.disconnect();
+		}
+	}
+
+	const core = createEngineCore(
+		resolved,
+		registry,
+		{
+			store,
+			transport,
+			// Publishing uses the shared connection, so a trigger-only engine (decision 19) still
+			// publishes what it causes; only a started engine subscribes (dedicated connection).
+			publisher: createPubSubPublisher({
+				publisher: connections.shared(),
+				prefix: resolved.prefix,
+			}),
+			createPubSub() {
+				const subscriber = connections.dedicated("subscriber");
+				// ioredis reconnects (and re-subscribes) on its own; without a listener it prints
+				// every connection error to the console.
+				subscriber.on("error", (error: unknown) =>
+					logger.debug({ err: error }, "pub/sub subscriber connection error")
+				);
+				return createPubSub({
+					publisher: connections.shared(),
+					subscriber,
+					prefix: resolved.prefix,
+					logger,
+				});
+			},
+			streams,
+			readStream: readRunStream,
+		},
+		{ isShuttingDown: () => shuttingDown, assertNotStopped }
+	);
+	const { deps, active, notifier, notifyStatus, abortLocal } = core;
+
+	// --- Leader loop (Phase 6, decision 16): reconciler + retention scheduling, leader only. ---
+	const reconciler = createReconciler({
+		store,
+		transport,
+		logger,
+		graceMs: resolved.reconciler.graceMs,
+		stallTimeoutMs: resolved.stallTimeoutMs,
+		batchSize: resolved.reconciler.batchSize,
+		reconcileSchedules: createReconcileSchedulesHook({
+			store,
+			transport,
+			logger,
+			schema: resolved.schema,
+		}),
+		onCanceled: canceled => {
+			const runIds = canceled.map(c => c.runId);
+			abortLocal(runIds);
+			for (const c of canceled) {
+				notifyStatus({
+					runId: c.runId,
+					taskId: c.taskId,
+					status: "canceled",
+					attempt: c.attempt,
+					error: c.error,
+					updatedAt: c.updatedAt,
+					transition: "canceled",
+				});
+			}
+			notifier.canceled(runIds);
+		},
+		// Stall recovery: back to `queued` means a retry (attempt + 1), otherwise it failed.
+		onStatusChange: info =>
+			notifyStatus({
+				runId: info.runId,
+				taskId: info.taskId,
+				status: info.status,
+				attempt: info.attempt,
+				error: info.error,
+				updatedAt: info.updatedAt,
+				transition: info.status === "queued" ? "retrying" : "failed",
+			}),
+	});
+	const retention = createRetention({
+		store,
+		logger,
+		days: resolved.retentionDays,
+		batchSize: resolved.retentionBatchSize,
+	});
+	let leader: LeaderElector | undefined;
+	let leaderTimer: ReturnType<typeof setInterval> | undefined;
+	let leaderTick: Promise<void> | undefined;
+	let leaderLoopStopped = false;
+	/** Set when leadership is lost: the next tick doesn't contend, giving healthier processes a turn. */
+	let skipNextAcquire = false;
+	/** Last retention window this process enqueued (the jobs are removed on completion). */
+	let lastRetentionWindow: number | undefined;
+	/** Every `executeRun` call still in progress (from the acquire to its last enqueue). */
+	const inFlight = new Set<Promise<void>>();
+
+	function start(options: StartOptions = {}): Promise<void> {
+		try {
+			assertNotStopped();
+		} catch (error) {
+			return Promise.reject(error);
+		}
+		if (lifecycle !== "idle") {
+			return Promise.reject(new MinitriggerError("engine.start() was already called"));
+		}
+		lifecycle = "starting";
+		const attempt = (async () => {
+			// Decision 22: a check that cannot run only warns; a wrong answer throws (Postgres
+			// version, Redis eviction policy, pending migrations -- `autoMigrate: false` because
+			// `start()` does not call `migrate()` itself; a pending migration must be applied via
+			// `engine.migrate()` first, and the thrown `ConfigError` says so).
+			// `checkEnvironment` itself calls `logger.warn` per warning; nothing else to do with the
+			// returned report here.
+			await checkEnvironment({
+				pool,
+				redis: connections.shared(),
+				schema: resolved.schema,
+				logger,
+				autoMigrate: false,
+			});
+
+			// On failure `startWorkers` closes whatever workers it already created.
+			await transport.startWorkers({
+				...(options.queues ? { queues: options.queues } : {}),
+				processRun: async (_queue, data) => {
+					const execution = executeRun(deps, { runId: data.runId, seq: data.seq });
+					inFlight.add(execution);
+					try {
+						await execution;
+					} finally {
+						inFlight.delete(execution);
+					}
+				},
+				processSystem: createSystemDispatcher({
+					config: resolved,
+					store,
+					transport,
+					active,
+					notify: notifier,
+					runRetention: () => retention.runOnce(),
+					registry,
+				}),
+			});
+
+			// Phase 8, decision 21: create/update every `defineTask({ schedule })` in Postgres + BullMQ.
+			await syncDeclarativeSchedules({
+				store,
+				transport,
+				registry,
+				logger,
+				maxPayloadBytes: resolved.limits.maxPayloadBytes,
+				pruneDeclarative: resolved.schedules.pruneDeclarative,
+			});
+
+			const ps = core.getPubSub();
+			ps.onCancel(abortLocal);
+			await ps.ready;
+
+			startLeaderLoop();
+		})();
+		startPromise = attempt.then(
+			() => {
+				if (lifecycle === "starting") lifecycle = "started";
+			},
+			(error: unknown) => {
+				// Only "started" once everything is up; a failed start can be retried.
+				if (lifecycle === "starting") lifecycle = "idle";
+				throw error;
+			}
+		);
+		return startPromise;
+	}
+
+	function startLeaderLoop(): void {
+		leader = createLeaderElector({
+			...(typeof resolved.postgres === "string"
+				? { connectionString: resolved.postgres }
+				: { clientFactory: () => new Client(pool.options) }),
+			schema: resolved.schema,
+			logger,
+			onAcquire: () =>
+				logger.info(
+					{ schema: resolved.schema },
+					"this engine is now the leader (reconciler, retention)"
+				),
+			onLose: () => {
+				skipNextAcquire = true;
+				logger.warn(
+					{ schema: resolved.schema },
+					"leadership lost (dedicated client died); will try to reacquire on a later tick"
+				);
+			},
+		});
+		const tick = () => {
+			// Never overlap: a slow tick (big backlog, slow DB) makes the next ones skip.
+			if (leaderLoopStopped || leaderTick) return;
+			leaderTick = runLeaderTick()
+				.catch((error: unknown) => logger.error({ err: error }, "leader tick failed"))
+				.finally(() => {
+					leaderTick = undefined;
+				});
+		};
+		leaderTimer = setInterval(tick, resolved.reconciler.intervalMs);
+		leaderTimer.unref();
+		tick();
+	}
+
+	/**
+	 * One leader tick: contend for leadership (decision 16) and, only as leader, run the reconciler
+	 * (decisions 1, 3, 6) and make sure this retention window's `-system` job exists (decision 8).
+	 * If leadership is lost mid-tick the tick still finishes: every reconciler action is safe to run
+	 * concurrently with a new leader's (idempotent enqueues, re-checks under row locks).
+	 */
+	async function runLeaderTick(): Promise<void> {
+		if (!leader) return;
+		if (skipNextAcquire) {
+			skipNextAcquire = false;
+			return;
+		}
+		if (!(await leader.tryAcquire()) || leaderLoopStopped) return;
+		const report = await reconciler.runOnce();
+		const acted =
+			report.staleQueued +
+			report.staleWaiting +
+			report.orphanWaiting +
+			report.stalled.requeued +
+			report.stalled.failed +
+			report.expiredWaitpoints;
+		if (acted > 0 || report.errors > 0) logger.info({ ...report }, "reconciler tick");
+		if (leaderLoopStopped) return;
+		await scheduleRetention();
+	}
+
+	/**
+	 * Enqueues `retention` once per `retention.intervalMs` window, with jobId
+	 * `retention-${window}` where the window is derived from the DB clock (decision 17). The jobId
+	 * dedupes it across processes while the job exists; because jobs are removed on completion, this
+	 * process also remembers the last window it enqueued. A leadership change inside a window can
+	 * still cause a second sweep in it: harmless, retention is idempotent. (The test engine has no
+	 * leader loop, so this Postgres clock read never runs there.)
+	 */
+	async function scheduleRetention(): Promise<void> {
+		const { rows } = await pool.query<{ now_ms: string }>(
+			"SELECT floor(extract(epoch FROM now()) * 1000)::bigint AS now_ms"
+		);
+		const nowMs = Number(rows[0]?.now_ms);
+		if (!Number.isFinite(nowMs)) return;
+		const window = Math.floor(nowMs / resolved.retentionIntervalMs);
+		if (window === lastRetentionWindow) return;
+		await transport.enqueueSystem("retention", {}, { jobId: `retention-${window}` });
+		lastRetentionWindow = window;
+	}
+
+	/** Stops the leader loop: no new tick, waits for the running one, releases leadership. */
+	async function stopLeaderLoop(): Promise<void> {
+		leaderLoopStopped = true;
+		clearInterval(leaderTimer);
+		await leaderTick;
+		await leader?.close();
+	}
+
+	/** Waits (bounded) for every in-flight `executeRun`, including ones that start meanwhile. */
+	async function drainInFlight(timeoutMs: number): Promise<void> {
+		const deadline = Date.now() + timeoutMs;
+		while (inFlight.size > 0) {
+			const remaining = deadline - Date.now();
+			if (remaining <= 0) {
+				logger.warn(
+					{ inFlight: inFlight.size },
+					"stop(): executions still in flight after the drain timeout; closing the queues anyway " +
+						"(the reconciler recovers any enqueue that was lost)"
+				);
+				return;
+			}
+			let timer: ReturnType<typeof setTimeout> | undefined;
+			await Promise.race([
+				Promise.allSettled(Array.from(inFlight)),
+				new Promise<void>(resolve => {
+					timer = setTimeout(resolve, remaining);
+				}),
+			]);
+			clearTimeout(timer);
+		}
+	}
+
+	/** Decision 20: abort, release (no attempt increment, `enqueue_seq + 1`) and re-enqueue. */
+	async function handBackActiveRuns(): Promise<void> {
+		await Promise.all(
+			active.values().map(async execution => {
+				execution.handedBack = true;
+				execution.abort("shutdown");
+				try {
+					const result = await store.runs.release(execution.owner);
+					if (result.kind === "released") {
+						notifier.status({
+							runId: execution.runId,
+							taskId: execution.run.taskId,
+							status: result.enqueue.status,
+							attempt: execution.run.attempt,
+							error: execution.run.error,
+							updatedAt: result.enqueue.updatedAt,
+							transition: "queued",
+						});
+						await enqueue(deps, result.enqueue);
+						logger.info(
+							{ runId: execution.runId, taskId: execution.taskId },
+							"run handed back to the queue on shutdown"
+						);
+					}
+				} catch (error) {
+					logger.error(
+						{ runId: execution.runId, err: error },
+						"failed to release a run on shutdown; the stall reconciler will recover it"
+					);
+				}
+			})
+		);
+	}
+
+	/**
+	 * Decision 20, in order: stop the leader loop (await its tick, release leadership) -> stop
+	 * fetching -> wait for active runs up to `shutdownTimeoutMs` -> abort + release the
+	 * still-active ones -> wait (bounded) for every in-flight `executeRun`, so a run acquired during
+	 * shutdown is handed back and executor-side enqueues (retry, parent resume) land -> detach
+	 * pub/sub and flush pending publishes -> close the queues -> close the connections and the pool.
+	 */
+	function stop(): Promise<void> {
+		if (stopPromise) return stopPromise;
+		lifecycle = "stopping";
+		shuttingDown = true;
+		stopPromise = (async () => {
+			try {
+				// A concurrent start() must finish (or fail) first, or its workers would leak.
+				await startPromise?.catch(() => {});
+				await stopLeaderLoop();
+				await transport.closeWorkers({
+					timeoutMs: resolved.shutdownTimeoutMs,
+					beforeClose: async () => {
+						await handBackActiveRuns();
+						await drainInFlight(IN_FLIGHT_DRAIN_MS);
+						core.endSubscriptions();
+						for (const reader of Array.from(streamReaders)) reader.disconnect();
+						await core.currentPubSub()?.close();
+						await core.drainNotifications(NOTIFY_DRAIN_MS);
+					},
+				});
+			} finally {
+				if (ownsPool) {
+					await pool.end().catch(error => {
+						logger.warn({ err: error }, "error closing the postgres pool");
+					});
+				}
+			}
+		})();
+		return stopPromise;
+	}
+
+	return {
+		migrate: () => migrate(pool, resolved.schema),
+		start,
+		stop,
+		trigger: core.trigger,
+		runs: core.runs,
+		tokens: core.tokens,
+		schedules: core.schedules,
+		events: core.events,
 	};
 }
 
@@ -1194,8 +1316,8 @@ function toPublicRun<O>(record: RunRecord): Run<O> {
 	};
 }
 
-/** Per-task option checks the registry doesn't do (retry, backoff, maxDurationMs, reserved queue). */
-function validateTasks(registry: Registry, config: ResolvedConfig): void {
+/** Per-task option checks the registry doesn't do (retry, backoff, maxDurationMs, reserved queue). @internal */
+export function validateTasks(registry: Registry, config: ResolvedConfig): void {
 	const reserved = systemQueueName(config.prefix);
 	for (const queue of registry.queues.values()) {
 		if (queue.name === reserved) {

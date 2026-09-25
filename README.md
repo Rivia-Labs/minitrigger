@@ -538,6 +538,62 @@ interface StepApi {
 `Duration` fields accept either a number of milliseconds or a string like `"5m"`, `"2d"`, `"1.5h"`
 (`ms`, `s`, `m`, `h`, `d`, `w`).
 
+## Testing your tasks
+
+`createTestEngine({ tasks })` runs your real task code with **no Redis and no Postgres**: an
+in-memory store and queue, driven through the same executor as production (replay, memoization,
+suspension, retries, non-determinism checks). Nothing runs in the background; the test drives it.
+
+```ts
+import { createTestEngine } from "minitrigger";
+import { expect, it } from "vitest";
+import { approval } from "./tasks.js";
+
+it("approves a document", async () => {
+	const engine = createTestEngine({ tasks: [approval] });
+
+	// Triggers and runs until the run finishes or blocks. Sleeps and retry backoffs are instant.
+	const first = await engine.runInline(approval, { doc: "contract.pdf" });
+	expect(first.status).toBe("waiting"); // blocked on ctx.step.waitForToken
+
+	const [token] = await engine.tokens.pending(first.runId);
+	await engine.tokens.complete(token!.id, { approved: true });
+
+	const final = await engine.drive(first.runId); // runs again until idle
+	expect(final).toMatchObject({ status: "completed", output: { status: "approved" } });
+	await engine.stop();
+});
+```
+
+- `runInline(task, payload, options?)` returns `{ runId, status, output, error, attempt }`.
+  Children of `triggerAndWait`/`batchTriggerAndWait` run inline too. A failed run is returned,
+  not thrown: `error` is the stored error (e.g. `{ name: "NonDeterminismError", ... }`).
+- `trigger` only enqueues; `drain()` runs everything due; `drive(run)` = `drain()` + the run's
+  result.
+- **Clock.** The engine has its own clock (`clock: { start }`, default: now), used as the database
+  clock. With the default `autoAdvance: true`, when nothing is due but a run is delayed (a
+  `sleep`, a retry backoff, `trigger({ delay })`), the clock jumps straight to the **earliest**
+  delayed job of **any** kind, in time order — a token or `triggerAndWait` timeout included, even
+  one no execution has reached `waitForToken`/`triggerAndWait` for yet. This means a run that
+  first sleeps past a *shorter* timeout it already created (e.g.
+  `createToken(..., { timeout: "1h" })` then `sleep("2h")` then `waitForToken`) will see that
+  token time out at the 1h mark before the sleep resolves, exactly as it would with a real clock:
+  the token's own expiry does not wait for anyone to start waiting on it. Use
+  `autoAdvance: false` and `await engine.clock.advance(...)` to interleave instead (e.g. complete
+  a token before its timeout even though a later step would have slept past it).
+- `runs.*`, `tokens.complete`, `events.on`, `schedules.*` and `runs.subscribe`/`readStream` work
+  as in `createEngine`. There is no `migrate`/`start`. Cron schedules don't fire on their own:
+  `await engine.tickSchedule(id)` fires one occurrence (a `defineTask({ schedule })` uses the task
+  id) — it syncs every `defineTask({ schedule })` into the store first (lazily, once; `schedules.*`,
+  `drain`/`drive`/`runInline`/`clock.advance` and `trigger` also trigger that sync, so
+  `schedules.list()` on a fresh engine already sees them), rejects with a `ConfigError` for an
+  unknown schedule id, and rejects with whatever error the tick job itself failed with.
+- `EngineClient` (`Pick<Engine, "trigger" | "runs" | "tokens" | "schedules" | "events">`) is the
+  surface `Engine` and `TestEngine` share: use it to type a helper that works against either.
+- `maxDurationMs`, heartbeats and log flushes still use real timers. A drain that processes more
+  than `maxJobsPerDrain` jobs (default 10 000) throws, to catch runs that never settle. There is no
+  `retention` option: the test engine's `-system` worker never runs real retention sweeps.
+
 ## Operation
 
 - **Startup environment checks.** `engine.start()` runs `checkEnvironment()` before starting any

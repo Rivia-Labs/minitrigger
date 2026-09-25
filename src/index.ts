@@ -4,6 +4,7 @@ export {
 	type CompleteTokenOutcome,
 	createEngine,
 	type Engine,
+	type EngineClient,
 	type EngineEvents,
 	type EngineRuns,
 	type EngineTokens,
@@ -63,6 +64,16 @@ export type {
 	WaitResult,
 } from "./task.js";
 export { defineTask } from "./task.js";
+export {
+	createTestEngine,
+	type InlineRunResult,
+	type PendingToken,
+	type TestClock,
+	type TestClockOptions,
+	type TestEngine,
+	type TestEngineConfig,
+	type TestEngineTokens,
+} from "./testing/index.js";
 export type { BackoffOptions, RetryOptions } from "./utils/backoff.js";
 export { type Duration, parseDuration } from "./utils/duration.js";
 export type { Json, Serializable } from "./utils/serialization.js";
