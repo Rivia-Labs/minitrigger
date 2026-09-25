@@ -58,6 +58,7 @@ export function defineDebounceConcurrencyContractSuite(get: () => StoreHarness):
 			await get().advance(4_000);
 			const second = await s().runs.create(newRun({ payload: { n: 1 }, debounce: debounce() }));
 			if (second.kind !== "debounced") throw new Error(`expected debounced, got ${second.kind}`);
+			if (second.enqueue === null) throw new Error("expected an enqueue: run_after moved");
 			expect(second.run.id).toBe(first.run.id);
 			expect(second.staleSeq).toBe(1);
 			expect(second.enqueue).toMatchObject({ runId: first.run.id, seq: 2, status: "queued" });
@@ -100,10 +101,53 @@ export function defineDebounceConcurrencyContractSuite(get: () => StoreHarness):
 			expect(await dueIn(res.run.id)).toBeLessThanOrEqual(1_000);
 		});
 
+		it("collapse after run_after is pinned at the deadline doesn't bump the seq again (audit item 1)", async () => {
+			const opts = debounce({ delayMs: 1_000, maxDelayMs: 1_200 });
+			const first = await s().runs.create(newRun({ debounce: opts }));
+			expect(first.kind).toBe("created");
+			// Push past the deadline: run_after actually changes (now+1000 -> the pinned deadline),
+			// so this collapse legitimately bumps the seq and must be re-enqueued.
+			await get().advance(300);
+			const pinning = await s().runs.create(newRun({ payload: { n: 1 }, debounce: opts }));
+			if (pinning.kind !== "debounced") throw new Error(`expected debounced, got ${pinning.kind}`);
+			expect(pinning.enqueue).not.toBeNull();
+			expect(pinning.run.enqueueSeq).toBe(2);
+			// Further collapses before the deadline recompute the SAME pinned run_after: nothing to
+			// enqueue, so the seq must stay put (the bug: it used to bump every time, fencing the
+			// job that's already correctly scheduled for the deadline before it can be acquired).
+			// `advance()` itself shifts every stored timestamp (including this run's `run_after` and
+			// `debounce_deadline`, together, on the SQL store -- see the harness above) to simulate
+			// time passing, so each "unchanged" check below compares against a value read AFTER that
+			// shift but BEFORE the create() call, isolating the collapse's own effect from advance()'s.
+			await get().advance(100);
+			const beforeAgain = (await s().runs.get(first.run.id))?.runAfter?.getTime();
+			const again = await s().runs.create(newRun({ payload: { n: 2 }, debounce: opts }));
+			if (again.kind !== "debounced") throw new Error(`expected debounced, got ${again.kind}`);
+			expect(again.enqueue).toBeNull();
+			expect(again.run.enqueueSeq).toBe(2);
+			expect(again.run.payload).toEqual({ n: 2 });
+			expect((await s().runs.get(first.run.id))?.runAfter?.getTime()).toBe(beforeAgain);
+			await get().advance(50);
+			const beforeYetAgain = (await s().runs.get(first.run.id))?.runAfter?.getTime();
+			const yetAgain = await s().runs.create(newRun({ payload: { n: 3 }, debounce: opts }));
+			if (yetAgain.kind !== "debounced")
+				throw new Error(`expected debounced, got ${yetAgain.kind}`);
+			expect(yetAgain.enqueue).toBeNull();
+			expect(yetAgain.run.enqueueSeq).toBe(2);
+			expect((await s().runs.get(first.run.id))?.runAfter?.getTime()).toBe(beforeYetAgain);
+			// The still-current seq (2) can acquire; nothing stale was ever produced by the no-op
+			// collapses.
+			expect(await s().runs.acquire(first.run.id, randomUUID(), 2)).not.toBeNull();
+		});
+
 		it("the stale seq cannot acquire; the new seq acquires and releases the key", async () => {
 			const first = await s().runs.create(newRun({ debounce: debounce() }));
+			// Moves run_after (not just the clock staying put), so this collapse legitimately bumps
+			// the seq -- the scenario this test is about (a stale job left over from a real reschedule).
+			await get().advance(1_000);
 			const second = await s().runs.create(newRun({ debounce: debounce() }));
 			if (second.kind !== "debounced") throw new Error("expected debounced");
+			if (second.enqueue === null) throw new Error("expected an enqueue: run_after moved");
 			expect(await s().runs.acquire(first.run.id, randomUUID(), second.staleSeq)).toBeNull();
 			const run = await s().runs.acquire(first.run.id, randomUUID(), second.enqueue.seq);
 			expect(run?.status).toBe("running");
@@ -160,8 +204,76 @@ export function defineDebounceConcurrencyContractSuite(get: () => StoreHarness):
 			expect(new Set(results.map(r => r.run.id)).size).toBe(1);
 			expect(results.filter(r => r.kind === "created")).toHaveLength(1);
 			expect(results.filter(r => r.kind === "debounced")).toHaveLength(5);
-			const run = await s().runs.get(results[0]?.run.id ?? "");
-			expect(run?.enqueueSeq).toBe(6);
+			const runId = results[0]?.run.id ?? "";
+			const run = await s().runs.get(runId);
+			if (!run) throw new Error("run disappeared");
+			// How many of the 6 serialized collapses actually moved `run_after` (and so bumped the
+			// seq, audit item 1) is a clock-resolution artifact: real Postgres' `now()` ticks
+			// between statements, the memory store's injected clock does not move on its own between
+			// transactions (docs/store-contract.md). What must hold regardless of that: the run's
+			// CURRENT seq is always the live, acquirable one.
+			expect(await s().runs.acquire(runId, randomUUID(), run.enqueueSeq)).not.toBeNull();
+		});
+
+		it("a debounce collapse never resets concurrency_waits, nor pulls run_after earlier than a pending backoff (audit item 1, review item 4)", async () => {
+			// Verifies the audit's secondary concern: does the collapse UPDATE reset backoff for a
+			// run that also carries a concurrencyKey? It must not -- `concurrency_waits` is reset
+			// only by `acquireWithConcurrencyLimit`'s own acquire path, never by the debounce
+			// collapse (docs/store-contract.md, "Schema assumptions for 005").
+			const holder = await s().runs.create(newRun({ concurrencyKey: "ck" }));
+			if (holder.kind !== "created") throw new Error("expected created");
+			expect(
+				(await s().runs.acquireWithConcurrencyLimit(holder.run.id, randomUUID(), 1, { limit: 1 }))
+					.kind
+			).toBe("acquired");
+
+			const opts = { limit: 1 };
+			const b = await s().runs.create(
+				newRun({ concurrencyKey: "ck", debounce: debounce({ key: "d1", delayMs: 50 }) })
+			);
+			if (b.kind !== "created") throw new Error("expected created");
+			// holder still holds the only slot: b is limited once, bumping its concurrency_waits
+			// 0 -> 1 (and its seq), pushing its run_after out to roughly a 1s backoff.
+			const limited1 = await s().runs.acquireWithConcurrencyLimit(b.run.id, randomUUID(), 1, opts);
+			if (limited1.kind !== "limited") throw new Error(`expected limited, got ${limited1.kind}`);
+			expect(limited1.enqueue.delayMs).toBeGreaterThan(1_000 - SLACK_MS);
+			expect(limited1.enqueue.delayMs).toBeLessThanOrEqual(1_250);
+
+			// Review item 4: a debounce collapse of the same key arrives with a much shorter delay
+			// (50ms) than the pending backoff (~1s). The run is still `queued` (a limited attempt
+			// never leaves `queued`), so it collapses -- but must NOT pull run_after back to the
+			// debounce's own (sooner) deadline while `concurrency_waits > 0`: doing so would let the
+			// very next acquisition attempt through before the backoff it's owed, skipping it
+			// entirely. Nothing to reschedule => no enqueue, no seq bump either (audit item 1's rule).
+			// `advance()` shifts every stored timestamp together (docs/store-contract.md), so the
+			// "unchanged" snapshot below is taken AFTER it, isolating the collapse's own effect.
+			await get().advance(10);
+			const runAfterBackoff = (await s().runs.get(b.run.id))?.runAfter?.getTime();
+			const collapsed = await s().runs.create(
+				newRun({ concurrencyKey: "ck", debounce: debounce({ key: "d1", delayMs: 50 }) })
+			);
+			if (collapsed.kind !== "debounced")
+				throw new Error(`expected debounced, got ${collapsed.kind}`);
+			expect(collapsed.enqueue).toBeNull();
+			expect(collapsed.run.id).toBe(b.run.id);
+			expect(collapsed.run.enqueueSeq).toBe(limited1.enqueue.seq);
+			// run_after is unchanged (never moved earlier); the payload still updates ("last").
+			expect((await s().runs.get(b.run.id))?.runAfter?.getTime()).toBe(runAfterBackoff);
+			expect(collapsed.run.payload).toEqual({ n: 0 });
+
+			// If the collapse had reset concurrency_waits back to 0, this next limited attempt would
+			// report the BASE backoff again; since it must not touch it, this is the SECOND
+			// consecutive limited attempt and reports the next (roughly doubled) tier. Reuses
+			// `limited1`'s seq: the collapse above left it as the current, live one.
+			const limited2 = await s().runs.acquireWithConcurrencyLimit(
+				b.run.id,
+				randomUUID(),
+				collapsed.run.enqueueSeq,
+				opts
+			);
+			if (limited2.kind !== "limited") throw new Error(`expected limited, got ${limited2.kind}`);
+			expect(limited2.enqueue.delayMs).toBeGreaterThan(2_000 - SLACK_MS);
+			expect(limited2.enqueue.delayMs).toBeLessThanOrEqual(2_250);
 		});
 
 		it("inside a transaction the debounce collapse works too", async () => {

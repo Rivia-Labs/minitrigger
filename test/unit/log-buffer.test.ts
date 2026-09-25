@@ -176,6 +176,32 @@ describe("createLogBuffer", () => {
 		expect(() => JSON.stringify(entry?.data)).not.toThrow();
 	});
 
+	it("preserves a sparse array's holes as null, like JSON.stringify (audit item low-b)", async () => {
+		const { insertBatch } = fakeInsertBatch();
+		const mirrorCalls: Record<string, unknown>[] = [];
+		const mirror = {
+			debug: () => {},
+			info: (fields: Record<string, unknown>) => mirrorCalls.push(fields),
+			warn: () => {},
+			error: () => {},
+		};
+		const logger = createLogBuffer({ runId: "run-1", insertBatch, maxLogEntryBytes: 1024, mirror });
+
+		// biome-ignore lint/suspicious/noSparseArray: exercising the sparse-array sanitization path
+		const sparse = [1, , 3];
+		expect(() => logger.info("has sparse array", { items: sparse } as never)).not.toThrow();
+		await logger.close();
+
+		const fields = mirrorCalls[0];
+		const items = fields?.items;
+		expect(Array.isArray(items)).toBe(true);
+		// A real, JSON.stringify-equivalent array: index 1 holds an actual `null`, not a hole (a
+		// hole would make `1 in items` false and `toEqual([1, null, 3])` fail to match it).
+		expect(1 in (items as unknown[])).toBe(true);
+		expect(items).toEqual([1, null, 3]);
+		expect(JSON.stringify(items)).toBe(JSON.stringify([1, null, 3]));
+	});
+
 	it("never throws for a bigint in data (converted to its decimal string)", async () => {
 		const { insertBatch, calls } = fakeInsertBatch();
 		const logger = createLogBuffer({ runId: "run-1", insertBatch, maxLogEntryBytes: 1024 });

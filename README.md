@@ -278,7 +278,10 @@ queue **without spending an attempt**, and tries again.
 - Each time a run is found over the limit it retries with a growing backoff (roughly doubling,
   starting around a second, capped at 30 s, plus jitter); the count resets to 0 once the run
   acquires. A key that's busy for a long time means the polling cost per waiting run grows to that
-  30 s ceiling, not a tight loop.
+  30 s ceiling, not a tight loop — concretely, once a waiting run's own backoff has climbed toward
+  the ceiling, the LATENCY from the key's slot actually freeing up to that run acquiring it can
+  itself be as long as ~30 s (its next scheduled retry), not just "about a second"; a fresh
+  (never-yet-limited) run always tries again within about a second regardless.
 - Only `running` runs count: a run waiting on a sleep, token or child does not hold a slot, so
   another run of the key may execute while it waits.
 - Runs triggered without a `concurrencyKey` are not limited. Using `concurrencyKey` on a task whose
@@ -475,7 +478,8 @@ for await (const token of engine.runs.readStream<string>(runId, "answer")) proce
   kept) and ends at the writer's end marker. When the stream ended with an error (the `source`
   given to `ctx.stream` threw, or the attempt was aborted mid-stream), the iteration **throws** a
   `MinitriggerError` (with the original `Name: message`) after yielding the chunks written before
-  it. Each reader uses its own Redis connection, closed when the iteration ends (or on `stop()`).
+  it. Each reader uses its own Redis connection, closed when the iteration ends (or on `stop()`,
+  which ends the iteration cleanly, without an error, like `runs.subscribe`).
 - Readers stop at the **first** end marker. If a run retries after a stream error, the next
   attempt's `ctx.stream` with the same name appends to the same stream key, after that marker:
   a reader starting from the beginning never sees the retry's chunks. Use a per-attempt name
@@ -498,19 +502,30 @@ run: async (payload, ctx) => {
 
 `ctx.progress.set(value)` overwrites a single value per run (`runs.progress`; `null` until the
 first call) — not a log, not a step: it isn't memoized and doesn't participate in non-determinism
-detection, so calling it a different number of times across replays is fine. `value` is validated
-like a payload (`Serializable`, `limits.maxProgressBytes`, default 16 KB) and rejects with
+detection, so calling it a different number of times across replays is fine. `value`'s type is
+inferred per call (`set<T>(value: T & Serializable<T>)`, same as `step.run`/a payload), so a plain
+interface or object type works directly, not just `Json`. It's validated like a payload
+(`Serializable`, `limits.maxProgressBytes`, default 16 KB) and rejects with
 `SerializationError` if it's too large — a normal error the task can catch, unlike an invalid
 `ctx.step.*` argument. Writes are coalesced (at most one every 250 ms; only the latest value
 survives a burst) and the last value set is flushed before the run's next completion, failure or
-suspension is written, unless this execution has already lost ownership of the run (canceled, hand
-back on shutdown, ...) — that's the same "drop with a warning" fallback `ctx.logger` uses when it
-loses the run. A write that fails is retried once; if the retry also fails, only that value is
+suspension is written, and before `engine.stop()` hands a still-running run back to the queue
+(decision 20: the flush happens before the release, while this process still owns the run). A
+value is dropped only when this execution has already lost ownership of the run (canceled, stall
+recovered elsewhere, ...) — the same "drop with a warning" fallback `ctx.logger` uses when it loses
+the run. A `ctx.progress.set` after the attempt ended (e.g. from code still running after a
+rejected `Promise.all`) writes nothing and logs one warning. A write that fails is retried once; if the retry also fails, only that value is
 dropped (with a warning) — a transient store hiccup doesn't disable progress for the rest of the
 execution. It survives retries and resumes (the engine never resets it on its own).
 `engine.runs.get`/`runs.list` read the latest value back; `runs.subscribe` emits `update.progress`
 on each persisted change (best-effort over pub/sub, with a periodic re-read as a safety net; a
 progress-only change is emitted on its own, not just as a side effect of a status transition).
+
+Nit: on `engine.stop()`'s graceful hand-back, progress and logs are treated differently. The
+pending progress value is flushed (as above — decision 20, before the release, while this process
+still owns the run), but any log entries still buffered at that point are dropped with a `warn`
+(see `ctx.logger` above): logs are a stream meant to be written promptly, not a single
+"latest value" a resumed attempt still needs.
 
 ### Schedules (cron)
 
@@ -597,6 +612,21 @@ schema that owned it was retired). Two further guards remain for deployments tha
 schema, the reconciler never deletes a scheduler tagged with another schema, and a `schedule-tick`
 tagged with another schema is refused (logged as an error, retried by BullMQ, nothing created or
 removed). They limit the damage; they don't make a shared prefix work.
+The exception is a **retired** schema: when a job scheduler (or tick) tagged with another schema
+is met and that schema, its `schedules` table or the schedule's row no longer exists in the
+engine's database, the scheduler is removed (one `warn`) instead of failing every tick forever.
+The check only sees the engine's own database, so on its own it would wrongly call a schema
+"retired" whenever it lives in a DIFFERENT database (e.g. a blue/green deploy: the old engine on
+database A, the new one on database B, both sharing one Redis prefix) — it has no way to see that
+the old engine's schema is still there, still ticking, just not in database B. A second, database-
+independent guard closes that gap: removal only ever happens while THIS engine holds the prefix's
+owner key (`${prefix}:owner-schema`) EXCLUSIVELY for its own schema — the same key `start()` writes
+above. **Do not delete `${prefix}:owner-schema` while the schema that owns it might still be
+running** (e.g. before an old engine has fully stopped during a blue/green cutover): as long as
+that key is missing or points at some other schema, this engine treats every foreign-tagged
+scheduler as live and never removes it, no matter what its own database says. Delete the key only
+once the retired schema's engine is confirmed stopped, so the new engine's `claimPrefix()` can
+take over it — that's also what makes the cross-database removal above safe to run at all.
 
 ### `ctx` (second argument of a task's `run`)
 
@@ -607,7 +637,7 @@ type TaskContext = {
 	signal: AbortSignal;               // cancellation, maxDurationMs, lost ownership, shutdown, or the attempt ending
 	run: { id: string; taskId: string; attempt: number; createdAt: Date };
 	stream(name: string, source: AsyncIterable<Json | string>): Promise<void>;
-	progress: { set(value: Json): Promise<void> };   // see "Progress" above
+	progress: { set<T>(value: T & Serializable<T>): Promise<void> };   // see "Progress" above
 };
 ```
 
@@ -744,6 +774,109 @@ it("approves a document", async () => {
   `retention`, only `days` is accepted (for the idempotency-key TTL check, exactly as in
   `createEngine`): the test engine never runs retention sweeps.
 
+## Upgrading to 0.2.0
+
+Migration `005_debounce_concurrency` (decisions 24/25: debounce and concurrency keys) adds two
+indexes to `runs` — `idx_runs_debounce` (unique, partial) and `idx_runs_concurrency_running`
+(partial) — with plain `CREATE INDEX`, not `CREATE INDEX CONCURRENTLY` (audit item low-d):
+`engine.migrate()` runs every pending migration inside ONE transaction (`src/migrations/migrate.ts`,
+so a failure rolls back everything instead of leaving a schema half-migrated), and
+`CREATE INDEX CONCURRENTLY` cannot run inside a transaction block at all — Postgres rejects it
+outright. A plain `CREATE INDEX` takes a `SHARE` lock on `runs` for as long as the index build
+takes, which blocks every `INSERT`/`UPDATE`/`DELETE` on `runs` (including run acquisition,
+completion and the heartbeat) — on a `runs` table with a lot of history, that can be a real,
+user-visible pause.
+
+Two ways to upgrade:
+
+- **Accept the pause, in a maintenance window.** `pg_stat_user_tables`/`pg_relation_size('runs')`
+  gives a sense of how long a `CREATE INDEX` (not `CONCURRENTLY`) might take on your table before
+  running `engine.migrate()`; do it at low traffic, or take the engine offline for the duration.
+- **Avoid it: pre-build both indexes `CONCURRENTLY`, then tell `migrate()` they're already done.**
+  Migration 005's own `CREATE INDEX` statements have no `IF NOT EXISTS` (and can't be edited now
+  that they've shipped — schema changes only land in new migrations, see `CLAUDE.md`), so simply
+  pre-creating the indexes and then calling `engine.migrate()` as normal would fail on "relation
+  already exists" and roll back the whole batch. Instead, mark version 5 as applied directly, so
+  `migrate()`'s own bookkeeping (`schema_migrations`) skips re-running its SQL. Run this OUTSIDE a
+  transaction (e.g. `psql` with autocommit, one statement at a time — not inside a `BEGIN`), against
+  the target schema, BEFORE calling `engine.migrate()`:
+
+  ```sql
+  SET search_path TO "<schema>";
+
+  -- Fail fast instead of queueing behind (and blocking) other transactions on `runs` while this
+  -- session waits for its lock -- `ADD COLUMN` below takes a brief `ACCESS EXCLUSIVE` lock even
+  -- though it doesn't rewrite the table (all four columns are nullable or have a constant
+  -- default). Pick a timeout appropriate for your traffic; 0 disables it (the default, and NOT
+  -- what you want here).
+  SET lock_timeout = '5s';
+
+  ALTER TABLE runs
+    ADD COLUMN IF NOT EXISTS debounce_key text,
+    ADD COLUMN IF NOT EXISTS debounce_deadline timestamptz,
+    ADD COLUMN IF NOT EXISTS concurrency_key text,
+    ADD COLUMN IF NOT EXISTS concurrency_waits int NOT NULL DEFAULT 0;
+
+  CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS idx_runs_debounce
+    ON runs (task_id, debounce_key)
+    WHERE status = 'queued' AND debounce_key IS NOT NULL;
+
+  CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_runs_concurrency_running
+    ON runs (queue, concurrency_key)
+    WHERE status = 'running' AND concurrency_key IS NOT NULL;
+  ```
+
+  **Before marking version 5 applied, check both indexes actually built.** `CREATE INDEX
+  CONCURRENTLY` can be interrupted (killed session, `psql` disconnect, crash) and leave an
+  `INVALID` index behind instead of failing outright -- and because it's already named
+  `idx_runs_debounce`/`idx_runs_concurrency_running`, a re-run of the block above (`IF NOT
+  EXISTS`) would silently skip rebuilding it, since the index exists, just unusable (never
+  scanned by the planner, still maintained on every write):
+
+  ```sql
+  SELECT indexrelid::regclass::text AS index_name, indisvalid
+  FROM pg_index
+  WHERE indexrelid IN (
+    '"<schema>".idx_runs_debounce'::regclass,
+    '"<schema>".idx_runs_concurrency_running'::regclass
+  );
+  ```
+
+  If either row comes back `indisvalid = f`, drop and rebuild just that one (still outside a
+  transaction, `CONCURRENTLY` on both statements) before continuing:
+
+  ```sql
+  DROP INDEX CONCURRENTLY idx_runs_debounce; -- or idx_runs_concurrency_running
+
+  CREATE UNIQUE INDEX CONCURRENTLY idx_runs_debounce
+    ON runs (task_id, debounce_key)
+    WHERE status = 'queued' AND debounce_key IS NOT NULL;
+  -- or, for the other one:
+  CREATE INDEX CONCURRENTLY idx_runs_concurrency_running
+    ON runs (queue, concurrency_key)
+    WHERE status = 'running' AND concurrency_key IS NOT NULL;
+  ```
+
+  Re-run the `pg_index` check above until both rows show `indisvalid = t`, then, and only then,
+  mark version 5 applied:
+
+  ```sql
+  INSERT INTO "<schema>".schema_migrations (version, name)
+  VALUES (5, 'debounce_concurrency')
+  ON CONFLICT (version) DO NOTHING;
+  ```
+
+  After this, `engine.migrate()` sees version 5 already recorded and does nothing for it (its
+  `CREATE TABLE IF NOT EXISTS schema_migrations`/earlier migrations still run normally if they're
+  also pending). Double-check `<schema>` and the column/index definitions above still match
+  `src/migrations/005_debounce_concurrency.sql` in the version you're upgrading to before running
+  this by hand.
+
+If you're upgrading an existing v0.1.0 deployment (which already has migrations 001-003, including
+003's own `idx_runs_created`, applied), 004 is the only other migration 0.2.0 adds on top of 005,
+and it's metadata-only (`ALTER TABLE runs ADD COLUMN progress jsonb`, no index, near-instant) — this
+concern is specific to 005's two new indexes.
+
 ## Operation
 
 - **Startup environment checks.** `engine.start()` runs `checkEnvironment()` before starting any
@@ -776,7 +909,9 @@ it("approves a document", async () => {
   The workers stop fetching jobs first, before `stop()` waits for the leader's reconciler tick; a
   retention sweep in progress stops between batches. `stop()` also finishes when Redis is
   unreachable: Redis connections that are not ready are dropped instead of sent a `QUIT` (which
-  would wait for a reconnection that never comes).
+  would wait for a reconnection that never comes). Closing the pool the engine created is bounded
+  too (5 s): if a client is still checked out, `stop()` logs a `warn` and resolves, and the pool
+  finishes closing once that client is released. An injected pool is never closed.
 - **Pool sizing.** The pool needs `max >= total worker concurrency + 5` (the engine's own
   bookkeeping queries need headroom beyond what your workers consume). A pool the engine creates
   gets that size by default (at least 10) and a 10 s `connectionTimeoutMillis`
@@ -885,12 +1020,14 @@ install](#install) exercises.
     outside a memoized step may run again unless it's idempotent.
 13. **Missed cron ticks are not backfilled.** If every process is down when a scheduled tick would
     have fired, that occurrence is skipped for good — it doesn't run late and doesn't accumulate.
-14. **A failed attempt waits for its steps still in flight.** When the task function throws while
-    other steps are still running (e.g. one step of a `Promise.all` rejects), the engine waits for
-    them before recording the failure, without aborting `ctx.signal`: a step that completes is
-    recorded and the retry reuses its output instead of running it again. `maxDurationMs` still
-    bounds that wait (the attempt then fails with the original error, and the unfinished steps
-    re-run on the retry); a step that would suspend meanwhile is ignored — the error wins. A step
-    whose function only stops when `ctx.signal` aborts (instead of on its own) will block the
-    failure/retry until it finishes; set `maxDurationMs` if that step could run long, or it hangs
-    the attempt indefinitely.
+14. **A failed attempt waits for its steps still in flight — for a bounded time.** When the task
+    function throws while other steps are still running (e.g. one step of a `Promise.all`
+    rejects), the engine waits for them before recording the failure, without aborting
+    `ctx.signal`: a step that completes is recorded and the retry reuses its output instead of
+    running it again. The wait is bounded by `stallTimeoutMs` (default 60 s), or by
+    `maxDurationMs` if that ends sooner; past the bound `ctx.signal` aborts and the attempt fails
+    (or retries) with the original error, and the unfinished steps re-run on the retry. So a
+    pattern like `Promise.race([ctx.step.run("x", ...), deadline])` whose losing step never settles
+    costs at most `stallTimeoutMs` of the worker slot, not forever. A step that would suspend
+    meanwhile is ignored — the error wins. A step that ignores `ctx.signal` keeps running after the
+    bound, alongside the retry: honor `ctx.signal` in long steps.

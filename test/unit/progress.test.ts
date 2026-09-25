@@ -245,4 +245,53 @@ describe("createRunProgress", () => {
 		expect(notifyProgress).toHaveBeenCalledTimes(1);
 		expect(notifyProgress).toHaveBeenCalledWith("r1", expect.any(Date), { step: 1 });
 	});
+
+	it("warns once when set() is called after the execution ended (close())", async () => {
+		const { setProgress, calls } = fakeSetProgress();
+		const { logger, messages } = warnCollector();
+		const writer = createRunProgress(
+			{ runs: { setProgress }, config: { logger, heartbeatTimeoutMs: 5_000 } },
+			ctx(),
+			{ intervalMs: 10 }
+		);
+		await writer.close();
+		writer.set({ a: 1 });
+		writer.set({ a: 2 });
+		await sleep(20);
+		expect(calls).toEqual([]);
+		expect(messages.filter(m => m.includes("after this execution ended"))).toHaveLength(1);
+	});
+
+	it("flushForHandBack() writes the pending value even though ownership is already marked gone", async () => {
+		const { setProgress, calls } = fakeSetProgress();
+		let gone = false;
+		const writer = createRunProgress(
+			{ runs: { setProgress }, config: { logger: quietLogger, heartbeatTimeoutMs: 5_000 } },
+			ctx({ ownershipGone: () => gone }),
+			{ intervalMs: 10_000 }
+		);
+		writer.set({ a: 1 }); // leading write
+		writer.set({ a: 2 }); // pending behind the window
+		// What stop() does (decision 20): mark the execution handed back, then flush BEFORE the
+		// release, while the store's ownership guard still accepts this execution's writes.
+		gone = true;
+		const flushed = writer.flushForHandBack();
+		// The executor's own close() racing it must not drop the value.
+		await Promise.all([flushed, writer.close()]);
+		expect(calls).toEqual([{ a: 1 }, { a: 2 }]);
+	});
+
+	it("flushForHandBack() with nothing pending waits for the write in flight and writes nothing more", async () => {
+		const { setProgress, calls } = fakeSetProgress();
+		const writer = createRunProgress(
+			{ runs: { setProgress }, config: { logger: quietLogger, heartbeatTimeoutMs: 5_000 } },
+			ctx(),
+			{ intervalMs: 10_000 }
+		);
+		writer.set({ a: 1 });
+		await writer.flushForHandBack();
+		expect(calls).toEqual([{ a: 1 }]);
+		await writer.close();
+		expect(calls).toEqual([{ a: 1 }]);
+	});
 });

@@ -51,10 +51,13 @@ import { createReconciler } from "./reconciler.js";
 import { buildRegistry, getTask, type Registry, type ResolvedQueue } from "./registry.js";
 import { createRetention } from "./retention.js";
 import {
-	assertScheduleTickSchema,
 	createReconcileSchedulesHook,
 	createSchedulesApi,
 	type EngineSchedules,
+	foreignScheduleState,
+	foreignScheduleTickSchema,
+	removeRetiredForeignScheduler,
+	ScheduleTickSchemaMismatchError,
 	syncDeclarativeSchedules,
 } from "./schedules.js";
 import { createSqlStore } from "./store/sql/index.js";
@@ -90,10 +93,18 @@ const DEFAULT_LIST_LIMIT = 20;
 const IN_FLIGHT_DRAIN_MS = 5_000;
 /** How long `stop()` waits for the re-enqueue of each run it hands back (Redis may be unreachable). */
 const HAND_BACK_ENQUEUE_TIMEOUT_MS = 3_000;
+/** Added to `2 * heartbeatTimeoutMs` for the hand-back flush of each still-active run on `stop()`. */
+const HAND_BACK_FLUSH_MARGIN_MS = 500;
 /** How long `stop()` waits for a running leader tick before releasing leadership. */
 const LEADER_TICK_STOP_TIMEOUT_MS = 5_000;
 /** How long `stop()` waits for pending best-effort status/cancel publishes before closing Redis. */
 const NOTIFY_DRAIN_MS = 2_000;
+/**
+ * How long `stop()` waits for `pool.end()` of the pool the engine created (review item b):
+ * `pg` only resolves it once every checked-out client is released, so a client held by work that
+ * survived the bounded waits above would otherwise keep `stop()` pending forever.
+ */
+export const POOL_END_TIMEOUT_MS = 5_000;
 const DEFAULT_LOGS_LIMIT = 100;
 const MAX_LOGS_LIMIT = 1_000;
 /**
@@ -644,10 +655,13 @@ export function createEngineCore(
 				updatedAt: result.run.updatedAt,
 			});
 			await enqueue(deps, result.enqueue);
-		} else if (result.kind === "debounced") {
+		} else if (result.kind === "debounced" && result.enqueue) {
 			// Decision 24: the pending run stays `queued` (nothing is published); its seq was
 			// bumped, so enqueue the new job first, then drop the stale one (best-effort: a
-			// redelivery of it is rejected by `acquire`'s seq check anyway).
+			// redelivery of it is rejected by `acquire`'s seq check anyway). Audit item 1: when
+			// `run_after` didn't actually change (e.g. already pinned at the debounce deadline),
+			// `enqueue` is null and there is nothing to (re)schedule or remove -- the job already
+			// enqueued for the unchanged `run_after`/seq is still exactly right.
 			await enqueue(deps, result.enqueue);
 			await transport.removeRunJob(result.run.queue, result.run.id, result.staleSeq);
 		}
@@ -1024,8 +1038,12 @@ export function createEngine(config: EngineConfig): Engine {
 	const streams = createStreams({ redis: connections.shared(), prefix: resolved.prefix });
 	/** The pub/sub subscriber connection, once created (disconnected directly by `stop()`). */
 	let subscriberConnection: Redis | undefined;
-	/** Dedicated connections of the open `runs.readStream` iterations (disconnected on `stop()`). */
-	const streamReaders = new Set<Redis>();
+	/**
+	 * Dedicated connections of the open `runs.readStream` iterations, each with the controller that
+	 * `stop()` aborts before disconnecting it, so the iteration ends cleanly (like
+	 * `runs.subscribe`) instead of rejecting with "Connection is closed".
+	 */
+	const streamReaders = new Map<Redis, AbortController>();
 
 	/** `runs.readStream`: one dedicated connection per reader (decision 14), closed at the end. */
 	async function* readRunStream(
@@ -1033,16 +1051,22 @@ export function createEngine(config: EngineConfig): Engine {
 		name: string,
 		signal: AbortSignal | undefined
 	): AsyncGenerator<string | Json, void, undefined> {
-		if (signal?.aborted) return;
+		// First iterated after stop() began: nothing would disconnect this reader any more.
+		if (signal?.aborted || shuttingDown) return;
 		// A duplicate (not `connections.dedicated`, which keeps every connection until stop()):
 		// readers come and go, so each one is closed as soon as its iteration ends.
 		const reader = connections.shared().duplicate({ maxRetriesPerRequest: null });
 		reader.on("error", (error: unknown) =>
 			logger.debug({ err: error, runId, name }, "stream reader connection error")
 		);
-		streamReaders.add(reader);
+		// Aborted by stop() only: a real end-with-error marker still throws out of `streams.read`.
+		const stopController = new AbortController();
+		streamReaders.set(reader, stopController);
+		const readSignal = signal
+			? AbortSignal.any([signal, stopController.signal])
+			: stopController.signal;
 		try {
-			yield* streams.read(runId, name, { redis: reader, ...(signal ? { signal } : {}) });
+			yield* streams.read(runId, name, { redis: reader, signal: readSignal });
 		} finally {
 			streamReaders.delete(reader);
 			reader.disconnect();
@@ -1080,6 +1104,37 @@ export function createEngine(config: EngineConfig): Engine {
 	);
 	const { deps, active, notifier, notifyStatus, abortLocal } = core;
 
+	/** Review item (c): does another schema of this database still own that schedule? */
+	const stateOfForeignSchedule = (foreignSchema: string, scheduleId: string) =>
+		foreignScheduleState(pool, foreignSchema, scheduleId);
+	/**
+	 * Review item 3: does THIS engine currently, exclusively own the Redis prefix? Bound to the
+	 * same `${prefix}:owner-schema` key `claimPrefix()` writes (no TTL). `foreignScheduleState`
+	 * above only ever sees this engine's own database, so a foreign schema living in ANOTHER
+	 * database (blue/green: old engine on database A, new one on database B, same prefix) always
+	 * looks orphaned to it even while the old engine is still running -- this closes that gap: a
+	 * foreign-tagged scheduler is only ever removed when this engine holds the prefix's owner key,
+	 * i.e. nothing else currently claims it. A Redis error here is treated as "not the owner" (the
+	 * safe default: keep the scheduler); logged once at `debug` to avoid repeating on every tick.
+	 */
+	let isPrefixOwnerErrorLogged = false;
+	const isPrefixOwner = async (): Promise<boolean> => {
+		try {
+			const owner = await connections.shared().get(`${resolved.prefix}:owner-schema`);
+			return owner === resolved.schema;
+		} catch (error) {
+			if (!isPrefixOwnerErrorLogged) {
+				isPrefixOwnerErrorLogged = true;
+				logger.debug(
+					{ err: error, prefix: resolved.prefix },
+					"could not check the Redis prefix owner key; treating a foreign-tagged scheduler as " +
+						"still live (kept)"
+				);
+			}
+			return false;
+		}
+	};
+
 	// --- Leader loop (Phase 6, decision 16): reconciler + retention scheduling, leader only. ---
 	const reconciler = createReconciler({
 		store,
@@ -1093,6 +1148,8 @@ export function createEngine(config: EngineConfig): Engine {
 			transport,
 			logger,
 			schema: resolved.schema,
+			foreignScheduleState: stateOfForeignSchedule,
+			isPrefixOwner,
 		}),
 		onCanceled: canceled => {
 			const runIds = canceled.map(c => c.runId);
@@ -1156,14 +1213,38 @@ export function createEngine(config: EngineConfig): Engine {
 	 * Audit item 8: a `schedule-tick` tagged with another schema (two schemas sharing this prefix)
 	 * is refused before the tick handler could create a run here or remove the other schema's
 	 * scheduler; the throw lets BullMQ retry it, possibly on the owning engine's worker.
+	 * Review item (c): unless that schema was retired (schema, `schedules` table or row gone from
+	 * this database): then its scheduler is removed once (`warn`) and the tick ends quietly, instead
+	 * of failing 5 times per occurrence forever.
 	 */
 	const processSystem: typeof dispatchSystem = async (name, data, job) => {
 		if (name === SCHEDULE_TICK_JOB_NAME) {
-			const scheduleId =
-				typeof job.repeatJobKey === "string" ? job.repeatJobKey : String(job.id ?? "");
-			try {
-				assertScheduleTickSchema(data, resolved.schema, scheduleId);
-			} catch (error) {
+			const foreign = foreignScheduleTickSchema(data, resolved.schema);
+			if (foreign !== undefined) {
+				const dataId = (data as { scheduleId?: unknown }).scheduleId;
+				const resolvedId =
+					typeof job.repeatJobKey === "string"
+						? job.repeatJobKey
+						: typeof dataId === "string"
+							? dataId
+							: undefined;
+				const scheduleId = resolvedId ?? String(job.id ?? "");
+				if (resolvedId !== undefined) {
+					try {
+						const outcome = await removeRetiredForeignScheduler(
+							{ transport, logger, foreignScheduleState: stateOfForeignSchedule, isPrefixOwner },
+							resolvedId,
+							foreign
+						);
+						if (outcome !== "live") return;
+					} catch (error) {
+						logger.warn(
+							{ err: error, scheduleId, schema: foreign },
+							"could not check whether another schema still owns this schedule; tick refused"
+						);
+					}
+				}
+				const error = new ScheduleTickSchemaMismatchError(scheduleId, foreign, resolved.schema);
 				logger.error(
 					{ err: error, scheduleId, schema: resolved.schema },
 					"schedule tick of another schema sharing this prefix refused (nothing created or removed)"
@@ -1450,8 +1531,17 @@ export function createEngine(config: EngineConfig): Engine {
 	async function handBackActiveRuns(): Promise<void> {
 		await Promise.all(
 			active.values().map(async execution => {
-				execution.handedBack = true;
-				execution.abort("shutdown");
+				// Marks it handed back, aborts it and flushes its pending progress value while the
+				// run is still owned (after the release the ownership guard rejects that write).
+				// Bounded: `setProgress` has its own statement_timeout (heartbeatTimeoutMs) and
+				// retries once, so a Postgres outage can't hold stop() up longer than this.
+				const handBackMs = 2 * resolved.heartbeatTimeoutMs + HAND_BACK_FLUSH_MARGIN_MS;
+				if (!(await withTimeout(execution.handBack(), handBackMs))) {
+					logger.warn(
+						{ runId: execution.runId, timeoutMs: handBackMs },
+						"pending writes of a run handed back on shutdown did not finish in time; releasing it"
+					);
+				}
 				try {
 					const result = await store.runs.release(execution.owner);
 					if (result.kind === "released") {
@@ -1526,7 +1616,10 @@ export function createEngine(config: EngineConfig): Engine {
 						await handBackActiveRuns();
 						await drainInFlight(IN_FLIGHT_DRAIN_MS);
 						core.endSubscriptions();
-						for (const reader of Array.from(streamReaders)) reader.disconnect();
+						for (const [reader, controller] of Array.from(streamReaders)) {
+							controller.abort();
+							reader.disconnect();
+						}
 						await core.currentPubSub()?.close();
 						// Item 7: the subscriber is dedicated to this engine; dropped at once (a QUIT
 						// would wait in ioredis' offline queue while Redis is unreachable).
@@ -1535,10 +1628,26 @@ export function createEngine(config: EngineConfig): Engine {
 					},
 				});
 			} finally {
+				// Decision 14: only the pool the engine created. Bounded (review item b): a client
+				// still checked out would keep `pool.end()` pending forever.
 				if (ownsPool) {
-					await pool.end().catch(error => {
-						logger.warn({ err: error }, "error closing the postgres pool");
-					});
+					const ended = await withTimeout(
+						pool.end().catch(error => {
+							logger.warn({ err: error }, "error closing the postgres pool");
+						}),
+						POOL_END_TIMEOUT_MS
+					);
+					if (!ended) {
+						logger.warn(
+							{
+								timeoutMs: POOL_END_TIMEOUT_MS,
+								totalCount: pool.totalCount,
+								idleCount: pool.idleCount,
+							},
+							"the postgres pool did not close in time (a client is still checked out); " +
+								"stop() resolves anyway and the pool finishes closing once it is released"
+						);
+					}
 				}
 			}
 		})();

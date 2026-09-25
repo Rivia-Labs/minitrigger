@@ -332,6 +332,98 @@ describe("task function throws while other steps are in flight", () => {
 	});
 });
 
+describe("the drain before a failure is bounded without maxDurationMs (review item 4)", () => {
+	it("a step that never settles (Promise.race deadline pattern) no longer holds the slot: the run retries, then fails with the original error", async () => {
+		const warnLogs: { fields: unknown; message: string }[] = [];
+		const capturingLogger: EngineLogger = {
+			debug: noop,
+			info: noop,
+			warn: (fields, message) => warnLogs.push({ fields, message }),
+			error: noop,
+		};
+		const abortSeen: Array<{ attempt: number; afterMs: number }> = [];
+		// Never settles on its own (only when the test ends), so without a bound the executor
+		// would wait for it forever with the heartbeat alive.
+		let releaseSlow: () => void = () => {};
+		const slowReleased = new Promise<void>(resolve => {
+			releaseSlow = resolve;
+		});
+		const task = defineTask({
+			id: uniqueTaskId("drain-bounded"),
+			queue: { name: uniqueQueue() },
+			retry: fastRetry(2),
+			run: async (_p: { v: number }, ctx) => {
+				const attempt = ctx.run.attempt;
+				const started = Date.now();
+				ctx.signal.addEventListener("abort", () =>
+					abortSeen.push({ attempt, afterMs: Date.now() - started })
+				);
+				await Promise.race([
+					ctx.step.run("slow", async () => {
+						await slowReleased;
+						return "slow";
+					}),
+					new Promise<never>((_, reject) => setTimeout(() => reject(new Error("deadline")), 100)),
+				]);
+				return "done";
+			},
+		});
+		try {
+			const engine = await startedEngine([task], {
+				stallTimeoutMs: 800,
+				logger: capturingLogger,
+			});
+			const handle = await engine.trigger(task, { v: 1 });
+			const started = Date.now();
+			const run = await waitForStatus(engine, handle.id, "failed", 6_000);
+			expect(Date.now() - started).toBeLessThan(6_000);
+			expect(run.attempt).toBe(2);
+			expect(run.error).toMatchObject({ name: "Error", message: "deadline", retryable: true });
+			// ctx.signal fired when the bound elapsed (before the terminal write), on each attempt.
+			expect(abortSeen.map(a => a.attempt)).toEqual([1, 2]);
+			for (const seen of abortSeen) expect(seen.afterMs).toBeGreaterThanOrEqual(800);
+			const warned = warnLogs.filter(l => l.message.includes("in flight"));
+			expect(warned.length).toBeGreaterThanOrEqual(2);
+			expect(warned[0]?.fields).toMatchObject({ runId: handle.id, steps: ["slow"] });
+			expect(warnLogs.some(l => l.message.includes("gave up waiting"))).toBe(true);
+			// The step never completed: nothing memoized.
+			expect(await engine.runs.steps(handle.id)).toEqual([]);
+		} finally {
+			releaseSlow();
+		}
+	});
+
+	it("a step that finishes within the bound is still recorded and reused by the retry", async () => {
+		const bStarts: number[] = [];
+		const task = defineTask({
+			id: uniqueTaskId("drain-bounded-ok"),
+			queue: { name: uniqueQueue() },
+			retry: fastRetry(2),
+			run: async (_p: { v: number }, ctx) => {
+				const attempt = ctx.run.attempt;
+				const [, b] = await Promise.all([
+					ctx.step.run("a", () => {
+						if (attempt === 1) throw new Error("a fails on attempt 1");
+						return "a";
+					}),
+					ctx.step.run("b", async () => {
+						bStarts.push(attempt);
+						await sleep(300);
+						return "b";
+					}),
+				]);
+				return b;
+			},
+		});
+		const engine = await startedEngine([task], { stallTimeoutMs: 1_000 });
+		const handle = await engine.trigger(task, { v: 1 });
+		const run = await waitForStatus(engine, handle.id, "completed");
+		expect(run.attempt).toBe(2);
+		expect(run.output).toBe("b");
+		expect(bStarts).toEqual([1]);
+	});
+});
+
 describe("a fatal step error fails the run promptly (does not wait for in-flight steps)", () => {
 	it("a fatal NonDeterminismError (duplicate name) with a long in-flight step fails without waiting for it", async () => {
 		const task = defineTask({

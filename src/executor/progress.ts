@@ -22,7 +22,10 @@
  *   `ownershipGone`-driven "drop with a warning" spirit as `executor/logger.ts`'s run logger,
  *   Phase 7's precedent for this executor/store seam);
  * - `close()` flushes a pending value (the last `set` before the run completes/fails/suspends
- *   must never be lost), then disables further writes. Idempotent, like `logs/buffer.ts#close`.
+ *   must never be lost), then disables further writes (a later `set()` warns once and writes
+ *   nothing). Idempotent, like `logs/buffer.ts#close`.
+ * - `flushForHandBack()` flushes a pending value when `engine.stop()` hands the run back (decision
+ *   20), before the release, while this execution still owns the run.
  * - a successful write also notifies `RunNotifier.progress` (best-effort pub/sub), matching how
  *   `logs/buffer.ts` never blocks its own flush loop on the mirror sink.
  *
@@ -59,6 +62,15 @@ export interface RunProgress {
 	 * it started (or if nothing was ever written yet). Idempotent; never throws.
 	 */
 	close(): Promise<void>;
+	/**
+	 * Decision 20 (`engine.stop()` handing the run back): writes the pending value right away, even
+	 * though the execution is already marked handed back ({@link RunProgressContext.ownershipGone}
+	 * true) -- the run is only released after this resolves, so the store's ownership guard still
+	 * accepts the write. Also waits for a write already in flight. Must be called synchronously
+	 * right after marking the hand-back (before any `await`), so neither a trailing write nor
+	 * `close()` gets to drop the pending value first. Never throws.
+	 */
+	flushForHandBack(): Promise<void>;
 }
 
 const DEFAULT_INTERVAL_MS = 250;
@@ -87,6 +99,7 @@ export function createRunProgress(
 	let closed = false;
 	let stopped = false;
 	let droppedWarned = false;
+	let lateSetWarned = false;
 	// Serializes writes: `close()` awaits exactly the write already in flight (if any).
 	let writeChain: Promise<void> = Promise.resolve();
 
@@ -197,9 +210,35 @@ export function createRunProgress(
 
 	return {
 		set(value) {
-			if (closed || stopped) return;
+			if (closed) {
+				// The attempt is over (e.g. code left running after a rejected `Promise.all`, or a
+				// callback firing late): the value can no longer be written. Say so once instead of
+				// resolving silently.
+				if (!lateSetWarned) {
+					lateSetWarned = true;
+					try {
+						log.warn(
+							fields,
+							"ctx.progress.set called after this execution ended; the value was not written"
+						);
+					} catch {
+						// A broken engine logger must never fail a run.
+					}
+				}
+				return;
+			}
+			if (stopped) return;
 			pending = { value };
 			kick();
+		},
+		flushForHandBack() {
+			clearTimer();
+			if (!stopped && pending !== undefined) {
+				const value = pending.value;
+				pending = undefined;
+				writeChain = writeChain.then(() => doWrite(value));
+			}
+			return writeChain;
 		},
 		async close() {
 			if (closed) return;

@@ -441,10 +441,16 @@ export function createTestEngine(config: TestEngineConfig): TestEngine {
 			// promise the user's code never resolves). Mark every active execution handed back (so
 			// nothing writes after this point, mirroring `handBackActiveRuns`) and abort it, then wait
 			// for the drain loop bounded, so `stop()` always resolves even if the drain never does.
-			for (const execution of core.active.values()) {
-				execution.handedBack = true;
-				execution.abort("shutdown");
-			}
+			// `handBack()` also flushes a pending progress value (bounded like the drain wait).
+			const handBacks = Promise.all(Array.from(core.active.values(), e => e.handBack()));
+			let flushTimer: ReturnType<typeof setTimeout> | undefined;
+			await Promise.race([
+				handBacks,
+				new Promise<void>(resolve => {
+					flushTimer = setTimeout(resolve, STOP_DRAIN_TIMEOUT_MS);
+				}),
+			]);
+			clearTimeout(flushTimer);
 			if (running) {
 				let timer: ReturnType<typeof setTimeout> | undefined;
 				await Promise.race([

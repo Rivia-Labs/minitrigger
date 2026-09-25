@@ -47,7 +47,16 @@ Atualizado em 2026-09-25. Leia junto com `CLAUDE.md` (decisões e notas de imple
 
 - Issue #1 (progresso por run, decisão 23, migration 004) e issue #2 (debounce e concurrency key, decisões 24/25, migration 005) implementadas. Debounce sempre trailing (`mode` removido por decisão do dono); runs limitadas por concurrency key esperam com backoff de 1 s até 30 s, sem ordem FIFO.
 - Bug do BullMQ 6.3.8/6.3.9 contornado (laço sem espera ao fechar o worker); reportado em taskforcesh/bullmq#4831.
+- Segunda revisão externa aplicada (debounce preso no deadline, corrida do líder no close, tipo do `progress.set`, limite da espera por steps em voo e itens baixos); notas no `CLAUDE.md`.
 - Próximo passo opcional: release v0.2.0 (migrations 004 e 005 ficam congeladas depois dele).
+  **Antes de rodar `engine.migrate()` num deploy existente com uma tabela `runs` grande, ler
+  "Upgrading to 0.2.0" no README:** a migration 005 cria dois índices com `CREATE INDEX` simples
+  (não `CONCURRENTLY` — impossível dentro da transação única que `migrate()` usa para todo o lote),
+  o que bloqueia escrita em `runs` (inclusive aquisição/heartbeat/conclusão de run) pelo tempo de
+  build do índice. O README tem o SQL exato para pré-criar os dois índices com `CONCURRENTLY`
+  fora de uma transação e marcar a migration 5 como aplicada em `schema_migrations` diretamente
+  (as duas `CREATE INDEX` de 005 não têm `IF NOT EXISTS`, então só pré-criar os índices e rodar
+  `migrate()` normalmente FALHARIA com "relation already exists" e desfaria o lote inteiro).
 
 ### Auditoria externa (2026-09-25)
 

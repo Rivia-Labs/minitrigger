@@ -1,6 +1,6 @@
 import { describe, expectTypeOf, it } from "vitest";
 import type { Engine } from "../../src/engine.js";
-import type { StepApi, TaskOutput, TaskPayload, WaitResult } from "../../src/task.js";
+import type { StepApi, TaskOutput, TaskPayload, TaskProgress, WaitResult } from "../../src/task.js";
 import { defineTask } from "../../src/task.js";
 
 /**
@@ -361,6 +361,44 @@ describe("engine.schedules.upsert: payload required/Serializable when the task r
 	it("allows omitting payload for a task without one", () => {
 		function use(engine: Engine) {
 			engine.schedules.upsert({ id: "s2", task: withoutPayload, cron: "0 9 * * *" });
+		}
+		expectTypeOf(use).returns.toBeVoid();
+	});
+});
+
+describe("TaskProgress.set: T inferred from value, must be Serializable (audit item 3)", () => {
+	it("accepts an interface value (regression: used to be typed as Json, rejecting interfaces)", () => {
+		interface Progress {
+			done: number;
+			total: number;
+		}
+		function use(progress: TaskProgress) {
+			const p: Progress = { done: 1, total: 10 };
+			const result = progress.set(p);
+			expectTypeOf(result).toEqualTypeOf<Promise<void>>();
+		}
+		expectTypeOf(use).returns.toBeVoid();
+	});
+
+	it("accepts plain Json values, same as before", () => {
+		function use(progress: TaskProgress) {
+			progress.set({ pct: 50 });
+			progress.set(42);
+			progress.set("working");
+			progress.set(null);
+			progress.set([1, 2, 3]);
+		}
+		expectTypeOf(use).returns.toBeVoid();
+	});
+
+	it("rejects a non-serializable value", () => {
+		function use(progress: TaskProgress) {
+			// @ts-expect-error Date is not JSON-serializable
+			progress.set(new Date());
+			// @ts-expect-error Map is not JSON-serializable
+			progress.set(new Map<string, number>());
+			// @ts-expect-error a function is not JSON-serializable
+			progress.set({ done: 1, onDone: () => {} });
 		}
 		expectTypeOf(use).returns.toBeVoid();
 	});

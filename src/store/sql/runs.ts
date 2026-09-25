@@ -142,17 +142,46 @@ export function createRunStore(exec: SqlExecutor, ctx: SqlContext): RunStore {
 		);
 		const existing = found[0];
 		if (existing) {
+			// Audit item 1: `enqueue_seq` (and thus `updated_at`'s worth of rescheduling) only
+			// advances when the recomputed `run_after` actually differs from the locked row's
+			// current one -- every `SET` expression here reads the row as it was BEFORE this
+			// UPDATE, so `run_after` on the right of `IS DISTINCT FROM` is still the old value even
+			// though the same statement also assigns it a new one. A collapse that lands on the
+			// same `run_after` (e.g. already pinned at `debounce_deadline`) has nothing to
+			// reschedule: bumping the seq then would needlessly fence the job already scheduled for
+			// that unchanged `run_after` (it fences on the seq, not `run_after`).
+			// Review item 4: never move run_after earlier than its current value while a
+			// concurrency-limited attempt is backing off (`concurrency_waits > 0`) -- a `limited`
+			// acquisition already pushed run_after into the future to space out retries; a debounce
+			// collapse that pulled it back in would let the very next acquisition attempt through
+			// before the backoff it's owed, skipping it entirely. `greatest` ignores NULL, so the
+			// `CASE` below is a no-op (falls back to the plain `least(...)` collapse) whenever
+			// `concurrency_waits = 0`.
 			const { rows } = await db.query<RunRow & { delay_ms: number }>(
 				`UPDATE ${runs}
-				 SET run_after = least(${nowPlusMs("$2")}, debounce_deadline),
+				 SET run_after = greatest(
+				       least(${nowPlusMs("$2")}, debounce_deadline),
+				       CASE WHEN concurrency_waits > 0 THEN run_after END
+				     ),
 				     payload = CASE WHEN $3 THEN $4::jsonb ELSE payload END,
-				     enqueue_seq = enqueue_seq + 1, updated_at = now()
+				     enqueue_seq = CASE
+				       WHEN greatest(
+				              least(${nowPlusMs("$2")}, debounce_deadline),
+				              CASE WHEN concurrency_waits > 0 THEN run_after END
+				            ) IS DISTINCT FROM run_after
+				       THEN enqueue_seq + 1
+				       ELSE enqueue_seq
+				     END,
+				     updated_at = now()
 				 WHERE id = $1
 				 RETURNING ${RUN_COLUMNS}, ${DELAY_MS_SQL} AS delay_ms`,
 				[existing.id, debounce.delayMs, debounce.payload === "last", jsonParam(input.payload)]
 			);
 			const row = rows[0];
 			if (!row) throw new Error("debounce: locked run disappeared");
+			if (row.enqueue_seq === existing.enqueue_seq) {
+				return { kind: "debounced", run: mapRun(row), enqueue: null };
+			}
 			return {
 				kind: "debounced",
 				run: mapRun(row),

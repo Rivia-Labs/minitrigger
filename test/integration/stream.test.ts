@@ -138,4 +138,34 @@ describe("ctx.stream / runs.readStream", () => {
 			break;
 		}
 	});
+
+	it("a reader without a signal ends cleanly when engine.stop() disconnects it", async () => {
+		const client = makeEngine([]);
+		const runId = randomUUID();
+		await ns.redis.xadd(`${ns.prefix}:stream:${runId}:open`, "*", "data", JSON.stringify("a"));
+		const chunks: unknown[] = [];
+		const reading = (async () => {
+			for await (const chunk of client.runs.readStream(runId, "open")) chunks.push(chunk);
+		})();
+		await waitFor(() => chunks.length === 1, { timeoutMs: 5_000 });
+		// The reader is now blocked in XREAD BLOCK; stop() disconnects its connection.
+		await client.stop();
+		await expect(reading).resolves.toBeUndefined();
+		expect(chunks).toEqual(["a"]);
+	});
+
+	it("a stream that ended with an error still throws to the reader", async () => {
+		const client = makeEngine([]);
+		const runId = randomUUID();
+		const key = `${ns.prefix}:stream:${runId}:bad`;
+		await ns.redis.xadd(key, "*", "data", JSON.stringify("a"));
+		await ns.redis.xadd(key, "*", "end", "1", "error", "Error: boom");
+		const chunks: unknown[] = [];
+		await expect(
+			(async () => {
+				for await (const chunk of client.runs.readStream(runId, "bad")) chunks.push(chunk);
+			})()
+		).rejects.toThrow(/ended with an error: Error: boom/);
+		expect(chunks).toEqual(["a"]);
+	});
 });

@@ -127,15 +127,27 @@ NULL), now())`, status stays `waiting`, return `EnqueueRequest`. Otherwise retur
 throws). Loop (bounded; exhausted → `MinitriggerError`, not a plain `Error`), each attempt one tx:
 `SELECT id, enqueue_seq FROM runs WHERE task_id AND debounce_key AND status='queued' FOR UPDATE`.
 Found → `UPDATE runs SET run_after = least(now()+delay, debounce_deadline), payload = CASE last
-THEN $new ELSE payload END, enqueue_seq = enqueue_seq+1, updated_at = now() RETURNING` →
-`debounced` (with `staleSeq` = the locked seq; the caller enqueues the new seq and removes
-`${id}-${staleSeq}`); always trailing, and `concurrency_key`/`debounce_deadline`/`max_attempts` of
-the locked run are never touched by the collapse (only `run_after` and, per `payload`, the
-payload). Not found → `SAVEPOINT`; `INSERT ... debounce_key, debounce_deadline = now()+maxDelay
-(NULL without), run_after = least(now()+delay, now()+maxDelay)`; a unique violation of
-`idx_runs_debounce` → `ROLLBACK TO SAVEPOINT` and loop (the next `FOR UPDATE` waits for/finds the
-winner). Never `xmax`. The memory store scans for the queued row of the key under its mutex and
-raises the same unique violation on a conflicting insert (never loops: no concurrent writer can
+THEN $new ELSE payload END, enqueue_seq = CASE WHEN least(now()+delay, debounce_deadline) IS
+DISTINCT FROM run_after THEN enqueue_seq+1 ELSE enqueue_seq END, updated_at = now() RETURNING`
+(the `enqueue_seq`/`run_after` comparison reads the row as it stood BEFORE this UPDATE, simultaneous-
+assignment style, same statement) → `debounced` with either `{ enqueue, staleSeq: <the locked seq>
+}` when the recomputed `run_after` actually moved (caller enqueues the new seq and removes
+`${id}-${staleSeq}`) or `{ enqueue: null }` when it didn't (audit item 1: a collapse landing on the
+SAME `run_after` as before -- e.g. every collapse once it's pinned at `debounce_deadline` -- has
+nothing to reschedule; bumping the seq anyway would needlessly fence the job already correctly
+scheduled for that unchanged `run_after`/seq before a worker gets to acquire it, which broke the
+"a key that never goes quiet still runs periodically" promise under a trigger burst faster than
+acquisition). `payload` is still applied either way, and always trailing; `concurrency_key`/
+`debounce_deadline`/`max_attempts`/`concurrency_waits` of the locked run are never touched by the
+collapse (only `run_after`, `enqueue_seq` per the above, and, per `payload`, the payload -- in
+particular the collapse never resets `concurrency_waits`, which only `acquireWithConcurrencyLimit`'s
+own acquire path does). Not found → `SAVEPOINT`; `INSERT ... debounce_key, debounce_deadline =
+now()+maxDelay (NULL without), run_after = least(now()+delay, now()+maxDelay)`; a unique violation
+of `idx_runs_debounce` → `ROLLBACK TO SAVEPOINT` and loop (the next `FOR UPDATE` waits for/finds the
+winner). Never `xmax`. The memory store mirrors the same "bump `enqueue_seq` only when the
+recomputed `run_after` differs from the locked row's current one" rule (comparing the two `number`s
+directly, no `now()` round-trip needed) and scans for the queued row of the key under its mutex,
+raising the same unique violation on a conflicting insert (never loops: no concurrent writer can
 interleave under its mutex).
 
 `engine.runs.replay(id)` = `get` + `create` (new id, same task/payload, current queue and

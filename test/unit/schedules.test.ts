@@ -10,6 +10,7 @@ import {
 	createReconcileSchedulesHook,
 	createSchedulesApi,
 	processScheduleTick,
+	removeRetiredForeignScheduler,
 	type SchedulesApiDeps,
 	syncDeclarativeSchedules,
 } from "../../src/schedules.js";
@@ -748,6 +749,212 @@ describe("createReconcileSchedulesHook", () => {
 		await createReconcileSchedulesHook({ store, transport, logger, schema: "mt_test" })();
 
 		expect(removeCalls).toEqual(["orphan"]);
+	});
+
+	describe("review item (c): foreign-tagged schedulers of a retired schema", () => {
+		const foreign: JobSchedulerInfo = {
+			id: "foreign",
+			pattern: "0 9 * * *",
+			timezone: undefined,
+			schema: "other_schema",
+		};
+		const hookWith = (
+			state: (schema: string, id: string) => Promise<"live" | "orphaned">,
+			current: JobSchedulerInfo | undefined = foreign
+		) => {
+			const { store } = fakeStore({ schedule: null });
+			const fake = fakeTransport({
+				listJobSchedulers: async () => [foreign],
+				getJobScheduler: async () => current,
+			});
+			const { logger } = silentLogger();
+			const hook = createReconcileSchedulesHook({
+				store,
+				transport: fake.transport,
+				logger,
+				schema: "mt_test",
+				foreignScheduleState: state,
+			});
+			return { hook, removeCalls: fake.removeCalls };
+		};
+
+		it("removes it when that schema no longer owns the schedule", async () => {
+			const seen: string[] = [];
+			const { hook, removeCalls } = hookWith(async (schema, id) => {
+				seen.push(`${schema}/${id}`);
+				return "orphaned";
+			});
+			await hook();
+			expect(seen).toEqual(["other_schema/foreign"]);
+			expect(removeCalls).toEqual(["foreign"]);
+		});
+
+		it("keeps it when that schema still owns the schedule", async () => {
+			const { hook, removeCalls } = hookWith(async () => "live");
+			await hook();
+			expect(removeCalls).toEqual([]);
+		});
+
+		it("keeps it when the ownership check fails", async () => {
+			const { hook, removeCalls } = hookWith(async () => {
+				throw new Error("permission denied for schema other_schema");
+			});
+			await hook();
+			expect(removeCalls).toEqual([]);
+		});
+
+		it("keeps it when the scheduler was re-tagged meanwhile (another owner re-created the id)", async () => {
+			const { hook, removeCalls } = hookWith(async () => "orphaned", {
+				...foreign,
+				schema: "mt_test",
+			});
+			await hook();
+			expect(removeCalls).toEqual([]);
+		});
+	});
+
+	// External review item 3: `foreignScheduleState` only ever sees THIS engine's database, so a
+	// foreign schema living in ANOTHER database (blue/green: old engine on database A, new one on
+	// database B, same Redis prefix) always looks "orphaned" to it, even while the old engine is
+	// still running. `isPrefixOwner` gates removal on this engine holding the Redis
+	// `${prefix}:owner-schema` key exclusively -- see `removeRetiredForeignScheduler` below for the
+	// direct unit tests, and this one integration point: the hook must never even reach
+	// `foreignScheduleState`/`getJobScheduler` when it isn't the owner.
+	describe("review item 3: isPrefixOwner gates removal", () => {
+		const foreign: JobSchedulerInfo = {
+			id: "foreign",
+			pattern: "0 9 * * *",
+			timezone: undefined,
+			schema: "other_schema",
+		};
+
+		it("never removes a foreign-tagged scheduler when this engine is not the prefix owner, even if the schema looks orphaned", async () => {
+			const stateCalls: string[] = [];
+			const { store } = fakeStore({ schedule: null });
+			const fake = fakeTransport({
+				listJobSchedulers: async () => [foreign],
+				getJobScheduler: async () => foreign,
+			});
+			const { logger } = silentLogger();
+			const hook = createReconcileSchedulesHook({
+				store,
+				transport: fake.transport,
+				logger,
+				schema: "mt_test",
+				foreignScheduleState: async (schema, id) => {
+					stateCalls.push(`${schema}/${id}`);
+					return "orphaned";
+				},
+				isPrefixOwner: async () => false,
+			});
+
+			await hook();
+
+			expect(fake.removeCalls).toEqual([]);
+			// Short-circuits before even checking foreignScheduleState.
+			expect(stateCalls).toEqual([]);
+		});
+
+		it("removes it as before when this engine IS the prefix owner", async () => {
+			const { store } = fakeStore({ schedule: null });
+			const fake = fakeTransport({
+				listJobSchedulers: async () => [foreign],
+				getJobScheduler: async () => foreign,
+			});
+			const { logger } = silentLogger();
+			const hook = createReconcileSchedulesHook({
+				store,
+				transport: fake.transport,
+				logger,
+				schema: "mt_test",
+				foreignScheduleState: async () => "orphaned",
+				isPrefixOwner: async () => true,
+			});
+
+			await hook();
+
+			expect(fake.removeCalls).toEqual(["foreign"]);
+		});
+	});
+});
+
+describe("removeRetiredForeignScheduler: isPrefixOwner (external review item 3)", () => {
+	const foreign: JobSchedulerInfo = {
+		id: "foreign",
+		pattern: "0 9 * * *",
+		timezone: undefined,
+		schema: "other_schema",
+	};
+
+	it("returns 'live' without checking foreignScheduleState when isPrefixOwner() is false (key missing or another schema owns it)", async () => {
+		const { logger } = silentLogger();
+		let foreignScheduleStateCalled = false;
+		const outcome = await removeRetiredForeignScheduler(
+			{
+				transport: {
+					getJobScheduler: async () => foreign,
+					removeJobScheduler: async () => true,
+				},
+				logger,
+				foreignScheduleState: async () => {
+					foreignScheduleStateCalled = true;
+					return "orphaned" as const;
+				},
+				isPrefixOwner: async () => false,
+			},
+			"foreign",
+			"other_schema"
+		);
+
+		expect(outcome).toBe("live");
+		expect(foreignScheduleStateCalled).toBe(false);
+	});
+
+	it("removes as before when isPrefixOwner() is true", async () => {
+		const { logger } = silentLogger();
+		const removeCalls: string[] = [];
+		const outcome = await removeRetiredForeignScheduler(
+			{
+				transport: {
+					getJobScheduler: async () => foreign,
+					removeJobScheduler: async (id: string) => {
+						removeCalls.push(id);
+						return true;
+					},
+				},
+				logger,
+				foreignScheduleState: async () => "orphaned" as const,
+				isPrefixOwner: async () => true,
+			},
+			"foreign",
+			"other_schema"
+		);
+
+		expect(outcome).toBe("removed");
+		expect(removeCalls).toEqual(["foreign"]);
+	});
+
+	it("defaults to the old behavior (treated as owner) when isPrefixOwner is omitted", async () => {
+		const { logger } = silentLogger();
+		const removeCalls: string[] = [];
+		const outcome = await removeRetiredForeignScheduler(
+			{
+				transport: {
+					getJobScheduler: async () => foreign,
+					removeJobScheduler: async (id: string) => {
+						removeCalls.push(id);
+						return true;
+					},
+				},
+				logger,
+				foreignScheduleState: async () => "orphaned" as const,
+			},
+			"foreign",
+			"other_schema"
+		);
+
+		expect(outcome).toBe("removed");
+		expect(removeCalls).toEqual(["foreign"]);
 	});
 });
 

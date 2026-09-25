@@ -134,22 +134,42 @@ function createDebounced(tx: MemTx, input: NewRun, debounce: NewRunDebounce): Cr
 	}
 	if (existing) {
 		const nextAfter = tx.now + debounce.delayMs;
-		const runAfter =
+		const collapsedAfter =
 			existing.debounceDeadline === null
 				? nextAfter
 				: Math.min(nextAfter, existing.debounceDeadline);
+		// Review item 4: never move run_after earlier than its current value while a
+		// concurrency-limited attempt is backing off (`concurrencyWaits > 0`) -- a `limited`
+		// acquisition already pushed run_after into the future to space out retries; a debounce
+		// collapse that pulled it back in would let the very next acquisition attempt through
+		// before the backoff it's owed, skipping it entirely.
+		// `runAfter` is `number | null` on `RunRow` in general (null once a run leaves `queued`),
+		// but `existing` is always `status === 'queued'` here (the lookup above filters on it), so
+		// it always has one; the `?? collapsedAfter` fallback is only there to satisfy the type.
+		const runAfter =
+			existing.concurrencyWaits > 0
+				? Math.max(collapsedAfter, existing.runAfter ?? collapsedAfter)
+				: collapsedAfter;
+		// Audit item 1 (mirrors the SQL store): only bump `enqueueSeq` when the recomputed
+		// `runAfter` actually differs from the locked row's current one. A collapse that lands on
+		// the same `runAfter` (e.g. already pinned at the debounce deadline) has nothing to
+		// reschedule -- bumping the seq then would needlessly fence the job already scheduled for
+		// that unchanged `runAfter` (`acquire` fences on the seq, not `runAfter`).
+		const seqChanged = runAfter !== existing.runAfter;
 		const row = updateRun(tx, existing, {
 			runAfter,
 			payload: debounce.payload === "last" ? toJsonb(input.payload) : existing.payload,
-			enqueueSeq: existing.enqueueSeq + 1,
+			enqueueSeq: seqChanged ? existing.enqueueSeq + 1 : existing.enqueueSeq,
 			updatedAt: tx.now,
 		});
-		return {
-			kind: "debounced",
-			run: mapRun(row),
-			enqueue: enqueueOf(row, tx.now),
-			staleSeq: existing.enqueueSeq,
-		};
+		return seqChanged
+			? {
+					kind: "debounced",
+					run: mapRun(row),
+					enqueue: enqueueOf(row, tx.now),
+					staleSeq: existing.enqueueSeq,
+				}
+			: { kind: "debounced", run: mapRun(row), enqueue: null };
 	}
 	const deadline = debounce.maxDelayMs === null ? null : tx.now + debounce.maxDelayMs;
 	const delay =

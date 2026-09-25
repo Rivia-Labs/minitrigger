@@ -280,13 +280,30 @@ export interface NewRunDebounce {
 export type CreateRunResult =
 	| { kind: "created"; run: RunRecord; enqueue: EnqueueRequest }
 	| { kind: "existing"; run: RunRecord }
-	/**
-	 * Decision 24: collapsed into the pending run of the same debounce key. `enqueue_seq` was
-	 * bumped (the run keeps its status `queued`), so the caller enqueues `enqueue` and removes the
-	 * now stale job `${runId}-${staleSeq}` best-effort (a redelivery of it is rejected by
-	 * `acquire` anyway).
-	 */
-	| { kind: "debounced"; run: RunRecord; enqueue: EnqueueRequest; staleSeq: number };
+	| DebouncedCreateRunResult;
+
+/**
+ * Decision 24: collapsed into the pending run of the same debounce key. `run_after` is
+ * recomputed as `least(now() + delayMs, debounce_deadline)`; `enqueue_seq` is bumped ONLY when
+ * that recomputation actually moves `run_after` (audit item 1: a collapse that lands on the same
+ * `run_after` as before -- e.g. every collapse after the deadline is pinned -- has nothing to
+ * reschedule, so it must not fence the job that's already correctly scheduled for it). The
+ * payload (`debounce.payload === "last"`) is still applied either way.
+ */
+export type DebouncedCreateRunResult =
+	| {
+			kind: "debounced";
+			run: RunRecord;
+			/** `run_after` changed: the caller enqueues `enqueue` and removes `${runId}-${staleSeq}`. */
+			enqueue: EnqueueRequest;
+			staleSeq: number;
+	  }
+	| {
+			kind: "debounced";
+			run: RunRecord;
+			/** `run_after` did not change: nothing to enqueue or remove. */
+			enqueue: null;
+	  };
 
 /** Decision 25: options of {@link RunStore.acquireWithConcurrencyLimit}. */
 export interface ConcurrencyLimitOptions {
@@ -476,11 +493,15 @@ export interface RunStore {
 	 * retry the whole operation once.
 	 *
 	 * With `debounce` (decision 24), in one transaction: `SELECT ... FOR UPDATE` the `queued` run
-	 * with the same `(task_id, debounce_key)`. Found => collapse into it (`run_after` always
-	 * pushed to `least(now() + delayMs, debounce_deadline)` (trailing),
-	 * payload per `payload`, ALWAYS `enqueue_seq + 1` because `acquire` does not look at
-	 * `run_after` and only the seq fences the old job) and return `debounced`. Not found =>
-	 * insert with `debounce_key`/`debounce_deadline`; a unique violation of the partial index
+	 * with the same `(task_id, debounce_key)`. Found => collapse into it: `run_after` recomputed
+	 * to `least(now() + delayMs, debounce_deadline)` (trailing), payload per `payload`;
+	 * `enqueue_seq + 1` (and `enqueue` set) ONLY when that recomputed `run_after` differs from the
+	 * locked row's current one (audit item 1 -- `acquire` fences on the seq, not `run_after`, so
+	 * bumping it when nothing actually moved would needlessly fence the job already scheduled for
+	 * the unchanged `run_after`, e.g. every collapse once `run_after` is pinned at
+	 * `debounce_deadline`); otherwise `enqueue: null`, nothing to reschedule. Returns `debounced`
+	 * either way. Not found => insert with `debounce_key`/`debounce_deadline`; a unique violation
+	 * of the partial index
 	 * (a concurrent trigger inserted first) rolls back to a savepoint and loops, now finding and
 	 * collapsing into that run. Never `xmax`.
 	 */

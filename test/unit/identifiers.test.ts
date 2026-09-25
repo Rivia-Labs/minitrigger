@@ -6,6 +6,7 @@ import {
 	validateSqlIdentifier,
 	validateStepName,
 	validateTaskId,
+	validateTriggerKey,
 } from "../../src/utils/identifiers.js";
 
 describe("validateSqlIdentifier", () => {
@@ -88,6 +89,22 @@ describe("validateStepName", () => {
 	it("accepts a step name at the length boundary", () => {
 		expect(validateStepName("a".repeat(256))).toHaveLength(256);
 	});
+
+	it("rejects NUL (audit item low-a): the raw pg error would only surface after the step fn ran", () => {
+		expect(() => validateStepName("a\u0000b")).toThrow(ConfigError);
+		expect(() => validateStepName("a\u0000b")).toThrow(/NUL/);
+	});
+
+	it("rejects a lone UTF-16 surrogate (audit item low-a): Postgres text stores it as U+FFFD, which would NonDeterminismError on replay", () => {
+		expect(() => validateStepName("a\ud800b")).toThrow(ConfigError);
+		expect(() => validateStepName("a\ud800b")).toThrow(/surrogate/);
+		// A high surrogate not followed by its low half, and a lone low surrogate, are both invalid.
+		expect(() => validateStepName("a\udc00b")).toThrow(ConfigError);
+	});
+
+	it("accepts a valid (paired) surrogate, e.g. an emoji", () => {
+		expect(validateStepName("step-\u{1f600}")).toBe("step-\u{1f600}");
+	});
 });
 
 describe("validateIdempotencyKey", () => {
@@ -105,6 +122,36 @@ describe("validateIdempotencyKey", () => {
 		expect(() => validateIdempotencyKey("__child:run:step")).toThrow(
 			/idempotency key "__child:run:step" is invalid: keys starting with "__" are reserved.*doesn't start with "__"/
 		);
+	});
+
+	it("rejects NUL and a lone surrogate (audit item low-a)", () => {
+		expect(() => validateIdempotencyKey("a\u0000b")).toThrow(ConfigError);
+		expect(() => validateIdempotencyKey("a\u0000b")).toThrow(/NUL/);
+		expect(() => validateIdempotencyKey("a\ud800b")).toThrow(ConfigError);
+		expect(() => validateIdempotencyKey("a\ud800b")).toThrow(/surrogate/);
+	});
+});
+
+describe("validateTriggerKey", () => {
+	it("accepts valid keys", () => {
+		expect(validateTriggerKey("debounce key", "options.debounce.key", "order-123")).toBe(
+			"order-123"
+		);
+	});
+
+	it("rejects NUL and a lone surrogate (audit item low-a)", () => {
+		expect(() => validateTriggerKey("debounce key", "options.debounce.key", "a\u0000b")).toThrow(
+			ConfigError
+		);
+		expect(() => validateTriggerKey("debounce key", "options.debounce.key", "a\u0000b")).toThrow(
+			/NUL/
+		);
+		expect(() =>
+			validateTriggerKey("concurrency key", "options.concurrencyKey", "a\ud800b")
+		).toThrow(ConfigError);
+		expect(() =>
+			validateTriggerKey("concurrency key", "options.concurrencyKey", "a\ud800b")
+		).toThrow(/surrogate/);
 	});
 });
 

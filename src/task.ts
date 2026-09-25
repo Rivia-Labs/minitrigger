@@ -30,8 +30,12 @@ export type TaskQueueOptions = {
 	 * Decision 25: at most `limit` runs of this queue with the same
 	 * `trigger(..., { concurrencyKey })` execute at once (counted among `running` runs only; a
 	 * run waiting on a sleep/token/child does not hold a slot). A run over the limit goes back to
-	 * the queue for about a second without spending an attempt. Runs triggered without a
-	 * `concurrencyKey` are not limited by it.
+	 * the queue without spending an attempt, retrying with a growing backoff (starting around 1 s,
+	 * doubling per consecutive limited attempt, capped around 30 s, plus jitter; reset once it
+	 * acquires) -- audit item low-c: once the slot has been contended for a while, a held-open run
+	 * can push the next retry's *post-limited-slot* latency (from the slot freeing up to this run
+	 * actually acquiring it) up to that ~30 s ceiling, not just "about a second". Runs triggered
+	 * without a `concurrencyKey` are not limited by it.
 	 */
 	concurrencyKey?: { limit: number };
 };
@@ -192,13 +196,26 @@ export type TaskLogger = {
  */
 export type TaskProgress = {
 	/**
-	 * Overwrites the run's progress value. Validated synchronously against `Serializable`/
-	 * `limits.maxProgressBytes`, like a payload; rejects with `SerializationError` (a normal error
-	 * the task can catch, unlike an invalid `ctx.step.*` argument). Resolves once the value is
-	 * accepted by the internal coalescer (writes are batched at most every 250 ms and always
-	 * flushed before the run's terminal/suspension write), not necessarily once persisted.
+	 * Overwrites the run's progress value. `T` is inferred from `value` and must be
+	 * {@link Serializable} (audit item 3: unlike `defineTask`'s `P`/`O` or `step.run`'s `fn`, this
+	 * is a plain call-site argument -- not a function parameter being assigned into a wider
+	 * property type -- so there's no contravariance to work around; the same `T & Serializable<T>`
+	 * intersection `batchTriggerAndWait`'s `payloads` uses works directly here). Validated
+	 * synchronously against `Serializable`/`limits.maxProgressBytes`, like a payload; rejects with
+	 * `SerializationError` (a normal error the task can catch, unlike an invalid `ctx.step.*`
+	 * argument). Resolves once the value is accepted by the internal coalescer (writes are batched
+	 * at most every 250 ms and always flushed before the run's terminal/suspension write), not
+	 * necessarily once persisted.
+	 *
+	 * Nit (external review item 5): `T` inferred as `unknown` or `any` (e.g.
+	 * `progress.set(value as unknown)`, or any untyped `value`) passes this compile-time check --
+	 * `Serializable<T>` special-cases `unknown extends T`, the same escape hatch `defineTask`'s
+	 * notes (`CLAUDE.md`) call out for generic task payloads. The RUNTIME validation
+	 * (`Serializable`/`maxProgressBytes`, above) still applies regardless: a value that doesn't
+	 * actually serialize still rejects with `SerializationError` at the call, it just isn't caught
+	 * by the type system first.
 	 */
-	set(value: Json): Promise<void>;
+	set<T>(value: T & Serializable<T>): Promise<void>;
 };
 
 /** Context passed as the second argument of a task's `run`. */

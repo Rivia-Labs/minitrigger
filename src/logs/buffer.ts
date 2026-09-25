@@ -230,7 +230,20 @@ function sanitizeLogData(value: Json, seen: Set<object> = new Set()): Json {
 	seen.add(obj);
 	try {
 		if (Array.isArray(obj)) {
-			return (obj as readonly Json[]).map(item => sanitizeLogArrayItem(item, seen));
+			// Audit item low-b: NOT `.map()`. `Array.prototype.map` skips holes in a sparse array
+			// AND leaves them as holes (not `undefined`) at the same indices in its result, so a
+			// sparse input produced a sparse `safeData` -- fine once re-`JSON.stringify`d (which
+			// turns every hole into `null`, same as a plain value), but wrong for a consumer that
+			// reads the sanitized value directly (e.g. the `mirror` sink above, which receives
+			// `safeData` itself, not a re-stringified copy): `1 in sparse` is `false`, so code
+			// iterating with `for...in`/`Object.keys` silently skips that index instead of seeing
+			// `null`, unlike `JSON.stringify` (and unlike `structuredClone`). Indexing by `length`
+			// visits every slot, including holes (read as `undefined`, same as a real element set
+			// to `undefined`), so every index is materialized in the result.
+			const arr = obj as readonly Json[];
+			const result: Json[] = new Array(arr.length);
+			for (let i = 0; i < arr.length; i++) result[i] = sanitizeLogArrayItem(arr[i], seen);
+			return result;
 		}
 		const result: Record<string, Json | undefined> = {};
 		for (const [key, item] of Object.entries(obj as Record<string, unknown>)) {

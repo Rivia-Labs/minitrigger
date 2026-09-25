@@ -213,6 +213,9 @@ async function runAcquired(deps: ExecutorDeps, state: ExecutionState): Promise<v
 		}
 	);
 
+	// Decision 20: `engine.stop()` flushes the pending progress value before releasing the run.
+	state.onHandBack(() => progress.flushForHandBack());
+
 	const heartbeat = startHeartbeat(deps, state);
 	const maxDurationMs = task?.options.maxDurationMs;
 	const timer =
@@ -411,13 +414,22 @@ async function settleBeforeComplete(
  * them from scratch (a side effect twice). So the executor first waits for them, WITHOUT aborting
  * `ctx.signal`: a step that completes meanwhile is recorded and memoized for the retry. Heartbeat
  * and `maxDurationMs` keep running; a timeout ends the wait and the attempt still fails with the
- * ORIGINAL error (not a `TimeoutError`). A step that suspends meanwhile is ignored: the function
- * already failed, so the error wins over the suspension. The caller skips this entirely for a
- * fatal error (`state.fatalError` set, decision: coordinator, deviating from the original plan):
- * `ctx.step.*` refuses to persist anything after a fatal error and the run fails without retry
- * regardless, so waiting would only delay the terminal write (and hang if the in-flight step never
- * settles on its own). Only lost/canceled/shutdown (ownership gone) replace the outcome, since
- * nothing may be written anymore.
+ * ORIGINAL error (not a `TimeoutError`).
+ *
+ * The wait is also bounded by `stallTimeoutMs` (external review item 4): without it, a step that
+ * never settles on its own (e.g. the losing side of `Promise.race([ctx.step.run(...), deadline])`
+ * in a task without `maxDurationMs`) would hold the worker slot forever, the heartbeat keeping the
+ * run from ever looking stalled. Past the bound, `ctx.signal` aborts (`"finished"`: the attempt is
+ * over, so code that honors the signal stops) and the attempt fails/retries with the ORIGINAL error.
+ * `stallTimeoutMs` is the natural bound: it is how long the engine already tolerates a run making
+ * no visible progress. `maxDurationMs`, if shorter, still ends the wait first.
+ *
+ * A step that suspends meanwhile is ignored: the function already failed, so the error wins over
+ * the suspension. The caller skips this entirely for a fatal error (`state.fatalError` set,
+ * decision: coordinator, deviating from the original plan): `ctx.step.*` refuses to persist
+ * anything after a fatal error and the run fails without retry regardless, so waiting would only
+ * delay the terminal write (and hang if the in-flight step never settles on its own). Only
+ * lost/canceled/shutdown (ownership gone) replace the outcome, since nothing may be written anymore.
  */
 async function settleBeforeFail(
 	deps: ExecutorDeps,
@@ -425,15 +437,36 @@ async function settleBeforeFail(
 	outcome: Extract<Outcome, { kind: "error" }>
 ): Promise<Outcome> {
 	const steps = Array.from(state.inFlight.values());
+	const boundMs = deps.config.stallTimeoutMs;
 	deps.config.logger.warn(
 		{ runId: state.runId, taskId: state.taskId, steps },
 		`task function threw while steps are still in flight (${steps
 			.map(s => `step "${s}" is still in flight`)
-			.join("; ")}); waiting for them before recording the failure. A step that only stops when ` +
-			"ctx.signal aborts will block this until maxDurationMs (if set) times it out"
+			.join("; ")}); waiting for them (up to stallTimeoutMs, ${boundMs} ms, or maxDurationMs if ` +
+			"sooner) before recording the failure"
 	);
-	const aborted = await drainInFlight(state);
-	if (aborted?.kind === "aborted" && aborted.reason !== "timeout") return aborted;
+	let timer: ReturnType<typeof setTimeout> | undefined;
+	const bound = new Promise<"bound">(resolve => {
+		timer = setTimeout(() => resolve("bound"), boundMs);
+	});
+	const result = await Promise.race([drainInFlight(state), bound]);
+	clearTimeout(timer);
+	if (result === "bound") {
+		const stillInFlight = Array.from(state.inFlight.values());
+		deps.config.logger.warn(
+			{ runId: state.runId, taskId: state.taskId, steps: stillInFlight },
+			`gave up waiting for steps still in flight after ${boundMs} ms (stallTimeoutMs); aborting ` +
+				"ctx.signal and recording the original failure. A step that ignores ctx.signal keeps " +
+				"running alongside the retry"
+		);
+		state.abort(
+			"finished",
+			`run ${state.runId}: the task function threw and its in-flight steps did not settle within ` +
+				`${boundMs} ms (stallTimeoutMs); this attempt is over`
+		);
+		return outcome;
+	}
+	if (result?.kind === "aborted" && result.reason !== "timeout") return result;
 	return outcome;
 }
 
@@ -518,7 +551,7 @@ async function settle(
 					log.debug(fields, "run canceled while executing");
 					return;
 				case "suspended":
-				case "finished": // only fired after `settle`; listed for exhaustiveness
+				case "finished": // never an outcome (fired after `settle`, or by `settleBeforeFail` which keeps the error outcome)
 					return;
 			}
 			return;

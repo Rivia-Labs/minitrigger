@@ -178,6 +178,35 @@ describe("ctx.progress.set", () => {
 		expect((await engine.runs.get(handle.id))?.progress).toEqual({ step: "before-sleep" });
 	});
 
+	it("stop() hands back a run with a pending (coalesced) value: that value is flushed first", async () => {
+		let lastSet = -1;
+		let started = false;
+		const task = defineTask({
+			id: `progress-handback-${shortId()}`,
+			run: async (_payload: undefined, ctx) => {
+				started = true;
+				// Sets far faster than the coalescing window, so one is always pending, and keeps
+				// running past shutdownTimeoutMs (only the abort stops it) to be handed back.
+				for (let i = 0; !ctx.signal.aborted; i++) {
+					void ctx.progress.set({ i });
+					lastSet = i;
+					await new Promise(resolve => setTimeout(resolve, 5));
+				}
+				await new Promise(() => {});
+			},
+		});
+		const engine = makeEngine([task], { shutdownTimeoutMs: 200 });
+		await engine.start();
+		const handle = await engine.trigger(task);
+		await waitFor(() => started && lastSet > 100, { timeoutMs: 10_000 });
+		await engine.stop();
+
+		const client = makeEngine([]);
+		const run = await client.runs.get(handle.id);
+		expect(run?.status).toBe("queued");
+		expect(run?.progress).toEqual({ i: lastSet });
+	});
+
 	it("survives a retry: runs.get keeps the last progress across attempts (decision 23)", async () => {
 		let attempts = 0;
 		const task = defineTask({

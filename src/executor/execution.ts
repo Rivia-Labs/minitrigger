@@ -15,6 +15,9 @@ import type { Ownership, RunRecord } from "../store/types.js";
  * - `finished`: the attempt ended (terminal write, retry scheduled, release, or any other exit of
  *   the executor): fired so work still running (a step left behind by a rejected `Promise.all`,
  *   an un-awaited promise) stops instead of duplicating side effects alongside the next attempt.
+ *   Also fired just BEFORE the failure write when the task function threw and its in-flight steps
+ *   did not settle within `stallTimeoutMs` (`settleBeforeFail`, external review item 4); the
+ *   attempt then fails/retries with the original error.
  */
 export type AbortKind = "timeout" | "shutdown" | "lost" | "canceled" | "suspended" | "finished";
 
@@ -57,6 +60,7 @@ export class ExecutionState {
 	fatalError: Error | undefined;
 
 	private readonly abortListeners: Array<(kind: AbortKind) => void> = [];
+	private readonly handBackFlushers: Array<() => Promise<void>> = [];
 	private readonly suspendListeners: Array<() => void> = [];
 
 	constructor(run: RunRecord, executionId: string) {
@@ -71,9 +75,22 @@ export class ExecutionState {
 		return this.controller.signal;
 	}
 
-	/** Fires `ctx.signal` (once) and notifies listeners synchronously. */
+	/**
+	 * Fires `ctx.signal` (once) and notifies listeners synchronously.
+	 *
+	 * `"finished"` (fired by `settleBeforeFail` right before the failure write, ahead of the real
+	 * terminal write) can still be overwritten once by `"lost"`/`"canceled"`/`"shutdown"` arriving
+	 * afterwards (external review item 1): the signal is already aborted, so the abort reason and
+	 * listeners are not re-fired, but {@link abortKind} is corrected so `ownershipGone(state)`
+	 * (read live by the run logger/progress writer at flush/close time) reflects that ownership is
+	 * really gone, instead of staying stuck on `"finished"` and letting a log/progress write race
+	 * past an actual cancel/lost/shutdown.
+	 */
 	abort(kind: AbortKind, message?: string): void {
-		if (this.abortKind !== undefined) return;
+		if (this.abortKind !== undefined) {
+			if (this.abortKind === "finished" && isOwnershipLostKind(kind)) this.abortKind = kind;
+			return;
+		}
 		this.abortKind = kind;
 		this.controller.abort(abortReason(kind, this.runId, message));
 		for (const listener of this.abortListeners.splice(0)) listener(kind);
@@ -105,6 +122,34 @@ export class ExecutionState {
 		this.suspendListeners.push(listener);
 	}
 
+	/**
+	 * Registers work to finish before `engine.stop()` releases this run (decision 20), e.g. the
+	 * pending `ctx.progress` value, written while this execution still owns the run.
+	 */
+	onHandBack(flush: () => Promise<void>): void {
+		this.handBackFlushers.push(flush);
+	}
+
+	/**
+	 * What `engine.stop()` does to a still-active execution before releasing its run (decision 20):
+	 * marks it {@link handedBack} (the executor writes nothing more), aborts `ctx.signal` with
+	 * `"shutdown"` and starts the {@link onHandBack} flushes synchronously, so none of them can be
+	 * dropped by the executor first. Await the returned promise (bounded by the caller) BEFORE the
+	 * release: after it, the ownership guard rejects the writes. Never rejects.
+	 */
+	handBack(): Promise<void> {
+		this.handedBack = true;
+		this.abort("shutdown");
+		const flushes = this.handBackFlushers.splice(0).map(flush => {
+			try {
+				return flush();
+			} catch (error) {
+				return Promise.reject(error);
+			}
+		});
+		return Promise.allSettled(flushes).then(() => undefined);
+	}
+
 	/** Records the first fatal (non-retryable) step error; see {@link fatalError}. */
 	markFatal(error: Error): void {
 		this.fatalError ??= error;
@@ -119,6 +164,11 @@ export class ExecutionState {
 		promise.then(remove, remove);
 		return promise;
 	}
+}
+
+/** The three abort kinds under which ownership of the run is really gone (decision 5). */
+function isOwnershipLostKind(kind: AbortKind): boolean {
+	return kind === "lost" || kind === "canceled" || kind === "shutdown";
 }
 
 function abortReason(kind: AbortKind, runId: string, message: string | undefined): Error {

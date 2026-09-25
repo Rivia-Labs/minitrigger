@@ -18,6 +18,57 @@ function echo(value: string): string {
 	return truncated.length < value.length ? `${truncated}…` : truncated;
 }
 
+/**
+ * Audit item low-a: `jsonb`/`text` both reject a NUL (`\u0000`), and `text` silently re-encodes a
+ * lone UTF-16 surrogate (one not part of a valid high/low pair, e.g. from a mistranslated
+ * emoji/CJK codepoint) as U+FFFD when it's written (Postgres encodes strings as UTF-8, which has
+ * no way to represent an unpaired surrogate; see docs/store-contract.md, "Postgres value
+ * semantics"). Neither is safe in an identifier that's compared/looked-up later:
+ * - a `steps`/`idempotency_keys`/`runs` NUL would only surface as the raw pg error (SQLSTATE
+ *   `22021`/`22P05`) AFTER the user's step function already ran, instead of failing fast;
+ * - a lone surrogate in a step name silently becomes a *different* string (U+FFFD) once
+ *   persisted; the next replay's snapshot reads back the U+FFFD version and compares it against
+ *   the ORIGINAL (still lone-surrogate) name the user's code computes again, which never matches
+ *   -> `NonDeterminismError`, with no clue that the root cause is an unpaired surrogate.
+ * Returns a reason string (`"NUL"` or `"an unpaired UTF-16 surrogate"`) when `value` contains
+ * either, else `null`.
+ */
+function findUnsafeCharacter(value: string): string | null {
+	for (let i = 0; i < value.length; i++) {
+		const code = value.charCodeAt(i);
+		if (code === 0) return "NUL";
+		if (code >= 0xd800 && code <= 0xdbff) {
+			// High surrogate: valid only when immediately followed by a low surrogate.
+			const next = value.charCodeAt(i + 1);
+			if (next >= 0xdc00 && next <= 0xdfff) {
+				i++; // Skip the paired low surrogate; it's not "lone".
+				continue;
+			}
+			return "an unpaired UTF-16 surrogate";
+		}
+		if (code >= 0xdc00 && code <= 0xdfff) {
+			// Low surrogate not preceded by a high one (loop above always consumes a valid pair).
+			return "an unpaired UTF-16 surrogate";
+		}
+	}
+	return null;
+}
+
+/**
+ * Throws a `ConfigError` naming `kind`/the offending value when it contains NUL or a lone UTF-16
+ * surrogate (see {@link findUnsafeCharacter}); a no-op otherwise. Shared by every identifier
+ * validator below whose value ends up in a Postgres `text` column looked up again later.
+ */
+function assertNoUnsafeCharacter(kind: string, value: string): void {
+	const problem = findUnsafeCharacter(value);
+	if (problem !== null) {
+		throw new ConfigError(
+			`${kind} "${echo(value)}" is invalid: contains ${problem}, which Postgres either ` +
+				"rejects or silently rewrites (U+FFFD) -- remove it from the value"
+		);
+	}
+}
+
 /** Validates a Postgres schema name or BullMQ prefix (decision 15). */
 export function validateSqlIdentifier(kind: "schema" | "prefix", value: string): string {
 	if (!SQL_IDENTIFIER_PATTERN.test(value)) {
@@ -65,6 +116,7 @@ export function validateStepName(value: string): string {
 				`characters, got ${value.length}`
 		);
 	}
+	assertNoUnsafeCharacter("step name", value);
 	if (value.includes("#")) {
 		throw new ConfigError(
 			`step name "${echo(value)}" is invalid: "#" is reserved for internal step names ` +
@@ -94,6 +146,7 @@ export function validateIdempotencyKey(value: string): string {
 				`${IDEMPOTENCY_KEY_MAX_LENGTH} characters, got ${value.length}`
 		);
 	}
+	assertNoUnsafeCharacter("idempotency key", value);
 	if (value.startsWith("__")) {
 		throw new ConfigError(
 			`idempotency key "${echo(value)}" is invalid: keys starting with "__" are reserved ` +
@@ -123,6 +176,7 @@ export function validateTriggerKey(
 				`${IDEMPOTENCY_KEY_MAX_LENGTH} characters, got ${value.length}`
 		);
 	}
+	assertNoUnsafeCharacter(kind, value);
 	if (value.startsWith("__")) {
 		throw new ConfigError(
 			`${kind} "${echo(value)}" is invalid: keys starting with "__" are reserved ` +

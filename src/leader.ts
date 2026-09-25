@@ -135,7 +135,9 @@ export interface LeaderElector {
 	release(): Promise<void>;
 	/**
 	 * `release()`s and stops accepting further `tryAcquire()` calls (which then just resolve
-	 * `false`). Idempotent -- a second `close()` is a no-op.
+	 * `false`). A `tryAcquire()` already in flight (connecting, or running the lock query) resolves
+	 * `false` too: it unlocks the lock if it got it and ends its client. Idempotent -- a second
+	 * `close()` is a no-op.
 	 */
 	close(): Promise<void>;
 }
@@ -252,24 +254,46 @@ export function createLeaderElector(config: LeaderElectorConfig): LeaderElector 
 			logWarn("failed to connect leader election client", err);
 			return false;
 		}
+		// `close()` may have run while `connect()` was pending: it saw no client to release, so this
+		// attempt must drop the one it just connected (external review item 2), or its socket would
+		// keep the event loop alive for the process lifetime.
+		if (closed) {
+			await shutdownClient(c, false);
+			return false;
+		}
 
+		let locked: boolean;
 		try {
 			const { rows } = await c.query<{ locked: boolean }>(
 				"SELECT pg_try_advisory_lock(hashtext($1), 2) AS locked",
 				[schema]
 			);
-			if (rows[0]?.locked === true) {
-				leader = true;
-				safeCall(onAcquire);
-				return true;
-			}
-			await closeClient(c);
-			return false;
+			locked = rows[0]?.locked === true;
 		} catch (err) {
 			logWarn("leader election lock query failed", err);
 			await closeClient(c);
 			return false;
 		}
+		// Same race during the lock query: never become leader after `close()`. By this point
+		// `closed` can only have become true via a concurrent `close()`/`release()`, which -- since
+		// `client` already equals `c` here (set by `ensureClient()` before the query even started)
+		// -- synchronously cleared `client` as part of setting `closed` (review item 5), before
+		// awaiting its OWN `shutdownClient(c, ...)`. So if `client !== c` now, that concurrent call
+		// already claimed ending this exact client: running our own unlock/end here too would just
+		// race an already-ending connection and log a spurious "client may already be dead" warning
+		// for no benefit (the session ending on its own already frees the session-scoped advisory
+		// lock). Only step in ourselves in the (defensive, shouldn't happen) case nothing else did.
+		if (closed) {
+			if (client === c) await shutdownClient(c, locked);
+			return false;
+		}
+		if (locked) {
+			leader = true;
+			safeCall(onAcquire);
+			return true;
+		}
+		await closeClient(c);
+		return false;
 	}
 
 	function isLeader(): boolean {
@@ -290,8 +314,16 @@ export function createLeaderElector(config: LeaderElectorConfig): LeaderElector 
 		const wasLeader = leader;
 		leader = false;
 		if (client === c) client = undefined;
+		await shutdownClient(c, wasLeader);
+	}
+
+	/**
+	 * Unlocks (when `unlock`) and ends `c`, bounded by `releaseTimeoutMs`; past the bound the socket
+	 * is destroyed (the server then ends the session, freeing the advisory lock anyway).
+	 */
+	async function shutdownClient(c: Client, unlock: boolean): Promise<void> {
 		const graceful = (async () => {
-			if (wasLeader) {
+			if (unlock) {
 				try {
 					await c.query("SELECT pg_advisory_unlock(hashtext($1), 2)", [schema]);
 				} catch (err) {

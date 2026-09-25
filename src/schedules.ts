@@ -22,6 +22,7 @@
  */
 
 import { randomUUID } from "node:crypto";
+import { escapeIdentifier, type Pool } from "pg";
 import type { EngineLogger } from "./config.js";
 import { ConfigError } from "./errors.js";
 import { childTaskSpec, enqueue, type RunNotifier, taskQueueName } from "./executor/index.js";
@@ -365,7 +366,10 @@ export async function syncDeclarativeSchedules(deps: DeclarativeSyncDeps): Promi
 
 export interface ReconcileSchedulesDeps {
 	store: Pick<Store, "schedules">;
-	transport: Pick<Transport, "upsertJobScheduler" | "removeJobScheduler" | "listJobSchedulers">;
+	transport: Pick<
+		Transport,
+		"upsertJobScheduler" | "removeJobScheduler" | "listJobSchedulers" | "getJobScheduler"
+	>;
 	logger: EngineLogger;
 	/**
 	 * This engine's own Postgres schema (fix 8): a BullMQ scheduler tagged (via
@@ -377,6 +381,14 @@ export interface ReconcileSchedulesDeps {
 	 * (documented in `README.md`); this tag is a safety net, not a substitute for that.
 	 */
 	schema?: string;
+	/**
+	 * Review item (c), with `schema`: a scheduler tagged with another schema is removed when that
+	 * schema no longer owns it (retired: schema, table or row gone), via
+	 * {@link removeRetiredForeignScheduler}. Omitted => foreign-tagged schedulers are always kept.
+	 */
+	foreignScheduleState?: RetiredSchedulerDeps["foreignScheduleState"];
+	/** Review item 3, forwarded to {@link removeRetiredForeignScheduler}. */
+	isPrefixOwner?: RetiredSchedulerDeps["isPrefixOwner"];
 }
 
 /**
@@ -392,7 +404,7 @@ export interface ReconcileSchedulesDeps {
  * raced this hook's own two reads. See `CLAUDE.md`, Phase 8 notes, for the race this closes.
  */
 export function createReconcileSchedulesHook(deps: ReconcileSchedulesDeps): () => Promise<void> {
-	const { store, transport, logger, schema } = deps;
+	const { store, transport, logger, schema, foreignScheduleState: stateOf, isPrefixOwner } = deps;
 
 	return async function reconcileSchedules(): Promise<void> {
 		// Order matters (fix 1): read the BullMQ side first, so a schedule created by a concurrent
@@ -425,6 +437,25 @@ export function createReconcileSchedulesHook(deps: ReconcileSchedulesDeps): () =
 			// Fix 8: a scheduler tagged with a different schema belongs to another engine sharing
 			// this Redis prefix; never delete it, no matter what THIS schema's `schedules` table says.
 			if (schema !== undefined && scheduler.schema !== undefined && scheduler.schema !== schema) {
+				// Review item (c): unless that schema was retired (nothing else would ever remove it).
+				if (!stateOf) continue;
+				try {
+					await removeRetiredForeignScheduler(
+						{
+							transport,
+							logger,
+							foreignScheduleState: stateOf,
+							...(isPrefixOwner ? { isPrefixOwner } : {}),
+						},
+						scheduler.id,
+						scheduler.schema
+					);
+				} catch (error) {
+					logger.warn(
+						{ err: error, scheduleId: scheduler.id, schema: scheduler.schema },
+						"reconciler: could not check whether another schema still owns this job scheduler; kept"
+					);
+				}
 				continue;
 			}
 			try {
@@ -471,11 +502,101 @@ export class ScheduleTickSchemaMismatchError extends ConfigError {
  * existed) passes. Called by the engine before dispatching the tick.
  */
 export function assertScheduleTickSchema(data: unknown, schema: string, scheduleId: string): void {
+	const tag = foreignScheduleTickSchema(data, schema);
+	if (tag !== undefined) throw new ScheduleTickSchemaMismatchError(scheduleId, tag, schema);
+}
+
+/** The schema tag of a `schedule-tick` job's data when it is not `schema`, else `undefined`. */
+export function foreignScheduleTickSchema(data: unknown, schema: string): string | undefined {
 	const tag =
 		data !== null && typeof data === "object" ? (data as { schema?: unknown }).schema : undefined;
-	if (typeof tag === "string" && tag !== schema) {
-		throw new ScheduleTickSchemaMismatchError(scheduleId, tag, schema);
+	return typeof tag === "string" && tag !== schema ? tag : undefined;
+}
+
+/**
+ * Whether another schema still owns schedule `scheduleId`, checked in THIS engine's database
+ * (review item c): `"orphaned"` when the schema, its `schedules` table or the row is gone (a
+ * retired schema whose job schedulers were left in Redis); `"live"` otherwise. The schema name
+ * comes from Redis, so it only ever reaches SQL as a bound parameter (`format('%I')`) or through
+ * `escapeIdentifier`. Any other error (e.g. no `USAGE` on that schema, a table that isn't ours)
+ * propagates: the caller must then treat the scheduler as live.
+ */
+export async function foreignScheduleState(
+	pool: Pick<Pool, "query">,
+	foreignSchema: string,
+	scheduleId: string
+): Promise<"live" | "orphaned"> {
+	const { rows } = await pool.query<{ exists: boolean }>(
+		"SELECT to_regclass(format('%I.schedules', $1::text)) IS NOT NULL AS exists",
+		[foreignSchema]
+	);
+	if (rows[0]?.exists !== true) return "orphaned";
+	try {
+		const found = await pool.query(
+			`SELECT 1 FROM ${escapeIdentifier(foreignSchema)}.schedules WHERE id = $1`,
+			[scheduleId]
+		);
+		return (found.rowCount ?? 0) > 0 ? "live" : "orphaned";
+	} catch (error) {
+		// Dropped between the two queries: undefined_table / invalid_schema_name.
+		const code = (error as { code?: unknown }).code;
+		if (code === "42P01" || code === "3F000") return "orphaned";
+		throw error;
 	}
+}
+
+export type RetiredSchedulerOutcome =
+	/** The foreign schema still owns the schedule: keep its scheduler. */
+	| "live"
+	/** Orphaned, and its scheduler was removed now (logged once at `warn`). */
+	| "removed"
+	/** Orphaned, but the scheduler is already gone or now carries another tag: nothing to do. */
+	| "stale";
+
+export interface RetiredSchedulerDeps {
+	transport: Pick<Transport, "getJobScheduler" | "removeJobScheduler">;
+	logger: EngineLogger;
+	/** {@link foreignScheduleState} bound to the engine's pool. */
+	foreignScheduleState: (foreignSchema: string, scheduleId: string) => Promise<"live" | "orphaned">;
+	/**
+	 * External review item 3: {@link foreignScheduleState} only ever sees THIS engine's database --
+	 * a foreign schema living in ANOTHER database (a blue/green deploy: old engine on database A,
+	 * new engine on database B, same Redis prefix) always looks "orphaned" to it, even while the
+	 * old engine is still running and actively re-creating that scheduler. Bound to
+	 * `GET ${prefix}:owner-schema` (the same key `claimPrefix()` writes on `start()`, no TTL, never
+	 * expires on its own): `true` only when it equals THIS engine's own schema, meaning this engine
+	 * currently -- and exclusively, per that key's NX write -- owns the prefix, so any foreign tag
+	 * left in Redis can only be a leftover from a schema that no longer claims it. `false` (key
+	 * missing, or held by yet another schema) keeps the pre-fix behavior: never remove. Omitted =>
+	 * always treated as `true` (tests that don't exercise this guard).
+	 */
+	isPrefixOwner?: () => Promise<boolean>;
+}
+
+/**
+ * Review item (c): removes the job scheduler `scheduleId` tagged with `foreignSchema` when that
+ * schema no longer owns it ({@link foreignScheduleState}) AND this engine is the confirmed,
+ * exclusive owner of the Redis prefix ({@link RetiredSchedulerDeps.isPrefixOwner}, review item 3).
+ * Before removing, re-reads the scheduler and only removes it if it still carries `foreignSchema`'s
+ * tag (a scheduler re-created by this or another live schema under the same id is never touched).
+ * Errors propagate (caller: keep it).
+ */
+export async function removeRetiredForeignScheduler(
+	deps: RetiredSchedulerDeps,
+	scheduleId: string,
+	foreignSchema: string
+): Promise<RetiredSchedulerOutcome> {
+	if (deps.isPrefixOwner !== undefined && !(await deps.isPrefixOwner())) return "live";
+	if ((await deps.foreignScheduleState(foreignSchema, scheduleId)) === "live") return "live";
+	const current = await deps.transport.getJobScheduler(scheduleId);
+	if (current?.schema !== foreignSchema) return "stale";
+	if (!(await deps.transport.removeJobScheduler(scheduleId))) return "stale";
+	deps.logger.warn(
+		{ scheduleId, schema: foreignSchema },
+		"removed the BullMQ job scheduler of a retired schema (its schema, schedules table or row " +
+			"no longer exists in this database)"
+	);
+	return "removed";
 }
 
 export interface ProcessScheduleTickDeps {
