@@ -269,9 +269,12 @@ describe("item 8: prefix shared by two schemas", () => {
 			await a.schedules.delete(scheduleId).catch(() => {});
 		});
 
-		await sleep(4_000);
-		// B consumed some of A's ticks: without the guard it found no row in ITS schema and
-		// removed A's BullMQ scheduler, silently ending the schedule.
+		// Wait until B has actually consumed one of A's ticks (which worker wins each per-second tick
+		// is up to BullMQ, so a fixed sleep made this flaky): without the guard it found no row in ITS
+		// schema and removed A's BullMQ scheduler, silently ending the schedule.
+		await waitFor(() => logs.some(l => l.level === "error" && /another schema/.test(l.message)), {
+			timeoutMs: 20_000,
+		});
 		const list = await a.schedules.list();
 		expect(list.map(s => s.id)).toContain(scheduleId);
 		const queue = new Queue(`${ns.prefix}-system`, { connection: ns.redis, prefix: ns.prefix });
@@ -284,8 +287,7 @@ describe("item 8: prefix shared by two schemas", () => {
 			`SELECT count(*)::text AS n FROM ${escapeIdentifier(schemaB)}.runs`
 		);
 		expect(Number(rows[0]?.n)).toBe(0);
-		expect(logs.some(l => l.level === "error" && /another schema/.test(l.message))).toBe(true);
-	}, 20_000);
+	}, 40_000);
 });
 
 describe("item 11: a start() failing midway can be retried", () => {
