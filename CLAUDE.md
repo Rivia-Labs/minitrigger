@@ -4,6 +4,7 @@ Biblioteca TypeScript de execução durável de tasks/workflows (BullMQ + Redis 
 
 - Especificação completa: `docs/SPEC.md` (**a seção 2 é fixa; não mudar sem perguntar ao dono**).
 - Plano, grafo de tarefas e modelos por tarefa: `docs/PLAN.md`.
+- **Estado atual e próximos passos: `docs/HANDOFF.md` (ler primeiro ao retomar).**
 - Notas de API verificadas via Context7: `docs/research/api-notes.md`.
 - Agents do projeto: `.claude/agents/mt-implementer.md`, `mt-reviewer.md`, `mt-fixer.md`.
 
@@ -118,5 +119,5 @@ Env de teste: `TEST_DATABASE_URL`, `TEST_REDIS_URL` (padrões apontam para o doc
 | 6 — Resiliência | ✅ concluída — loop do líder na engine (reconciler + agendamento da retenção na `-system`), cancelamento entre processos por pub/sub, publicação de status, config `reconciler`/`retention`; testes de cada caso do reconciler via engine, stall, perda/retomada de liderança, `migrate()` com líder ativo, órfã com `warn`, cancelamento entre processos, retenção em lotes e FLUSHALL (projeto isolado) |
 | 7 — Logs/eventos/consulta | ✅ concluída — `ctx.logger` em lote no `run_logs` (flush antes da escrita terminal/suspensão), config `logging`, `runs.list/logs/steps`, `engine.events.on`, `runs.subscribe` (ordem obrigatória, engine só de disparo), `ctx.stream`/`runs.readStream`; testes `logs`/`subscribe`/`events`/`stream`/`query` |
 | 8 — Schedules | em andamento (migration 002 + `ScheduleStore` prontos; falta BullMQ/engine) |
-| 9 — Modo de teste/DX | pendente |
+| 9 — Modo de teste/DX | em andamento (9.1 store em memória pronta: `src/store/memory`, suíte de contrato compartilhada; falta `createTestEngine`, checagens de ambiente) |
 | 10 — Exemplo/docs/empacotamento | pendente |
