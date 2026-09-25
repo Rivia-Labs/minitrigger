@@ -30,8 +30,8 @@ async function token(owner: Ownership, name: string, timeoutMs: number | null = 
 /** Sleep step written directly (steps.ts belongs to another module); wake_at from the DB clock. */
 async function sleepStep(runId: string, name: string, seqIndex: number, offsetMs: number) {
 	await f.sql(
-		`INSERT INTO ${f.t("steps")} (run_id, name, seq_index, status, wake_at)
-		 VALUES ($1, $2, $3, 'waiting', now() + $4::float8 * interval '1 millisecond')`,
+		`INSERT INTO ${f.t("steps")} (run_id, name, seq_index, kind, status, wake_at)
+		 VALUES ($1, $2, $3, 'sleep', 'waiting', now() + $4::float8 * interval '1 millisecond')`,
 		[runId, name, seqIndex, offsetMs]
 	);
 }

@@ -51,6 +51,21 @@ export const TERMINAL_RUN_STATUSES: readonly TerminalRunStatus[] = [
 ];
 
 export type StepStatus = "completed" | "waiting";
+
+/**
+ * `steps.kind`: which `ctx.step` method recorded the row (decision 11; replay compares it
+ * exactly). `run` = `step.run`, `sleep` = `step.sleep`, `token` = `createToken`, `wait` =
+ * `${name}#wait` of `waitForToken`, `trigger` = `step.trigger`, `trigger_wait` =
+ * `triggerAndWait`, `batch_wait` = `batchTriggerAndWait`.
+ */
+export type StepKind =
+	| "run"
+	| "sleep"
+	| "token"
+	| "wait"
+	| "trigger"
+	| "trigger_wait"
+	| "batch_wait";
 export type WaitpointKind = "token" | "child_run" | "batch";
 export type WaitpointStatus = "pending" | "completed" | "timed_out";
 export type LogLevel = "debug" | "info" | "warn" | "error";
@@ -102,6 +117,7 @@ export interface StepRecord {
 	runId: string;
 	name: string;
 	seqIndex: number;
+	kind: StepKind;
 	status: StepStatus;
 	/**
 	 * `step.run`: the memoized output. `createToken`: `{ id }`. `step.trigger`:
@@ -461,6 +477,7 @@ export type TxRunStore = Omit<RunStore, "heartbeat">;
 export interface LoadedStep {
 	name: string;
 	seqIndex: number;
+	kind: StepKind;
 	status: StepStatus;
 	wakeAt: Date | null;
 	/** Always null when `ExecutionSnapshot.outputsDeferred` is true. */
@@ -510,14 +527,18 @@ export interface StepStore {
 	 * the ownership guard (FOR SHARE) (Phase 4). Guard failed => `lost`; step already exists
 	 * under that name => `ok` (idempotent replay, output not overwritten). A `(run_id,
 	 * seq_index)` collision under a different name throws (unique violation). `output` is
-	 * bound as JSON text, so any {@link Json} value (string, array, ...) round-trips.
+	 * bound as JSON text, so any {@link Json} value (string, array, ...) round-trips. `kind` is
+	 * written to `steps.kind` (`run` for `step.run`).
 	 */
 	insertCompleted(
 		owner: Ownership,
-		step: { name: string; seqIndex: number; output: Json | null }
+		step: { kind: StepKind; name: string; seqIndex: number; output: Json | null }
 	): Promise<"ok" | "lost">;
 
-	/** `step.sleep` first call: guarded insert `waiting`, `wake_at = now() + durationMs`. */
+	/**
+	 * `step.sleep` first call: guarded insert `waiting`, `kind = 'sleep'`,
+	 * `wake_at = now() + durationMs`.
+	 */
 	insertSleep(
 		owner: Ownership,
 		step: { name: string; seqIndex: number; durationMs: number }
@@ -533,11 +554,12 @@ export interface StepStore {
 	 * `${name}#wait` step of `waitForToken`: guarded insert `waiting`, output
 	 * `{ waitpointId }`, `wake_at NULL`, `ON CONFLICT (run_id, name) DO NOTHING`. Same outcomes
 	 * as {@link insertCompleted}: guard failed => `lost`; already exists => `ok`; seq_index
-	 * collision under another name throws.
+	 * collision under another name throws. `kind` is written to `steps.kind` (`wait` for
+	 * `${name}#wait`).
 	 */
 	insertWaitRef(
 		owner: Ownership,
-		step: { name: string; seqIndex: number; waitpointId: string }
+		step: { kind: StepKind; name: string; seqIndex: number; waitpointId: string }
 	): Promise<"ok" | "lost">;
 
 	/** Public `engine.runs.steps(runId)`: all steps with outputs, ordered by `seq_index`. */

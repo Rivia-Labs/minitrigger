@@ -9,13 +9,15 @@ import type { Ownership, RunRecord } from "../store/types.js";
  *   execution writes nothing more;
  * - `lost`: a guarded write/heartbeat reported lost ownership (decision 5) -> stop silently;
  * - `canceled`: `engine.runs.cancel()` in this process (cross-process pub/sub: Phase 6) -> stop
- *   silently (the cancel already cleared ownership).
+ *   silently (the cancel already cleared ownership);
+ * - `suspended`: the execution was suspended (decision 2) and the suspension transaction already
+ *   ran; fired only so a task function that swallowed the `SuspendSignal` stops its own work.
  */
-export type AbortKind = "timeout" | "shutdown" | "lost" | "canceled";
+export type AbortKind = "timeout" | "shutdown" | "lost" | "canceled" | "suspended";
 
 /**
  * Mutable state of one execution (one successful `acquire`). Shared by the executor, the
- * heartbeat, `ctx.step` (Phase 4) and the engine (`stop()`/`runs.cancel()`).
+ * heartbeat, `ctx.step` and the engine (`stop()`/`runs.cancel()`).
  */
 export class ExecutionState {
 	readonly runId: string;
@@ -32,14 +34,26 @@ export class ExecutionState {
 	 */
 	handedBack = false;
 	/**
-	 * Phase 4 seam: promises of the steps started in this execution and not yet settled; the
-	 * executor awaits `Promise.allSettled` of these before running the suspension transaction.
+	 * Promises of the steps started in this execution and not yet settled; the executor awaits
+	 * `Promise.allSettled` of these before running the suspension transaction (decision 2).
 	 */
 	readonly inFlight = new Set<Promise<unknown>>();
-	/** Phase 4 seam: set once a `SuspendSignal` was thrown (suspension is authoritative, decision 2). */
+	/**
+	 * Set once a `SuspendSignal` was thrown (suspension is authoritative, decision 2): every later
+	 * `step.*` call rethrows it and the task function's own outcome is ignored.
+	 */
 	suspended = false;
+	/** The first `SuspendSignal` of this execution (rethrown by later `step.*` calls). */
+	suspendSignal: Error | undefined;
+	/**
+	 * A code bug detected by `ctx.step` (`NonDeterminismError`, `DuplicateStepError`). It fails the
+	 * run without retry whatever the task function does afterwards (it may catch the error, or a
+	 * concurrent step may suspend): replaying the same code would hit it again.
+	 */
+	fatalError: Error | undefined;
 
 	private readonly abortListeners: Array<(kind: AbortKind) => void> = [];
+	private readonly suspendListeners: Array<() => void> = [];
 
 	constructor(run: RunRecord, executionId: string) {
 		this.run = run;
@@ -70,7 +84,29 @@ export class ExecutionState {
 		this.abortListeners.push(listener);
 	}
 
-	/** Phase 4 seam: registers an in-flight step promise until it settles. */
+	/** Marks the execution suspended (once) and notifies {@link onSuspend} listeners synchronously. */
+	markSuspended(signal: Error): void {
+		if (this.suspended) return;
+		this.suspended = true;
+		this.suspendSignal = signal;
+		for (const listener of this.suspendListeners.splice(0)) listener();
+	}
+
+	/** Calls `listener` once when the execution suspends (immediately if it already did). */
+	onSuspend(listener: () => void): void {
+		if (this.suspended) {
+			listener();
+			return;
+		}
+		this.suspendListeners.push(listener);
+	}
+
+	/** Records the first fatal (non-retryable) step error; see {@link fatalError}. */
+	markFatal(error: Error): void {
+		this.fatalError ??= error;
+	}
+
+	/** Registers an in-flight step promise until it settles. */
 	trackInFlight<T>(promise: Promise<T>): Promise<T> {
 		this.inFlight.add(promise);
 		const remove = () => {
@@ -91,6 +127,8 @@ function abortReason(kind: AbortKind, runId: string, message: string | undefined
 			return new DOMException(message ?? "the engine is shutting down", "AbortError");
 		case "canceled":
 			return new DOMException(message ?? `run ${runId} was canceled`, "AbortError");
+		case "suspended":
+			return new DOMException(message ?? `run ${runId} was suspended`, "AbortError");
 	}
 }
 

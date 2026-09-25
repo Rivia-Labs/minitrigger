@@ -71,6 +71,17 @@ Env de teste: `TEST_DATABASE_URL`, `TEST_REDIS_URL` (padrões apontam para o doc
 - Task sem parâmetro de payload tem payload `void` (opcional em `trigger`); `payload: unknown` explícito conta igual. Payload `undefined` é gravado como `null`.
 - Valores alimentados em `setTimeout` (heartbeat, stall, shutdown, `maxDurationMs`) são limitados a 2^31-1 ms; delays do BullMQ não.
 
+- **Fase 4 (steps):** `StepContext.register(kind, name)` é o ponto único de registro (checa step aninhado, erro fatal/suspensão/abort pendente, duplicata, atribui `seq_index` de forma síncrona, compara nome×índice e `kind` com o snapshot) e `start()` valida o nome do usuário e rastreia o step em `state.inFlight`; a fase 5 só adiciona tipos de step. Nomes internos (`${name}#wait`) usam `startInternal()` (pula `validateStepName`, mesmo registro + `trackInFlight`).
+- **`steps.kind`** (`run`, `sleep`, `token`, `wait`, `trigger`, `trigger_wait`, `batch_wait`), `NOT NULL` + CHECK, adicionado **editando a migration 001** (pacote ainda não publicado; depois do primeiro release, mudanças de schema só em migrations novas). Gravado por `insertCompleted`/`insertWaitRef` (parâmetro `kind`), `insertSleep` (`sleep`), `triggerChildren` (por `mode`) e `createToken` (`token`); o replay compara o `kind` exatamente (ex.: `createToken("x")` trocado por `step.run("x")` → `NonDeterminismError`).
+- `NonDeterminismError`, `DuplicateStepError`, `NestedStepError` e nome de step inválido (`validateStepName`, `ConfigError`) são bug de código: ficam em `state.fatalError` e falham a run **sem retry**, mesmo que o usuário capture o erro ou a execução suspenda depois. Depois disso, todo `step.*` relança o mesmo erro fatal (o código do usuário não consegue seguir executando steps).
+- **Steps aninhados não são suportados:** `ctx.step.*` chamado dentro do `fn` de um `step.run` lança `NestedStepError` (detectado com `AsyncLocalStorage` ativo só enquanto o `fn` roda). O `step.run` externo também não é gravado, mesmo que o `fn` capture o erro.
+- **Timeout durante o `allSettled` pré-suspensão:** se `maxDurationMs` estoura depois que a execução suspendeu (esperando steps em voo), a suspensão vence (decisão 2): `runs.suspend` roda normalmente, `attempt` não incrementa e o step em voo que não terminou reexecuta no replay. Cancel/lost/shutdown nesse intervalo não gravam nada.
+- **Concorrência e determinismo:** `seq_index` na chamada torna determinístico um `Promise.all` direto de steps. Mas ramos assíncronos concorrentes que chamam **mais** steps depois de um `await` (ex.: `Promise.all(items.map(async i => { await ctx.step.run(a); await ctx.step.run(b) }))`) registram esses steps na ordem de conclusão, que muda entre execuções, e podem gerar `NonDeterminismError` no replay. Regra: não chamar steps depois de `await` dentro de ramos concorrentes (vai para as "regras de ouro" do README na fase 10).
+- Output de `step.run` é normalizado antes de devolver: `void` → `null` já na primeira execução (igual ao replay). Output inválido/grande (`SerializationError`) propaga para a função como erro comum.
+- `sleep` no replay: vencido se `snapshot.now + tempo monotônico decorrido >= wake_at` (limite inferior do `now()` do banco); `completeSleep` re-checa no banco (`not_due` → suspende de novo). A suspensão corre na corrida da execução (`onSuspend`), sem esperar a função terminar; heartbeat e `maxDurationMs` seguem ativos durante o `allSettled`. Depois de `runs.suspend`, `ctx.signal` aborta com o novo `AbortKind` `"suspended"` para parar código que engoliu o sinal (`logger.warn`).
+- Outputs adiados (`maxInlineStepOutputBytes`) carregam em lotes alinhados de 50 `seq_index` (`DEFERRED_OUTPUT_BATCH_SIZE`), compartilhados por steps concorrentes.
+- `NonDeterminismError`, `DuplicateStepError` e `NestedStepError` são exportados por `src/index.ts`.
+
 ## Status das fases
 
 | Fase | Status |
@@ -78,9 +89,9 @@ Env de teste: `TEST_DATABASE_URL`, `TEST_REDIS_URL` (padrões apontam para o doc
 | 1 — Fundação | ✅ concluída — build ESM/CJS/DTS, 103 testes unitários, infra de integração por arquivo, `examples/basic` (ESM+CJS) |
 | 2 — Schema e store | ✅ concluída — migration 001, `migrate()` com advisory xact lock, contrato `src/store/types.ts` + `docs/store-contract.md`, repositórios SQL, 127 testes de integração (revisão opus aplicada) |
 | 3 — Trigger/fila/execução | ✅ concluída — `defineTask`/registry de filas, transporte BullMQ, executor (aquisição, heartbeat, retry, timeout), engine (`trigger`, `start`, `stop` graceful, `runs.*`); revisão opus aplicada |
-| 4 — Steps/replay/sleep | pendente |
+| 4 — Steps/replay/sleep | ✅ concluída — `StepContext` (`src/executor/step-context.ts`): snapshot numa query, `seq_index` na chamada, memoização, `sleep`, `SuspendSignal` autoritativo, `allSettled` pré-suspensão + `runs.suspend`; `steps.kind`, `NestedStepError`; 21 testes de integração + 18 unitários |
 | 5 — Tokens/subtasks | pendente |
-| 6 — Resiliência | em andamento (`src/leader.ts` pronto; falta ligar à engine) |
+| 6 — Resiliência | em andamento (`leader.ts`, `reconciler.ts`, `retention.ts` prontos; falta ligar à engine + cancelamento pub/sub) |
 | 7 — Logs/eventos/consulta | pendente |
 | 8 — Schedules | em andamento (migration 002 + `ScheduleStore` prontos; falta BullMQ/engine) |
 | 9 — Modo de teste/DX | pendente |

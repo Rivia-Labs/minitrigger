@@ -47,6 +47,15 @@ export class DuplicateStepError extends MinitriggerError {
 	override name = "DuplicateStepError";
 }
 
+/**
+ * `ctx.step.*` was called inside a `step.run` callback. Nested steps are not supported: the
+ * inner step would take a `seq_index` whose position depends on the outer callback's timing and
+ * would re-run with it on replay. A code bug: the run fails without retry.
+ */
+export class NestedStepError extends MinitriggerError {
+	override name = "NestedStepError";
+}
+
 /** The executing process lost ownership of the run (canceled, timed out, stolen by the reconciler, ...). */
 export class ExecutionLostError extends MinitriggerError {
 	override name = "ExecutionLostError";

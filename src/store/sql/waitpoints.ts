@@ -42,8 +42,8 @@ export function createWaitpointStore(exec: SqlExecutor, ctx: SqlContext): Waitpo
 					[token.waitpointId, owner.runId, token.name, token.timeoutMs]
 				);
 				await db.query(
-					`INSERT INTO ${ctx.t("steps")} (run_id, name, seq_index, status, output)
-					 VALUES ($1, $2, $3, 'completed', $4::jsonb)`,
+					`INSERT INTO ${ctx.t("steps")} (run_id, name, seq_index, kind, status, output)
+					 VALUES ($1, $2, $3, 'token', 'completed', $4::jsonb)`,
 					[owner.runId, token.name, token.seqIndex, jsonParam({ id: token.waitpointId })]
 				);
 				const row = rows[0];

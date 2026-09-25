@@ -61,6 +61,12 @@ CREATE TABLE steps (
 		CONSTRAINT steps_run_id_fkey REFERENCES runs (id) ON DELETE CASCADE,
 	name text NOT NULL,
 	seq_index int NOT NULL,
+	-- Which ctx.step method recorded the row; replay compares it exactly (decision 11).
+	-- run = step.run, sleep = step.sleep, token = createToken, wait = `${name}#wait` of
+	-- waitForToken, trigger = step.trigger, trigger_wait = triggerAndWait,
+	-- batch_wait = batchTriggerAndWait.
+	kind text NOT NULL
+		CHECK (kind IN ('run', 'sleep', 'token', 'wait', 'trigger', 'trigger_wait', 'batch_wait')),
 	status text NOT NULL CHECK (status IN ('completed', 'waiting')),
 	output jsonb,
 	wake_at timestamptz,

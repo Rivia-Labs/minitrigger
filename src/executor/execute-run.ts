@@ -6,6 +6,7 @@ import type { Transport } from "../queue/transport.js";
 import type { Registry } from "../registry.js";
 import type {
 	EnqueueRequest,
+	ExecutionSnapshot,
 	RunRecord,
 	SerializedError,
 	Store,
@@ -17,7 +18,7 @@ import { formatError } from "../utils/error-format.js";
 import { assertSerializable, type Json, normalizeOutput } from "../utils/serialization.js";
 import { type AbortKind, type ActiveExecutions, ExecutionState } from "./execution.js";
 import { createRunLogger } from "./logger.js";
-import { createStepApi } from "./step-context.js";
+import { createStepContext, SuspendSignal } from "./step-context.js";
 
 export interface ExecutorDeps {
 	store: Store;
@@ -41,14 +42,15 @@ export interface RunJob {
 }
 
 /**
- * How the task function ended (or why the executor stopped waiting for it).
- * Phase 4 adds `{ kind: "suspended" }` (a `SuspendSignal` was thrown: await `Promise.allSettled`
- * of `state.inFlight`, then `store.runs.suspend`, and ignore the function's own outcome).
+ * How the task function ended (or why the executor stopped waiting for it). `suspended`: a
+ * `SuspendSignal` was thrown (decision 2); the function's own outcome is ignored, the in-flight
+ * steps were settled and `store.runs.suspend` runs next.
  */
 type Outcome =
 	| { kind: "success"; output: unknown }
 	| { kind: "error"; error: unknown }
-	| { kind: "aborted"; reason: AbortKind };
+	| { kind: "aborted"; reason: AbortKind }
+	| { kind: "suspended" };
 
 /**
  * Executes one delivery of a run job (Phase 3; decisions 4, 5, 6, 12, 20):
@@ -142,14 +144,8 @@ async function runAcquired(deps: ExecutorDeps, state: ExecutionState): Promise<v
 				);
 
 	try {
-		const ctx: TaskContext = {
-			step: createStepApi(state),
-			logger,
-			signal: state.signal,
-			run: { id: run.id, taskId: run.taskId, attempt: run.attempt, createdAt: run.createdAt },
-			stream: () => Promise.reject(new Error("ctx.stream is implemented in Phase 7")),
-		};
-		const outcome = await invoke(task, state, ctx);
+		let outcome = await execute(deps, task, state, logger);
+		if (outcome.kind === "suspended") outcome = await settleInFlight(state);
 		clearTimeout(timer);
 		heartbeat.stop();
 		await settle(deps, state, task, outcome, maxDurationMs);
@@ -160,30 +156,102 @@ async function runAcquired(deps: ExecutorDeps, state: ExecutionState): Promise<v
 	}
 }
 
-function invoke(
+/** Loads the step snapshot (ONE query, Phase 4), builds `ctx` and runs the task function. */
+async function execute(
+	deps: ExecutorDeps,
 	task: AnyTask | undefined,
 	state: ExecutionState,
-	ctx: TaskContext
+	logger: TaskContext["logger"]
 ): Promise<Outcome> {
 	if (!task) {
 		// E.g. a rolling deploy where this process doesn't know the task yet: count it as a failed
 		// (retryable) attempt, so another worker that knows the task can pick up the retry.
-		return Promise.resolve({
+		return {
 			kind: "error",
 			error: new TaskNotRegisteredError(
 				`task "${state.taskId}" is not registered in the engine that picked up run ${state.runId}`
 			),
-		});
+		};
 	}
+	const { limits } = deps.config;
+	let snapshot: ExecutionSnapshot;
+	try {
+		snapshot = await deps.store.steps.loadForExecution(
+			state.runId,
+			limits.maxInlineStepOutputBytes
+		);
+	} catch (error) {
+		return { kind: "error", error };
+	}
+	if (state.abortKind !== undefined) return { kind: "aborted", reason: state.abortKind };
 
+	const steps = createStepContext(
+		state,
+		{ steps: deps.store.steps, maxStepOutputBytes: limits.maxStepOutputBytes },
+		snapshot
+	);
+	const { run } = state;
+	const ctx: TaskContext = {
+		step: steps.api,
+		logger,
+		signal: state.signal,
+		run: { id: run.id, taskId: run.taskId, attempt: run.attempt, createdAt: run.createdAt },
+		stream: () => Promise.reject(new Error("ctx.stream is implemented in Phase 7")),
+	};
+	return invoke(deps, task, state, ctx);
+}
+
+/**
+ * Decision 2: before the suspension transaction, wait for every step still in flight in this
+ * execution (so `Promise.all([step.run, step.sleep])` persists the `step.run` instead of re-running
+ * it on replay). A step that fails meanwhile was never persisted: it re-runs on replay and no
+ * attempt is counted (the suspension wins). Heartbeat and `maxDurationMs` keep running; an abort
+ * ends the wait: cancel/lost/shutdown write nothing more; a timeout still runs the suspension
+ * (see `settle`), since the execution still owns the run.
+ */
+async function settleInFlight(state: ExecutionState): Promise<Outcome> {
+	const aborted = new Promise<Outcome>(resolve => {
+		state.onAbort(reason => resolve({ kind: "aborted", reason }));
+	});
+	while (state.inFlight.size > 0) {
+		const settled = Promise.allSettled(Array.from(state.inFlight)).then(() => undefined);
+		const result = await Promise.race([settled, aborted]);
+		if (result !== undefined) return result;
+	}
+	return { kind: "suspended" };
+}
+
+function invoke(
+	deps: ExecutorDeps,
+	task: AnyTask,
+	state: ExecutionState,
+	ctx: TaskContext
+): Promise<Outcome> {
 	const fnOutcome = (async () => task.options.run(state.run.payload, ctx))().then(
 		(output): Outcome => ({ kind: "success", output }),
 		(error: unknown): Outcome => ({ kind: "error", error })
 	);
+	// Suspension is authoritative (decision 2): whatever the function does after a SuspendSignal is
+	// ignored. Ending any other way than by that signal means the user caught it: warn.
+	void fnOutcome.then(outcome => {
+		if (!state.suspended) return;
+		if (outcome.kind === "error" && outcome.error instanceof SuspendSignal) return;
+		deps.config.logger.warn(
+			{ runId: state.runId, taskId: state.taskId, outcome: outcome.kind },
+			"task function did not end with the suspension signal (it was caught by user code?); " +
+				"its result is ignored and the run stays suspended. Do not catch errors around ctx.step " +
+				"calls without rethrowing them"
+		);
+	});
 	const abortOutcome = new Promise<Outcome>(resolve => {
 		state.onAbort(reason => resolve({ kind: "aborted", reason }));
 	});
-	return Promise.race([fnOutcome, abortOutcome]);
+	const suspendOutcome = new Promise<Outcome>(resolve => {
+		state.onSuspend(() => resolve({ kind: "suspended" }));
+	});
+	return Promise.race([fnOutcome, abortOutcome, suspendOutcome]).then(outcome =>
+		state.suspended && outcome.kind !== "aborted" ? { kind: "suspended" } : outcome
+	);
 }
 
 async function settle(
@@ -199,10 +267,25 @@ async function settle(
 	// `engine.stop()` took the run back (decision 20): it releases it, we write nothing.
 	if (state.handedBack) return;
 
+	// A code bug detected by ctx.step (NonDeterminismError, DuplicateStepError): fail without
+	// retry, whatever the function did afterwards (caught it, suspended, returned). Replaying the
+	// same code would hit it again. An abort that already cleared ownership still wins.
+	const ownershipGone = outcome.kind === "aborted" && outcome.reason !== "timeout";
+	if (state.fatalError !== undefined && !ownershipGone) {
+		return failAttempt(deps, state, task, state.fatalError, false);
+	}
+
 	switch (outcome.kind) {
+		case "suspended":
+			return suspendRun(deps, state);
+
 		case "aborted":
 			switch (outcome.reason) {
 				case "timeout":
+					// `maxDurationMs` expired during the pre-suspension settle (the execution still
+					// owns the run): the suspension wins (decision 2), no attempt is counted. The
+					// in-flight steps that did not finish were never persisted and re-run on replay.
+					if (state.suspended) return suspendRun(deps, state);
 					return failAttempt(
 						deps,
 						state,
@@ -217,6 +300,8 @@ async function settle(
 					return;
 				case "canceled":
 					log.debug(fields, "run canceled while executing");
+					return;
+				case "suspended":
 					return;
 			}
 			return;
@@ -255,6 +340,37 @@ async function settle(
 			return afterTerminal(deps, state, result.parent);
 		}
 	}
+}
+
+/**
+ * The suspension transaction (decision 3), after the in-flight steps settled. `attempt` is never
+ * incremented. The BullMQ job then completes, so a suspended run does not hold a worker slot.
+ */
+async function suspendRun(deps: ExecutorDeps, state: ExecutionState): Promise<void> {
+	const fields = { runId: state.runId, taskId: state.taskId, attempt: state.run.attempt };
+	const result = await deps.store.runs.suspend(state.owner);
+	switch (result.kind) {
+		case "lost":
+			return onLost(deps, state);
+		case "waiting_on_waitpoints":
+			// Whoever resolves the last pending waitpoint enqueues the run.
+			deps.config.logger.debug(fields, "run suspended waiting on waitpoints");
+			break;
+		case "sleeping":
+			deps.config.logger.debug(
+				{ ...fields, delayMs: result.enqueue.delayMs },
+				"run suspended until its sleeps are due"
+			);
+			await enqueue(deps, result.enqueue);
+			break;
+		case "requeued":
+			// Everything it waited for was already resolved: resume right away.
+			deps.config.logger.debug(fields, "run suspended and requeued immediately");
+			await enqueue(deps, result.enqueue);
+			break;
+	}
+	// Stops a task function that swallowed the SuspendSignal (its outcome is ignored anyway).
+	state.abort("suspended");
 }
 
 /**

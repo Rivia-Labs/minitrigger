@@ -51,7 +51,7 @@ the SQL shape it must use. `$schema` is always `escapeIdentifier(schema)`.
 | Method | Decision | SQL shape |
 |---|---|---|
 | `create` | 9, 1 | `INSERT runs (status 'queued', attempt 1, enqueue_seq 1, run_after = now()+delay)`; if `idempotency`, `idempotency.claim` in the same tx. Not claimed → ROLLBACK (or to savepoint) and `get(existingRunId)` → `existing`. If that run is gone, retry once. |
-| `triggerChildren` | 10, 11 | One tx: guard parent `FOR SHARE`; `INSERT waitpoints` (`child_run`: pending_count NULL; `batch`: pending_count = n; `expires_at = now()+timeout`); per child `INSERT runs` (`queued`, `run_after=now()`, parent_run_id, parent_waitpoint_id (NULL for `trigger`), parent_step_name, batch_index) + claim key with `ttlMs null`; `INSERT steps` (`trigger`: completed `{id}`; else waiting `{waitpointId}`). Claim or step conflict → throw (rollback). Return enqueue per child + `expireDelayMs`. |
+| `triggerChildren` | 10, 11 | One tx: guard parent `FOR SHARE`; `INSERT waitpoints` (`child_run`: pending_count NULL; `batch`: pending_count = n; `expires_at = now()+timeout`); per child `INSERT runs` (`queued`, `run_after=now()`, parent_run_id, parent_waitpoint_id (NULL for `trigger`), parent_step_name, batch_index) + claim key with `ttlMs null`; `INSERT steps` (`trigger`: completed `{id}`, kind `trigger`; else waiting `{waitpointId}`, kind `trigger_wait`/`batch_wait`). Claim or step conflict → throw (rollback). Return enqueue per child + `expireDelayMs`. |
 | `acquire` | 5 | Exactly the decision-5 UPDATE ... RETURNING *. |
 | `heartbeat` | 6 | Own tx: `BEGIN; SET LOCAL statement_timeout = <int ms>; UPDATE runs SET heartbeat_at=now() WHERE id AND execution_id AND status='running'; COMMIT`. Never `SET` without `LOCAL`; do not touch `updated_at`. Not on `StoreTx`. |
 | `complete` / `fail` | 5, 10 | Lock parent (if `parent_waitpoint_id`), then guarded `UPDATE runs SET status, output/error, finished_at=now(), run_after=NULL, execution_id=NULL`; then child resolution. |
@@ -74,13 +74,18 @@ maxAttempts from the task definition, **no** idempotency key). No dedicated stor
 
 | Method | Decision | SQL shape |
 |---|---|---|
-| `loadForExecution` | Ph4, 17 | The Phase-4 window query verbatim (`$2 = maxInlineBytes`), plus `SELECT now()` and the run's waitpoints (`id, step_name, kind, status, pending_count, expires_at`, no output). When deferred, every `output` is null. |
+| `loadForExecution` | Ph4, 17 | The Phase-4 window query verbatim (`$2 = maxInlineBytes`; it also selects `kind`), plus `SELECT now()` and the run's waitpoints (`id, step_name, kind, status, pending_count, expires_at`, no output). When deferred, every `output` is null. |
 | `loadOutputs` | Ph4 | `WHERE run_id=$1 AND seq_index BETWEEN $2 AND $3 ORDER BY seq_index`. |
-| `insertCompleted` | 5, Ph4 | `INSERT INTO steps (...) SELECT ... WHERE <guard FOR SHARE> ON CONFLICT (run_id, name) DO NOTHING`, one CTE statement: guard failed → lost; name conflict → ok (not overwritten); `(run_id, seq_index)` collision under another name → throws. |
-| `insertSleep` | Ph4, 17 | Same guard, `status 'waiting', wake_at = now()+ms RETURNING wake_at, delayMs`. |
+| `insertCompleted` | 5, Ph4 | `INSERT INTO steps (..., kind, ...) SELECT ... WHERE <guard FOR SHARE> ON CONFLICT (run_id, name) DO NOTHING`, one CTE statement: guard failed → lost; name conflict → ok (not overwritten); `(run_id, seq_index)` collision under another name → throws. |
+| `insertSleep` | Ph4, 17 | Same guard, `kind 'sleep', status 'waiting', wake_at = now()+ms RETURNING wake_at, delayMs`. |
 | `completeSleep` | Ph4 | Guarded `UPDATE steps SET status='completed' WHERE run_id, name, status='waiting'`, returning the step; `not_due` if `wake_at > now()`. |
-| `insertWaitRef` | 10, 11 | Guarded insert of `${name}#wait`, `waiting`, output `{waitpointId}`, `ON CONFLICT (run_id, name) DO NOTHING`; outcomes as `insertCompleted`. |
-| `list` | Ph7 | All columns, `ORDER BY seq_index`. |
+| `insertWaitRef` | 10, 11 | Guarded insert of `${name}#wait` with the given `kind` (`wait`), `waiting`, output `{waitpointId}`, `ON CONFLICT (run_id, name) DO NOTHING`; outcomes as `insertCompleted`. |
+| `list` | Ph7 | All columns (incl. `kind`), `ORDER BY seq_index`. |
+
+`steps.kind` (NOT NULL, CHECK) records which `ctx.step` method wrote the row and is compared
+exactly on replay (decision 11): `run` (`insertCompleted`), `sleep` (`insertSleep`), `wait`
+(`insertWaitRef`), `token` (`WaitpointStore.createToken`), and via `RunStore.triggerChildren` by
+mode: `trigger` → `trigger`, `wait` → `trigger_wait`, `batch` → `batch_wait`.
 
 Waitpoint-backed steps stay `waiting` forever; their state is the waitpoint's (found in the
 snapshot by `step_name`: the step name for child/batch, the name without `#wait` for tokens).
@@ -89,7 +94,7 @@ snapshot by `step_name`: the step name for child/batch, the name without `#wait`
 
 | Method | Decision | SQL shape |
 |---|---|---|
-| `createToken` | 10, 11 | One tx: guard; `INSERT waitpoints (kind 'token', status 'pending', expires_at)`; `INSERT steps (name, completed, {id})`. |
+| `createToken` | 10, 11 | One tx: guard; `INSERT waitpoints (kind 'token', status 'pending', expires_at)`; `INSERT steps (name, kind 'token', completed, {id})`. |
 | `completeToken` | 3, 12 | Read run_id; `SELECT ... FROM runs WHERE id FOR UPDATE`; `UPDATE waitpoints SET status='completed', output WHERE id AND kind='token' AND status='pending'`; resume rule. A token of a canceled run is already `timed_out` → `not_pending`. |
 | `expire` | 10, Ph6 #5 | Lock run FOR UPDATE; read the waitpoint (`status='pending' AND expires_at IS NOT NULL`, else noop); `expires_at > now()` → `not_due` with DB-computed `delayMs` (handler re-delays the job); else for child/batch cancel non-terminal children recursively (cancel's walk; their parent-waitpoint resolution is a no-op), time out the canceled children's own pending waitpoints (→ `expireJobsToRemove`, as `cancel`), `UPDATE waitpoints SET status='timed_out', resolved_at=now()`; resume rule. |
 | `listExpired` | Ph6 #5 | `status='pending' AND expires_at <= now()` (partial index). |

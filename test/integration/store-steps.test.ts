@@ -51,8 +51,8 @@ async function dbNow(): Promise<Date> {
 describe("StepStore.loadForExecution", () => {
 	it("returns steps inline (not deferred) when under maxInlineBytes", async () => {
 		const owner = await insertRunningRun();
-		await steps.insertCompleted(owner, { name: "a", seqIndex: 1, output: { v: 1 } });
-		await steps.insertCompleted(owner, { name: "b", seqIndex: 2, output: { v: 2 } });
+		await steps.insertCompleted(owner, { kind: "run", name: "a", seqIndex: 1, output: { v: 1 } });
+		await steps.insertCompleted(owner, { kind: "run", name: "b", seqIndex: 2, output: { v: 2 } });
 
 		const snapshot = await steps.loadForExecution(owner.runId, 16 * 1024 * 1024);
 
@@ -66,8 +66,18 @@ describe("StepStore.loadForExecution", () => {
 
 	it("defers outputs (all null) when the total size exceeds a tiny maxInlineBytes", async () => {
 		const owner = await insertRunningRun();
-		await steps.insertCompleted(owner, { name: "a", seqIndex: 1, output: { v: "x".repeat(100) } });
-		await steps.insertCompleted(owner, { name: "b", seqIndex: 2, output: { v: "y".repeat(100) } });
+		await steps.insertCompleted(owner, {
+			kind: "run",
+			name: "a",
+			seqIndex: 1,
+			output: { v: "x".repeat(100) },
+		});
+		await steps.insertCompleted(owner, {
+			kind: "run",
+			name: "b",
+			seqIndex: 2,
+			output: { v: "y".repeat(100) },
+		});
 
 		const snapshot = await steps.loadForExecution(owner.runId, 1);
 
@@ -88,9 +98,9 @@ describe("StepStore.loadForExecution", () => {
 
 	it("orders steps by seq_index regardless of insertion order", async () => {
 		const owner = await insertRunningRun();
-		await steps.insertCompleted(owner, { name: "third", seqIndex: 3, output: null });
-		await steps.insertCompleted(owner, { name: "first", seqIndex: 1, output: null });
-		await steps.insertCompleted(owner, { name: "second", seqIndex: 2, output: null });
+		await steps.insertCompleted(owner, { kind: "run", name: "third", seqIndex: 3, output: null });
+		await steps.insertCompleted(owner, { kind: "run", name: "first", seqIndex: 1, output: null });
+		await steps.insertCompleted(owner, { kind: "run", name: "second", seqIndex: 2, output: null });
 
 		const snapshot = await steps.loadForExecution(owner.runId, 16 * 1024 * 1024);
 		expect(snapshot.steps.map(s => s.name)).toEqual(["first", "second", "third"]);
@@ -124,7 +134,12 @@ describe("StepStore.loadOutputs", () => {
 	it("returns only the requested seq_index range, ordered", async () => {
 		const owner = await insertRunningRun();
 		for (let i = 1; i <= 5; i++) {
-			await steps.insertCompleted(owner, { name: `s${i}`, seqIndex: i, output: { i } });
+			await steps.insertCompleted(owner, {
+				kind: "run",
+				name: `s${i}`,
+				seqIndex: i,
+				output: { i },
+			});
 		}
 
 		const range = await steps.loadOutputs(owner.runId, 2, 4);
@@ -137,7 +152,7 @@ describe("StepStore.loadOutputs", () => {
 
 	it("returns an empty array outside the range", async () => {
 		const owner = await insertRunningRun();
-		await steps.insertCompleted(owner, { name: "s1", seqIndex: 1, output: { i: 1 } });
+		await steps.insertCompleted(owner, { kind: "run", name: "s1", seqIndex: 1, output: { i: 1 } });
 		expect(await steps.loadOutputs(owner.runId, 10, 20)).toEqual([]);
 	});
 });
@@ -146,6 +161,7 @@ describe("StepStore.insertCompleted", () => {
 	it("inserts a new step and reports ok", async () => {
 		const owner = await insertRunningRun();
 		const result = await steps.insertCompleted(owner, {
+			kind: "run",
 			name: "step-a",
 			seqIndex: 1,
 			output: { done: true },
@@ -156,6 +172,7 @@ describe("StepStore.insertCompleted", () => {
 		expect(record).toMatchObject({
 			name: "step-a",
 			seqIndex: 1,
+			kind: "run",
 			status: "completed",
 			output: { done: true },
 		});
@@ -163,9 +180,15 @@ describe("StepStore.insertCompleted", () => {
 
 	it("is idempotent: a duplicate insert (ON CONFLICT DO NOTHING) still reports ok and does not overwrite", async () => {
 		const owner = await insertRunningRun();
-		await steps.insertCompleted(owner, { name: "step-a", seqIndex: 1, output: { v: "first" } });
+		await steps.insertCompleted(owner, {
+			kind: "run",
+			name: "step-a",
+			seqIndex: 1,
+			output: { v: "first" },
+		});
 
 		const second = await steps.insertCompleted(owner, {
+			kind: "run",
 			name: "step-a",
 			seqIndex: 1,
 			output: { v: "second" },
@@ -182,6 +205,7 @@ describe("StepStore.insertCompleted", () => {
 		await loseOwnership(owner.runId);
 
 		const result = await steps.insertCompleted(owner, {
+			kind: "run",
 			name: "step-a",
 			seqIndex: 1,
 			output: null,
@@ -195,6 +219,7 @@ describe("StepStore.insertCompleted", () => {
 		const wrongOwner: Ownership = { runId: owner.runId, executionId: randomUUID() };
 
 		const result = await steps.insertCompleted(wrongOwner, {
+			kind: "run",
 			name: "step-a",
 			seqIndex: 1,
 			output: null,
@@ -204,12 +229,12 @@ describe("StepStore.insertCompleted", () => {
 
 	it("enforces UNIQUE(run_id, seq_index) at the schema level", async () => {
 		const owner = await insertRunningRun();
-		await steps.insertCompleted(owner, { name: "step-a", seqIndex: 1, output: null });
+		await steps.insertCompleted(owner, { kind: "run", name: "step-a", seqIndex: 1, output: null });
 
 		await expect(
 			ns.pool.query(
-				`INSERT INTO ${ctx.t("steps")} (run_id, name, seq_index, status, output)
-				 VALUES ($1, 'step-b', 1, 'completed', NULL)`,
+				`INSERT INTO ${ctx.t("steps")} (run_id, name, seq_index, kind, status, output)
+				 VALUES ($1, 'step-b', 1, 'run', 'completed', NULL)`,
 				[owner.runId]
 			)
 		).rejects.toThrow(/duplicate key|unique/i);
@@ -271,6 +296,7 @@ describe("StepStore.insertWaitRef", () => {
 		const owner = await insertRunningRun();
 		const waitpointId = randomUUID();
 		const result = await steps.insertWaitRef(owner, {
+			kind: "wait",
 			name: "approval#wait",
 			seqIndex: 2,
 			waitpointId,
@@ -280,6 +306,7 @@ describe("StepStore.insertWaitRef", () => {
 		const [record] = await steps.list(owner.runId);
 		expect(record).toMatchObject({
 			name: "approval#wait",
+			kind: "wait",
 			status: "waiting",
 			output: { waitpointId },
 			wakeAt: null,
@@ -290,6 +317,7 @@ describe("StepStore.insertWaitRef", () => {
 		const owner = await insertRunningRun();
 		await loseOwnership(owner.runId);
 		const result = await steps.insertWaitRef(owner, {
+			kind: "wait",
 			name: "approval#wait",
 			seqIndex: 2,
 			waitpointId: randomUUID(),
@@ -301,8 +329,8 @@ describe("StepStore.insertWaitRef", () => {
 describe("StepStore.list", () => {
 	it("returns every column, ordered by seq_index", async () => {
 		const owner = await insertRunningRun();
-		await steps.insertCompleted(owner, { name: "b", seqIndex: 2, output: { v: 2 } });
-		await steps.insertCompleted(owner, { name: "a", seqIndex: 1, output: { v: 1 } });
+		await steps.insertCompleted(owner, { kind: "run", name: "b", seqIndex: 2, output: { v: 2 } });
+		await steps.insertCompleted(owner, { kind: "run", name: "a", seqIndex: 1, output: { v: 1 } });
 
 		const records = await steps.list(owner.runId);
 		expect(records.map(r => r.name)).toEqual(["a", "b"]);
@@ -328,7 +356,9 @@ describe("StepStore: jsonb outputs of every Json shape", () => {
 	for (const [label, output] of shapes) {
 		it(`insertCompleted round-trips ${label}`, async () => {
 			const owner = await insertRunningRun();
-			expect(await steps.insertCompleted(owner, { name: "s", seqIndex: 1, output })).toBe("ok");
+			expect(
+				await steps.insertCompleted(owner, { kind: "run", name: "s", seqIndex: 1, output })
+			).toBe("ok");
 			const [record] = await steps.list(owner.runId);
 			expect(record?.output).toEqual(output);
 			const snapshot = await steps.loadForExecution(owner.runId, 16 * 1024 * 1024);
@@ -340,16 +370,16 @@ describe("StepStore: jsonb outputs of every Json shape", () => {
 describe("StepStore: (run_id, seq_index) collisions under a different name", () => {
 	it("insertCompleted throws instead of silently swallowing the collision", async () => {
 		const owner = await insertRunningRun();
-		await steps.insertCompleted(owner, { name: "a", seqIndex: 1, output: 1 });
+		await steps.insertCompleted(owner, { kind: "run", name: "a", seqIndex: 1, output: 1 });
 		await expect(
-			steps.insertCompleted(owner, { name: "b", seqIndex: 1, output: 2 })
+			steps.insertCompleted(owner, { kind: "run", name: "b", seqIndex: 1, output: 2 })
 		).rejects.toThrow(/duplicate key|unique/i);
 	});
 
 	it("insertWaitRef: an existing step with the same name is ok (idempotent), not lost", async () => {
 		const owner = await insertRunningRun();
 		const waitpointId = randomUUID();
-		const step = { name: "approval#wait", seqIndex: 2, waitpointId };
+		const step = { kind: "wait" as const, name: "approval#wait", seqIndex: 2, waitpointId };
 		expect(await steps.insertWaitRef(owner, step)).toBe("ok");
 		expect(await steps.insertWaitRef(owner, step)).toBe("ok");
 		expect(await steps.list(owner.runId)).toHaveLength(1);
@@ -357,9 +387,47 @@ describe("StepStore: (run_id, seq_index) collisions under a different name", () 
 
 	it("insertWaitRef throws on a seq_index collision under a different name", async () => {
 		const owner = await insertRunningRun();
-		await steps.insertCompleted(owner, { name: "a", seqIndex: 2, output: 1 });
+		await steps.insertCompleted(owner, { kind: "run", name: "a", seqIndex: 2, output: 1 });
 		await expect(
-			steps.insertWaitRef(owner, { name: "approval#wait", seqIndex: 2, waitpointId: randomUUID() })
+			steps.insertWaitRef(owner, {
+				kind: "wait",
+				name: "approval#wait",
+				seqIndex: 2,
+				waitpointId: randomUUID(),
+			})
 		).rejects.toThrow(/duplicate key|unique/i);
+	});
+});
+
+describe("StepStore: step kind", () => {
+	it("writes the kind of each step and returns it from loadForExecution and list", async () => {
+		const owner = await insertRunningRun();
+		await steps.insertCompleted(owner, { kind: "run", name: "a", seqIndex: 0, output: 1 });
+		await steps.insertSleep(owner, { name: "nap", seqIndex: 1, durationMs: 60_000 });
+		await steps.insertWaitRef(owner, {
+			kind: "wait",
+			name: "approval#wait",
+			seqIndex: 2,
+			waitpointId: randomUUID(),
+		});
+		const expected = [
+			["a", "run"],
+			["nap", "sleep"],
+			["approval#wait", "wait"],
+		];
+		const snapshot = await steps.loadForExecution(owner.runId, 16 * 1024 * 1024);
+		expect(snapshot.steps.map(s => [s.name, s.kind])).toEqual(expected);
+		expect((await steps.list(owner.runId)).map(s => [s.name, s.kind])).toEqual(expected);
+	});
+
+	it("the schema rejects an unknown kind", async () => {
+		const owner = await insertRunningRun();
+		await expect(
+			ns.pool.query(
+				`INSERT INTO ${ctx.t("steps")} (run_id, name, seq_index, kind, status)
+				 VALUES ($1, 'x', 0, 'bogus', 'completed')`,
+				[owner.runId]
+			)
+		).rejects.toThrow(/check constraint/i);
 	});
 });

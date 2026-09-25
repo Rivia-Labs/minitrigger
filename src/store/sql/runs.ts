@@ -10,6 +10,7 @@ import type {
 	RunStatus,
 	RunStore,
 	SerializedError,
+	StepKind,
 	TerminalRunStatus,
 	TriggerChildrenInput,
 	TriggerChildrenResult,
@@ -44,6 +45,13 @@ import {
  * millisecond would be skipped by the `(created_at, id) < ($c, $id)` comparison.
  */
 const CREATED_AT_SQL = "date_trunc('milliseconds', now())";
+
+/** `steps.kind` of the step written by `triggerChildren`, per mode. */
+const STEP_KIND_BY_MODE: Record<TriggerChildrenInput["mode"], StepKind> = {
+	trigger: "trigger",
+	wait: "trigger_wait",
+	batch: "batch_wait",
+};
 
 /** Ownership predicate for writes to the run row itself (decision 5). */
 const OWNED = "id = $1 AND execution_id = $2 AND status = 'running'";
@@ -227,8 +235,8 @@ export function createRunStore(exec: SqlExecutor, ctx: SqlContext): RunStore {
 				);
 				const first = input.children[0];
 				await db.query(
-					`INSERT INTO ${ctx.t("steps")} (run_id, name, seq_index, status, output)
-					 VALUES ($1, $2, $3, $4, $5::jsonb)`,
+					`INSERT INTO ${ctx.t("steps")} (run_id, name, seq_index, kind, status, output)
+					 VALUES ($1, $2, $3, $6, $4, $5::jsonb)`,
 					[
 						input.parent.runId,
 						input.stepName,
@@ -237,6 +245,7 @@ export function createRunStore(exec: SqlExecutor, ctx: SqlContext): RunStore {
 						input.mode === "trigger"
 							? jsonParam({ id: first?.id ?? null })
 							: jsonParam({ waitpointId: input.waitpointId }),
+						STEP_KIND_BY_MODE[input.mode],
 					]
 				);
 				const enqueue: EnqueueRequest[] = input.children.map(c => ({

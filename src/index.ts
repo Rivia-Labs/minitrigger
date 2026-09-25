@@ -13,8 +13,11 @@ export {
 export {
 	AbortTaskRunError,
 	ConfigError,
+	DuplicateStepError,
 	ExecutionLostError,
 	MinitriggerError,
+	NestedStepError,
+	NonDeterminismError,
 	SerializationError,
 	TaskNotRegisteredError,
 } from "./errors.js";

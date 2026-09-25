@@ -41,6 +41,7 @@ describe("Store.withTransaction", () => {
 
 		await store.withTransaction(async tx => {
 			const result = await tx.steps.insertCompleted(owner, {
+				kind: "run",
 				name: "step-a",
 				seqIndex: 1,
 				output: { ok: true },
@@ -58,7 +59,12 @@ describe("Store.withTransaction", () => {
 
 		await expect(
 			store.withTransaction(async tx => {
-				await tx.steps.insertCompleted(owner, { name: "step-a", seqIndex: 1, output: null });
+				await tx.steps.insertCompleted(owner, {
+					kind: "run",
+					name: "step-a",
+					seqIndex: 1,
+					output: null,
+				});
 				throw new Error("boom");
 			})
 		).rejects.toThrow("boom");
@@ -71,8 +77,18 @@ describe("Store.withTransaction", () => {
 
 		await expect(
 			store.withTransaction(async tx => {
-				await tx.steps.insertCompleted(owner, { name: "a", seqIndex: 1, output: null });
-				await tx.steps.insertCompleted(owner, { name: "b", seqIndex: 2, output: null });
+				await tx.steps.insertCompleted(owner, {
+					kind: "run",
+					name: "a",
+					seqIndex: 1,
+					output: null,
+				});
+				await tx.steps.insertCompleted(owner, {
+					kind: "run",
+					name: "b",
+					seqIndex: 2,
+					output: null,
+				});
 				await tx.logs.insertBatch([
 					{ runId: owner.runId, level: "info", message: "hi", data: null },
 				]);

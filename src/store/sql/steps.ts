@@ -4,6 +4,7 @@ import type {
 	Json,
 	LoadedStep,
 	Ownership,
+	StepKind,
 	StepRecord,
 	StepStatus,
 	StepStore,
@@ -21,6 +22,7 @@ import { jsonParam } from "./resolve.js";
 interface StepWindowRow {
 	name: string;
 	seq_index: number;
+	kind: StepKind;
 	status: StepStatus;
 	wake_at: Date | null;
 	// Verbatim Phase-4 window query (docs/SPEC.md §5 Phase 4, docs/store-contract.md
@@ -52,6 +54,7 @@ interface StepRow {
 	run_id: string;
 	name: string;
 	seq_index: number;
+	kind: StepKind;
 	status: StepStatus;
 	output: Json | null;
 	wake_at: Date | null;
@@ -85,7 +88,7 @@ export function createStepStore(exec: SqlExecutor, ctx: SqlContext): StepStore {
 		async loadForExecution(runId: string, maxInlineBytes: number): Promise<ExecutionSnapshot> {
 			// Statement 1: the Phase-4 window query, verbatim.
 			const { rows: stepRows } = await db.query<StepWindowRow>(
-				`SELECT name, seq_index, status, wake_at,
+				`SELECT name, seq_index, kind, status, wake_at,
 				        CASE WHEN sum(pg_column_size(output)) OVER () <= $2 THEN output END AS output,
 				        sum(pg_column_size(output)) OVER () > $2 AS outputs_deferred
 				 FROM ${ctx.t("steps")}
@@ -117,6 +120,7 @@ export function createStepStore(exec: SqlExecutor, ctx: SqlContext): StepStore {
 			const steps: LoadedStep[] = stepRows.map(row => ({
 				name: row.name,
 				seqIndex: row.seq_index,
+				kind: row.kind,
 				status: row.status,
 				wakeAt: row.wake_at,
 				output: row.output,
@@ -160,7 +164,7 @@ export function createStepStore(exec: SqlExecutor, ctx: SqlContext): StepStore {
 
 		async insertCompleted(
 			owner: Ownership,
-			step: { name: string; seqIndex: number; output: Json | null }
+			step: { kind: StepKind; name: string; seqIndex: number; output: Json | null }
 		): Promise<"ok" | "lost"> {
 			// Single statement: the ownership guard and the guarded insert share one CTE so
 			// `rowCount = 0` on the insert can be told apart from a lost execution without a second
@@ -181,8 +185,8 @@ export function createStepStore(exec: SqlExecutor, ctx: SqlContext): StepStore {
 				   SELECT count(*)::int AS c FROM locked
 				 ),
 				 ins AS (
-				   INSERT INTO ${ctx.t("steps")} (run_id, name, seq_index, status, output)
-				   SELECT $1, $2, $3::int, 'completed', $4::jsonb
+				   INSERT INTO ${ctx.t("steps")} (run_id, name, seq_index, kind, status, output)
+				   SELECT $1, $2, $3::int, $6, 'completed', $4::jsonb
 				   WHERE (SELECT c FROM guard) > 0
 				   ON CONFLICT (run_id, name) DO NOTHING
 				   RETURNING 1
@@ -191,7 +195,14 @@ export function createStepStore(exec: SqlExecutor, ctx: SqlContext): StepStore {
 				        (SELECT count(*) FROM ins)::int AS inserted_count`,
 				// jsonb is always bound as JSON text: pg would send a JS string raw (invalid JSON)
 				// and turn a JS array into a PG array literal.
-				[owner.runId, step.name, step.seqIndex, jsonParam(step.output), owner.executionId]
+				[
+					owner.runId,
+					step.name,
+					step.seqIndex,
+					jsonParam(step.output),
+					owner.executionId,
+					step.kind,
+				]
 			);
 			const row = rows[0];
 			if (row === undefined || row.guard_count === 0) return "lost";
@@ -215,8 +226,8 @@ export function createStepStore(exec: SqlExecutor, ctx: SqlContext): StepStore {
 				   SELECT now() AS now
 				 ),
 				 ins AS (
-				   INSERT INTO ${ctx.t("steps")} (run_id, name, seq_index, status, wake_at)
-				   SELECT $1, $2, $3::int, 'waiting', n.now + ($4::numeric * interval '1 millisecond')
+				   INSERT INTO ${ctx.t("steps")} (run_id, name, seq_index, kind, status, wake_at)
+				   SELECT $1, $2, $3::int, 'sleep', 'waiting', n.now + ($4::numeric * interval '1 millisecond')
 				   FROM n
 				   WHERE (SELECT c FROM guard) > 0
 				   RETURNING
@@ -265,7 +276,7 @@ export function createStepStore(exec: SqlExecutor, ctx: SqlContext): StepStore {
 
 		async insertWaitRef(
 			owner: Ownership,
-			step: { name: string; seqIndex: number; waitpointId: string }
+			step: { kind: StepKind; name: string; seqIndex: number; waitpointId: string }
 		): Promise<"ok" | "lost"> {
 			// Same shape as insertCompleted: an existing `(run_id, name)` step is an idempotent
 			// replay ("ok"), a failed guard is "lost", a seq_index collision raises.
@@ -279,15 +290,15 @@ export function createStepStore(exec: SqlExecutor, ctx: SqlContext): StepStore {
 				   SELECT count(*)::int AS c FROM locked
 				 ),
 				 ins AS (
-				   INSERT INTO ${ctx.t("steps")} (run_id, name, seq_index, status, output)
-				   SELECT $1, $2, $3::int, 'waiting', jsonb_build_object('waitpointId', $4::uuid)
+				   INSERT INTO ${ctx.t("steps")} (run_id, name, seq_index, kind, status, output)
+				   SELECT $1, $2, $3::int, $6, 'waiting', jsonb_build_object('waitpointId', $4::uuid)
 				   WHERE (SELECT c FROM guard) > 0
 				   ON CONFLICT (run_id, name) DO NOTHING
 				   RETURNING 1
 				 )
 				 SELECT (SELECT c FROM guard) AS guard_count,
 				        (SELECT count(*) FROM ins)::int AS inserted_count`,
-				[owner.runId, step.name, step.seqIndex, step.waitpointId, owner.executionId]
+				[owner.runId, step.name, step.seqIndex, step.waitpointId, owner.executionId, step.kind]
 			);
 			const row = rows[0];
 			if (row === undefined || row.guard_count === 0) return "lost";
@@ -296,7 +307,7 @@ export function createStepStore(exec: SqlExecutor, ctx: SqlContext): StepStore {
 
 		async list(runId: string): Promise<StepRecord[]> {
 			const { rows } = await db.query<StepRow>(
-				`SELECT run_id, name, seq_index, status, output, wake_at, created_at
+				`SELECT run_id, name, seq_index, kind, status, output, wake_at, created_at
 				 FROM ${ctx.t("steps")}
 				 WHERE run_id = $1
 				 ORDER BY seq_index`,
@@ -306,6 +317,7 @@ export function createStepStore(exec: SqlExecutor, ctx: SqlContext): StepStore {
 				runId: row.run_id,
 				name: row.name,
 				seqIndex: row.seq_index,
+				kind: row.kind,
 				status: row.status,
 				output: row.output,
 				wakeAt: row.wake_at,
