@@ -1,9 +1,11 @@
 export type { EngineConfig, EngineLimits, EngineLogFn, EngineLogger } from "./config.js";
 export {
 	type CancelRunOutcome,
+	type CompleteTokenOutcome,
 	createEngine,
 	type Engine,
 	type EngineRuns,
+	type EngineTokens,
 	type ListRunsOptions,
 	type Run,
 	type RunList,

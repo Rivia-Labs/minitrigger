@@ -61,6 +61,15 @@ function makeReconciler(
 	});
 }
 
+/** The `${name}#wait` step `waitForToken` writes: only an awaited token blocks a resume. */
+async function awaitToken(runId: string, name: string, waitpointId: string, seqIndex = 1) {
+	await f.sql(
+		`INSERT INTO ${f.t("steps")} (run_id, name, seq_index, kind, status, output)
+		 VALUES ($1, $2, $3, 'wait', 'waiting', $4::jsonb)`,
+		[runId, `${name}#wait`, seqIndex, JSON.stringify({ waitpointId })]
+	);
+}
+
 const rawCleanups: Array<() => Promise<void>> = [];
 /** A raw BullMQ queue handle (its own connection) for inspecting jobs directly via `getJob`. */
 function rawQueue(name: string): Queue {
@@ -130,7 +139,30 @@ describe("createReconciler: case 2 (stale waiting)", () => {
 		expect(job).toBeDefined();
 	});
 
-	it("ignores a waiting run that still has a pending waitpoint", async () => {
+	it("ignores a waiting run that still has a pending (awaited) waitpoint", async () => {
+		const { owner } = await f.running();
+		const waitpointId = randomUUID();
+		await store().waitpoints.createToken(owner, {
+			waitpointId,
+			name: "tok",
+			seqIndex: 0,
+			timeoutMs: null,
+		});
+		await awaitToken(owner.runId, "tok", waitpointId);
+		await f.sql(
+			`UPDATE ${f.t("runs")} SET status = 'waiting', execution_id = NULL,
+			   run_after = now() - interval '1 minute' WHERE id = $1`,
+			[owner.runId]
+		);
+
+		const transport = makeTransport();
+		const { logger } = makeLogger();
+		const report = await makeReconciler(transport, logger).runOnce();
+
+		expect(report.staleWaiting).toBe(0);
+	});
+
+	it("a pending token that was never awaited does not keep a stale waiting run asleep", async () => {
 		const { owner } = await f.running();
 		await store().waitpoints.createToken(owner, {
 			waitpointId: randomUUID(),
@@ -148,7 +180,7 @@ describe("createReconciler: case 2 (stale waiting)", () => {
 		const { logger } = makeLogger();
 		const report = await makeReconciler(transport, logger).runOnce();
 
-		expect(report.staleWaiting).toBe(0);
+		expect(report.staleWaiting).toBe(1);
 	});
 });
 
@@ -264,6 +296,7 @@ describe("createReconciler: case 5 (expired waitpoints)", () => {
 			timeoutMs: 60_000,
 		});
 		if (created.kind !== "created") throw new Error("expected created");
+		await awaitToken(owner.runId, "tok", waitpointId);
 		expect(await store().runs.suspend(owner)).toEqual({ kind: "waiting_on_waitpoints" });
 		await f.sql(
 			`UPDATE ${f.t("waitpoints")} SET expires_at = now() - interval '1 second' WHERE id = $1`,
@@ -295,6 +328,63 @@ describe("createReconciler: case 5 (expired waitpoints)", () => {
 			waitpointExpireJobId(waitpointId)
 		);
 		expect(removedJob).toBeUndefined();
+	});
+
+	it("expiring a child_run waitpoint removes the canceled children's run jobs and calls onCanceled", async () => {
+		const parent = await f.running({ taskId: "parent" });
+		const waitpointId = randomUUID();
+		const childId = randomUUID();
+		const created = await f.runs.triggerChildren({
+			parent: parent.owner,
+			stepName: "child",
+			seqIndex: 0,
+			mode: "wait",
+			waitpointId,
+			timeoutMs: 60_000,
+			children: [
+				{
+					id: childId,
+					taskId: "child-task",
+					queue: QUEUE,
+					payload: null,
+					maxAttempts: 1,
+					idempotencyKey: `__child:${parent.owner.runId}:child`,
+					batchIndex: null,
+				},
+			],
+		});
+		if (created.kind !== "created") throw new Error("expected created");
+		const childJob = created.enqueue[0];
+		if (!childJob) throw new Error("expected a child enqueue");
+		const transport = makeTransport();
+		// Delayed so no worker could pick it up; the reconciler must remove it.
+		await transport.enqueueRun({ ...childJob, delayMs: 3_600_000 });
+		expect(await rawQueue(QUEUE).getJob(runJobId(childId, childJob.seq))).toBeDefined();
+		expect(await store().runs.suspend(parent.owner)).toEqual({ kind: "waiting_on_waitpoints" });
+		await f.sql(
+			`UPDATE ${f.t("waitpoints")} SET expires_at = now() - interval '1 second' WHERE id = $1`,
+			[waitpointId]
+		);
+
+		const canceled: string[][] = [];
+		const { logger } = makeLogger();
+		const report = await createReconciler({
+			store: store(),
+			transport,
+			logger,
+			graceMs: 1_000,
+			stallTimeoutMs: 60_000,
+			batchSize: 50,
+			onCanceled: runIds => {
+				canceled.push([...runIds]);
+			},
+		}).runOnce();
+
+		expect(report.expiredWaitpoints).toBe(1);
+		expect(report.errors).toBe(0);
+		expect((await store().runs.get(childId))?.status).toBe("canceled");
+		expect(await rawQueue(QUEUE).getJob(runJobId(childId, childJob.seq))).toBeUndefined();
+		expect(canceled).toEqual([[childId]]);
 	});
 
 	it("leaves a not-yet-due waitpoint alone", async () => {

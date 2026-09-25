@@ -3,7 +3,7 @@ import type { ResolvedConfig } from "../config.js";
 import { AbortTaskRunError, ExecutionLostError, TaskNotRegisteredError } from "../errors.js";
 import { waitpointExpireJobId } from "../queue/ids.js";
 import type { Transport } from "../queue/transport.js";
-import type { Registry } from "../registry.js";
+import { getTask, type Registry } from "../registry.js";
 import type {
 	EnqueueRequest,
 	ExecutionSnapshot,
@@ -18,11 +18,11 @@ import { formatError } from "../utils/error-format.js";
 import { assertSerializable, type Json, normalizeOutput } from "../utils/serialization.js";
 import { type AbortKind, type ActiveExecutions, ExecutionState } from "./execution.js";
 import { createRunLogger } from "./logger.js";
-import { createStepContext, SuspendSignal } from "./step-context.js";
+import { type ChildTaskSpec, createStepContext, SuspendSignal } from "./step-context.js";
 
 export interface ExecutorDeps {
 	store: Store;
-	transport: Pick<Transport, "enqueueRun" | "removeSystemJob">;
+	transport: Pick<Transport, "enqueueRun" | "removeSystemJob" | "enqueueSystem">;
 	registry: Registry;
 	config: ResolvedConfig;
 	/** Executions of this engine; `executeRun` registers each acquired run here while it runs. */
@@ -33,6 +33,12 @@ export interface ExecutorDeps {
 	 * the active executions, so nobody else would hand it back (decision 20).
 	 */
 	isShuttingDown?: () => boolean;
+}
+
+/** What the after-commit helpers need: enqueue a run, remove a `-system` job, log. */
+export interface EnqueueDeps {
+	transport: Pick<Transport, "enqueueRun" | "removeSystemJob">;
+	config: Pick<ResolvedConfig, "logger">;
 }
 
 /** The payload of a run job: jobId `${runId}-${seq}` (decision 7). */
@@ -145,6 +151,9 @@ async function runAcquired(deps: ExecutorDeps, state: ExecutionState): Promise<v
 
 	try {
 		let outcome = await execute(deps, task, state, logger);
+		if (outcome.kind === "success" && state.inFlight.size > 0) {
+			outcome = await settleBeforeComplete(deps, state, outcome);
+		}
 		if (outcome.kind === "suspended") outcome = await settleInFlight(state);
 		clearTimeout(timer);
 		heartbeat.stop();
@@ -187,7 +196,18 @@ async function execute(
 
 	const steps = createStepContext(
 		state,
-		{ steps: deps.store.steps, maxStepOutputBytes: limits.maxStepOutputBytes },
+		{
+			steps: deps.store.steps,
+			maxStepOutputBytes: limits.maxStepOutputBytes,
+			waits: {
+				runs: deps.store.runs,
+				waitpoints: deps.store.waitpoints,
+				maxPayloadBytes: limits.maxPayloadBytes,
+				resolveTask: child => childTaskSpec(getTask(deps.registry, child)),
+				enqueueRun: request => enqueue(deps, request),
+				scheduleExpire: (waitpointId, delayMs) => scheduleExpire(deps, waitpointId, delayMs),
+			},
+		},
 		snapshot
 	);
 	const { run } = state;
@@ -210,15 +230,50 @@ async function execute(
  * (see `settle`), since the execution still owns the run.
  */
 async function settleInFlight(state: ExecutionState): Promise<Outcome> {
+	return (await drainInFlight(state)) ?? { kind: "suspended" };
+}
+
+/**
+ * `Promise.allSettled` of the in-flight steps, repeated until none is left, racing an abort.
+ * Returns the abort outcome if the execution was aborted meanwhile, else `undefined`.
+ */
+async function drainInFlight(state: ExecutionState): Promise<Outcome | undefined> {
 	const aborted = new Promise<Outcome>(resolve => {
 		state.onAbort(reason => resolve({ kind: "aborted", reason }));
 	});
 	while (state.inFlight.size > 0) {
-		const settled = Promise.allSettled(Array.from(state.inFlight)).then(() => undefined);
+		const settled = Promise.allSettled(Array.from(state.inFlight.keys())).then(() => undefined);
 		const result = await Promise.race([settled, aborted]);
 		if (result !== undefined) return result;
 	}
-	return { kind: "suspended" };
+	return undefined;
+}
+
+/**
+ * The task function returned while steps it did not await were still in flight (e.g.
+ * `void ctx.step.trigger(...)`). Completing right away would make their guarded writes come back
+ * `lost` (a child silently never created) or leave a waitpoint of a finished run. So, with a
+ * warning, the executor first settles them exactly like before a suspension (decision 2): a
+ * trigger creates its child, a `step.run` is persisted. If settling suspends the execution (a
+ * `waitForToken`/`sleep`/`triggerAndWait` that was not awaited), the suspension wins, as it
+ * always does (decision 2): the run suspends instead of completing, and the replay returns the
+ * output once nothing is pending. An abort meanwhile ends the wait as in {@link settleInFlight}.
+ */
+async function settleBeforeComplete(
+	deps: ExecutorDeps,
+	state: ExecutionState,
+	outcome: Outcome
+): Promise<Outcome> {
+	const steps = Array.from(state.inFlight.values());
+	deps.config.logger.warn(
+		{ runId: state.runId, taskId: state.taskId, steps },
+		`task function returned with steps still in flight (${steps
+			.map(s => `step "${s}" was not awaited`)
+			.join("; ")}); settling them before completing the run. Await every ctx.step call`
+	);
+	const aborted = await drainInFlight(state);
+	if (aborted !== undefined) return aborted;
+	return state.suspended ? { kind: "suspended" } : outcome;
 }
 
 function invoke(
@@ -337,7 +392,7 @@ async function settle(
 			}
 			const result = await deps.store.runs.complete(state.owner, output);
 			if (result.kind === "lost") return onLost(deps, state);
-			return afterTerminal(deps, state, result.parent);
+			return afterResolution(deps, result.parent, result.expireJobsToRemove);
 		}
 	}
 }
@@ -393,7 +448,7 @@ async function failAttempt(
 		const result = await deps.store.runs.fail(state.owner, serialized);
 		if (result.kind === "lost") return onLost(deps, state);
 		log.warn({ ...fields, error: serialized }, "run failed");
-		return afterTerminal(deps, state, result.parent);
+		return afterResolution(deps, result.parent, result.expireJobsToRemove);
 	}
 
 	const backoff = task?.options.retry?.backoff ?? DEFAULT_RETRY.backoff;
@@ -412,16 +467,64 @@ function onLost(deps: ExecutorDeps, state: ExecutionState): void {
 	);
 }
 
-/** After `complete`/`fail`: resume the parent (if this resolved its waitpoint) and drop its expiry job. */
-async function afterTerminal(
-	deps: ExecutorDeps,
-	_state: ExecutionState,
-	parent: WaitpointResolution | null
+/**
+ * After `complete`/`fail` (and every other terminal transition: cancel, stall recovery, expiry):
+ * resume the parent if this resolved its waitpoint, drop that waitpoint's expire job and the
+ * expire jobs of the run's own waitpoints the transition timed out (decision 10, best-effort).
+ */
+export async function afterResolution(
+	deps: EnqueueDeps,
+	parent: WaitpointResolution | null,
+	expireJobsToRemove: readonly string[]
 ): Promise<void> {
-	if (!parent) return;
-	if (parent.resume) await enqueue(deps, parent.resume);
-	if (parent.hasExpireJob) {
+	if (parent?.resume) await enqueue(deps, parent.resume);
+	if (parent?.hasExpireJob) {
 		await deps.transport.removeSystemJob(waitpointExpireJobId(parent.waitpointId));
+	}
+	for (const waitpointId of expireJobsToRemove) {
+		await deps.transport.removeSystemJob(waitpointExpireJobId(waitpointId));
+	}
+}
+
+/** Queue of a task that declares none (see `registry.ts`). */
+const DEFAULT_QUEUE_NAME = "default";
+
+/** The queue a task's runs go to. */
+export function taskQueueName(task: AnyTask): string {
+	return task.options.queue?.name ?? DEFAULT_QUEUE_NAME;
+}
+
+/** What `triggerChildren` needs from a (registered) child task. */
+export function childTaskSpec(task: AnyTask): ChildTaskSpec {
+	return {
+		id: task.id,
+		queue: taskQueueName(task),
+		maxAttempts: task.options.retry?.maxAttempts ?? DEFAULT_RETRY.maxAttempts,
+	};
+}
+
+/**
+ * Schedules the `-system` job `waitpoint-expire` with the deterministic jobId
+ * `wp-${waitpointId}-expire` (decision 10), at the DB-computed delay. Re-adding it while it
+ * exists is a BullMQ no-op, so a replay can safely call this again. A failure is only logged:
+ * the reconciler's case 5 expires overdue waitpoints from Postgres.
+ */
+export async function scheduleExpire(
+	deps: { transport: Pick<Transport, "enqueueSystem">; config: Pick<ResolvedConfig, "logger"> },
+	waitpointId: string,
+	delayMs: number
+): Promise<void> {
+	try {
+		await deps.transport.enqueueSystem(
+			"waitpoint-expire",
+			{ waitpointId },
+			{ jobId: waitpointExpireJobId(waitpointId), delayMs }
+		);
+	} catch (error) {
+		deps.config.logger.warn(
+			{ waitpointId, err: error },
+			"failed to schedule the waitpoint expiry; the reconciler will expire it from Postgres"
+		);
 	}
 }
 
@@ -429,10 +532,7 @@ async function afterTerminal(
  * Enqueue after commit. A failure is only logged: Postgres already holds `run_after`, so the
  * reconciler re-enqueues the run (decision 1).
  */
-export async function enqueue(
-	deps: Pick<ExecutorDeps, "transport" | "config">,
-	request: EnqueueRequest
-): Promise<void> {
+export async function enqueue(deps: EnqueueDeps, request: EnqueueRequest): Promise<void> {
 	try {
 		await deps.transport.enqueueRun({
 			queue: request.queue,

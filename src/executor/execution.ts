@@ -34,10 +34,11 @@ export class ExecutionState {
 	 */
 	handedBack = false;
 	/**
-	 * Promises of the steps started in this execution and not yet settled; the executor awaits
-	 * `Promise.allSettled` of these before running the suspension transaction (decision 2).
+	 * Promises of the steps started in this execution and not yet settled, with their step names;
+	 * the executor awaits `Promise.allSettled` of these before running the suspension transaction
+	 * (decision 2) and before completing a run whose function returned without awaiting them.
 	 */
-	readonly inFlight = new Set<Promise<unknown>>();
+	readonly inFlight = new Map<Promise<unknown>, string>();
 	/**
 	 * Set once a `SuspendSignal` was thrown (suspension is authoritative, decision 2): every later
 	 * `step.*` call rethrows it and the task function's own outcome is ignored.
@@ -106,9 +107,9 @@ export class ExecutionState {
 		this.fatalError ??= error;
 	}
 
-	/** Registers an in-flight step promise until it settles. */
-	trackInFlight<T>(promise: Promise<T>): Promise<T> {
-		this.inFlight.add(promise);
+	/** Registers an in-flight step promise (of step `name`) until it settles. */
+	trackInFlight<T>(promise: Promise<T>, name: string): Promise<T> {
+		this.inFlight.set(promise, name);
 		const remove = () => {
 			this.inFlight.delete(promise);
 		};

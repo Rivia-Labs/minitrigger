@@ -24,8 +24,14 @@ the SQL shape it must use. `$schema` is always `escapeIdentifier(schema)`.
   Never throw for lost ownership.
 - Every exit from `running` sets `execution_id = NULL`. Every `runs` write except `heartbeat` sets
   `updated_at = now()`.
+- **Blocking waitpoint** (dec. 3, owner's decision: only awaited waitpoints block the resume): a
+  `pending` waitpoint of the run that is either `child_run`/`batch` (always created together with
+  their waiting step) or a `token` whose `${step_name}#wait` step (kind `wait`) exists, i.e. that
+  `waitForToken` already awaited. A token created and not (yet) awaited never keeps a sleeping run
+  from waking up. Single SQL source: `blockingWaitpointExistsSql` (`resolve.ts`), used by the
+  resume rule, `suspend` and the reconciler's `listStaleWaiting`/`repairOrphanWaiting`.
 - **Resume rule** (dec. 3), applied with the run locked `FOR UPDATE`: if `status='waiting'` and
-  `NOT EXISTS (pending waitpoint of run)` then `enqueue_seq = enqueue_seq + 1`, `run_after =
+  `NOT EXISTS (blocking waitpoint of run)` then `enqueue_seq = enqueue_seq + 1`, `run_after =
   greatest((SELECT max(wake_at) FROM steps WHERE run_id=$1 AND status='waiting' AND wake_at IS NOT
   NULL), now())`, status stays `waiting`, return `EnqueueRequest`. Otherwise return `null` (a
   `running` run is never enqueued; its suspension will see the resolved waitpoint).
@@ -43,6 +49,12 @@ the SQL shape it must use. `$schema` is always `escapeIdentifier(schema)`.
 - **Descendants on failure.** A run that fails permanently (`fail`, `recoverStalled` → failed) does
   NOT cancel its descendants, exactly like `complete`: children started with `step.trigger` may
   outlive their parent. Only `cancel` and waitpoint expiry (`expire`) cancel children.
+- **Own waitpoints on any terminal transition** (Phase 5). `complete`, `fail`, `recoverStalled` →
+  failed and `cancel` set every `pending` waitpoint OWNED by the finished run(s) to `timed_out`
+  (`resolved_at = now()`) in the same transaction, after the run update (waitpoint rows last), and
+  return the ids that had `expires_at` in `expireJobsToRemove` (caller removes `wp-${id}-expire`).
+  A later `completeToken` on them is `run_finished` (not `not_pending`/`timed_out`): the run
+  status is read under the same `FOR UPDATE` lock.
 - Callers enqueue/remove jobs only **after commit** (jobId `${runId}-${seq}`,
   `wp-${waitpointId}-expire`).
 
@@ -51,20 +63,20 @@ the SQL shape it must use. `$schema` is always `escapeIdentifier(schema)`.
 | Method | Decision | SQL shape |
 |---|---|---|
 | `create` | 9, 1 | `INSERT runs (status 'queued', attempt 1, enqueue_seq 1, run_after = now()+delay)`; if `idempotency`, `idempotency.claim` in the same tx. Not claimed → ROLLBACK (or to savepoint) and `get(existingRunId)` → `existing`. If that run is gone, retry once. |
-| `triggerChildren` | 10, 11 | One tx: guard parent `FOR SHARE`; `INSERT waitpoints` (`child_run`: pending_count NULL; `batch`: pending_count = n; `expires_at = now()+timeout`); per child `INSERT runs` (`queued`, `run_after=now()`, parent_run_id, parent_waitpoint_id (NULL for `trigger`), parent_step_name, batch_index) + claim key with `ttlMs null`; `INSERT steps` (`trigger`: completed `{id}`, kind `trigger`; else waiting `{waitpointId}`, kind `trigger_wait`/`batch_wait`). Claim or step conflict → throw (rollback). Return enqueue per child + `expireDelayMs`. |
+| `triggerChildren` | 10, 11 | One tx: guard parent `FOR SHARE`; `INSERT waitpoints` (`child_run`: pending_count NULL; `batch`: pending_count = n; `expires_at = now()+timeout`); per child `INSERT runs ... RETURNING` (`queued`, `run_after=now()+delayMs` (default 0; `step.trigger({ delay })`), enqueue `delayMs` computed by the DB, parent_run_id, parent_waitpoint_id (NULL for `trigger`), parent_step_name, batch_index) + claim key with `ttlMs null`; `INSERT steps` (`trigger`: completed `{id}`, kind `trigger`; else waiting `{waitpointId}`, kind `trigger_wait`/`batch_wait`). Claim or step conflict → throw (rollback). Return enqueue per child + `expireDelayMs`. |
 | `acquire` | 5 | Exactly the decision-5 UPDATE ... RETURNING *. |
 | `heartbeat` | 6 | Own tx: `BEGIN; SET LOCAL statement_timeout = <int ms>; UPDATE runs SET heartbeat_at=now() WHERE id AND execution_id AND status='running'; COMMIT`. Never `SET` without `LOCAL`; do not touch `updated_at`. Not on `StoreTx`. |
-| `complete` / `fail` | 5, 10 | Lock parent (if `parent_waitpoint_id`), then guarded `UPDATE runs SET status, output/error, finished_at=now(), run_after=NULL, execution_id=NULL`; then child resolution. |
+| `complete` / `fail` | 5, 10 | Lock parent (if `parent_waitpoint_id`), then guarded `UPDATE runs SET status, output/error, finished_at=now(), run_after=NULL, execution_id=NULL`; then own pending waitpoints → `timed_out` (`expireJobsToRemove`); then child resolution. |
 | `retry` | 4, 17 | Guarded `UPDATE ... status='queued', attempt=attempt+1, error, execution_id=NULL, run_after=now()+backoff, enqueue_seq=enqueue_seq+1 RETURNING` → enqueue. |
 | `release` | 20 | Guarded `UPDATE ... status='queued', execution_id=NULL, run_after=now(), enqueue_seq+1`; attempt unchanged. |
-| `suspend` | 3, 2 | `SELECT ... FROM runs WHERE id AND execution_id AND status='running' FOR UPDATE` (none → lost); then, in this tx: pending waitpoint → `waiting, run_after NULL, seq+1` (no enqueue; the bump makes a stale redelivery of `${id}-${oldSeq}` a no-op in `acquire`); else `max(wake_at) > now()` over waiting sleeps → `waiting, seq+1, run_after=max`; else `queued, seq+1, run_after=now()`. Always `execution_id NULL`. |
+| `suspend` | 3, 2 | `SELECT ... FROM runs WHERE id AND execution_id AND status='running' FOR UPDATE` (none → lost); then, in this tx: blocking waitpoint → `waiting, run_after NULL, seq+1` (no enqueue; the bump makes a stale redelivery of `${id}-${oldSeq}` a no-op in `acquire`); else `max(wake_at) > now()` over waiting sleeps → `waiting, seq+1, run_after=max`; else `queued, seq+1, run_after=now()`. Always `execution_id NULL`. |
 | `cancel` | 5, 10, Ph6 | Lock root's parent, root, then iteratively `SELECT id FROM runs WHERE parent_run_id = ANY($ids) ORDER BY id FOR UPDATE` (walk through terminal nodes too); non-terminal → `canceled, execution_id NULL, run_after NULL, finished_at now(), error {name:'Canceled', message, retryable:false}`. Then (waitpoint rows last) `UPDATE waitpoints SET status='timed_out', resolved_at=now() WHERE run_id = ANY(canceled ids) AND status='pending' RETURNING id, expires_at IS NOT NULL` → `expireJobsToRemove` (ids with `expires_at`; caller removes `wp-${id}-expire`). Child resolution for the root only. Return root first. |
 | `get`, `list` | Ph2/7 | `list`: `ORDER BY created_at DESC, id DESC`, cursor `(created_at, id) < ($c, $id)`, limit clamped to 100, optional task_id/status (`= ANY`)/created range. |
 | `listChildResults` | 10 | `SELECT id, batch_index, status, output, error FROM runs WHERE parent_waitpoint_id=$1 ORDER BY batch_index`. |
 | `listStaleQueued` | Ph6 #1 | `status='queued' AND run_after < now() - grace` → current seq, delay 0. Read-only. |
-| `listStaleWaiting` | 3, Ph6 #2 | `status='waiting' AND run_after < now() - grace AND NOT EXISTS pending wp` → same seq, delay 0. |
-| `repairOrphanWaiting` | Ph6 #3 | tx: candidates `status='waiting' AND run_after IS NULL AND NOT EXISTS pending wp ... FOR UPDATE SKIP LOCKED LIMIT n`, re-check, resume rule. |
-| `listStalled` / `recoverStalled` | 6, 4 | List ids `status='running' AND heartbeat_at < now() - stall` (partial index). Per run tx: lock parent, lock run, re-check; `attempt < max_attempts` → `queued, attempt+1, error, run_after now(), seq+1`; else `failed` + finished_at + child resolution. |
+| `listStaleWaiting` | 3, Ph6 #2 | `status='waiting' AND run_after < now() - grace AND NOT EXISTS blocking wp` → same seq, delay 0. |
+| `repairOrphanWaiting` | Ph6 #3 | tx: candidates `status='waiting' AND run_after IS NULL AND NOT EXISTS blocking wp ... FOR UPDATE SKIP LOCKED LIMIT n`, re-check, resume rule. |
+| `listStalled` / `recoverStalled` | 6, 4 | List ids `status='running' AND heartbeat_at < now() - stall` (partial index). Per run tx: lock parent, lock run, re-check; `attempt < max_attempts` → `queued, attempt+1, error, run_after now(), seq+1`; else `failed` + finished_at + own pending waitpoints `timed_out` (`expireJobsToRemove`) + child resolution. |
 | `deleteFinishedBatch` | Ph6, 10 | `DELETE FROM runs WHERE id IN (SELECT r.id FROM runs r LEFT JOIN runs p ON p.id = r.parent_run_id WHERE r.status IN terminal AND r.finished_at < now() - $age AND (p.id IS NULL OR p.status IN terminal) LIMIT n FOR UPDATE OF r SKIP LOCKED)`. |
 
 `engine.runs.replay(id)` = `get` + `create` (new id, same task/payload, current queue and
@@ -94,9 +106,9 @@ snapshot by `step_name`: the step name for child/batch, the name without `#wait`
 
 | Method | Decision | SQL shape |
 |---|---|---|
-| `createToken` | 10, 11 | One tx: guard; `INSERT waitpoints (kind 'token', status 'pending', expires_at)`; `INSERT steps (name, kind 'token', completed, {id})`. |
-| `completeToken` | 3, 12 | Read run_id; `SELECT ... FROM runs WHERE id FOR UPDATE`; `UPDATE waitpoints SET status='completed', output WHERE id AND kind='token' AND status='pending'`; resume rule. A token of a canceled run is already `timed_out` → `not_pending`. |
-| `expire` | 10, Ph6 #5 | Lock run FOR UPDATE; read the waitpoint (`status='pending' AND expires_at IS NOT NULL`, else noop); `expires_at > now()` → `not_due` with DB-computed `delayMs` (handler re-delays the job); else for child/batch cancel non-terminal children recursively (cancel's walk; their parent-waitpoint resolution is a no-op), time out the canceled children's own pending waitpoints (→ `expireJobsToRemove`, as `cancel`), `UPDATE waitpoints SET status='timed_out', resolved_at=now()`; resume rule. |
+| `createToken` | 10, 11 | One tx: guard; `INSERT waitpoints (kind 'token', status 'pending', expires_at) ON CONFLICT (run_id, step_name) DO NOTHING RETURNING` (conflict → return the existing token's id, `expireDelayMs` only while `pending`; a non-token waitpoint there throws); `INSERT steps (name, kind 'token', completed, {id}) ON CONFLICT (run_id, name) DO NOTHING`. |
+| `completeToken` | 3, 12 | Read run_id; `SELECT ... FROM runs WHERE id FOR UPDATE`; `UPDATE waitpoints SET status='completed', output WHERE id AND kind='token' AND status='pending'`; resume rule. Not updated: `timed_out` token of a terminal run (completed/failed/canceled; status read by the `FOR UPDATE`) → `run_finished`; otherwise `not_pending` with the token status. |
+| `expire` | 10, Ph6 #5 | Lock run FOR UPDATE; read the waitpoint (`status='pending' AND expires_at IS NOT NULL`, else noop); `expires_at > now()` → `not_due` with DB-computed `delayMs` (handler re-delays the job); else for child/batch cancel non-terminal children recursively (cancel's walk, `error.message = WAITPOINT_TIMEOUT_REASON` so the executor maps exactly those to `Timeout`; their parent-waitpoint resolution is a no-op; the caller removes their run jobs and aborts/publishes them), time out the canceled children's own pending waitpoints (→ `expireJobsToRemove`, as `cancel`), `UPDATE waitpoints SET status='timed_out', resolved_at=now()`; resume rule. |
 | `listExpired` | Ph6 #5 | `status='pending' AND expires_at <= now()` (partial index). |
 | `getToken` | 10 | `SELECT status, output, run_id FROM waitpoints WHERE id=$1`. |
 

@@ -10,6 +10,7 @@ import { ExecutionState } from "../../src/executor/execution.js";
 import {
 	createStepContext,
 	DEFERRED_OUTPUT_BATCH_SIZE,
+	type StepWaitDeps,
 	SuspendSignal,
 } from "../../src/executor/step-context.js";
 import type {
@@ -95,6 +96,18 @@ function fakeStore(saved: LoadedStep[] = [], outputs = new Map<number, Json>()):
 	return store;
 }
 
+const notUsed = () => Promise.reject(new Error("not used"));
+const unusedWaits: StepWaitDeps = {
+	runs: { triggerChildren: notUsed, listChildResults: notUsed },
+	waitpoints: { createToken: notUsed, getToken: notUsed },
+	maxPayloadBytes: 1024,
+	resolveTask: () => {
+		throw new Error("not used");
+	},
+	enqueueRun: notUsed,
+	scheduleExpire: notUsed,
+};
+
 function setup(saved: LoadedStep[] = [], opts: { deferred?: Map<number, Json>; now?: Date } = {}) {
 	const state = new ExecutionState(runRecord(), "exec-1");
 	const store = fakeStore(saved, opts.deferred);
@@ -104,7 +117,11 @@ function setup(saved: LoadedStep[] = [], opts: { deferred?: Map<number, Json>; n
 		outputsDeferred: opts.deferred !== undefined,
 		waitpoints: [],
 	};
-	const ctx = createStepContext(state, { steps: store, maxStepOutputBytes: 1024 }, snapshot);
+	const ctx = createStepContext(
+		state,
+		{ steps: store, maxStepOutputBytes: 1024, waits: unusedWaits },
+		snapshot
+	);
 	return { state, store, ctx, step: ctx.api };
 }
 

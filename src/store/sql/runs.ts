@@ -21,6 +21,7 @@ import { atomic, type Db, direct, type SqlContext, type SqlExecutor } from "./db
 import { claimKey } from "./idempotency.js";
 import {
 	applyResumeRule,
+	blockingWaitpointExistsSql,
 	cancelDescendants,
 	DELAY_MS_SQL,
 	ENQUEUE_RETURNING,
@@ -124,7 +125,10 @@ export function createRunStore(exec: SqlExecutor, ctx: SqlContext): RunStore {
 		status: "completed" | "failed",
 		output: Json | null,
 		error: SerializedError | null
-	): Promise<{ lost: true } | { lost: false; parent: WaitpointResolution | null }> {
+	): Promise<
+		| { lost: true }
+		| { lost: false; parent: WaitpointResolution | null; expireJobsToRemove: string[] }
+	> {
 		return atomic(exec, async db => {
 			const parent = await lockParentOf(db, ctx, owner.runId);
 			if (!parent) return { lost: true };
@@ -144,8 +148,15 @@ export function createRunStore(exec: SqlExecutor, ctx: SqlContext): RunStore {
 			);
 			const row = rows[0];
 			if (!row) return { lost: true };
+			// Waitpoint rows last (lock order): the run's own pending waitpoints can never resolve
+			// anything any more (mirror of cancel), then the parent's waitpoint.
+			const expireJobsToRemove = await timeOutWaitpointsOf(db, ctx, [owner.runId]);
 			const wp = row.parent_waitpoint_id;
-			return { lost: false, parent: wp ? await resolveChildWaitpoint(db, ctx, wp) : null };
+			return {
+				lost: false,
+				parent: wp ? await resolveChildWaitpoint(db, ctx, wp) : null,
+				expireJobsToRemove,
+			};
 		});
 	}
 
@@ -202,14 +213,15 @@ export function createRunStore(exec: SqlExecutor, ctx: SqlContext): RunStore {
 				}
 				const parentWp = waitpoint ? waitpoint.id : null;
 
-				await db.query(
+				const { rows: inserted } = await db.query<EnqueueRow>(
 					`INSERT INTO ${runs} (id, task_id, queue, payload, status, attempt, max_attempts,
 					   enqueue_seq, run_after, parent_run_id, parent_waitpoint_id, parent_step_name,
 					   batch_index, created_at, updated_at)
-					 SELECT c.id, c.task_id, c.queue, c.payload, 'queued', 1, c.max_attempts, 1, now(),
-					   $6::uuid, $7::uuid, $8, c.batch_index, ${CREATED_AT_SQL}, now()
+					 SELECT c.id, c.task_id, c.queue, c.payload, 'queued', 1, c.max_attempts, 1,
+					   ${nowPlusMs("$10")}, $6::uuid, $7::uuid, $8, c.batch_index, ${CREATED_AT_SQL}, now()
 					 FROM unnest($1::uuid[], $2::text[], $3::text[], $4::jsonb[], $5::int[], $9::int[])
-					   AS c(id, task_id, queue, payload, max_attempts, batch_index)`,
+					   AS c(id, task_id, queue, payload, max_attempts, batch_index)
+					 RETURNING ${ENQUEUE_RETURNING}`,
 					[
 						input.children.map(c => c.id),
 						input.children.map(c => c.taskId),
@@ -220,8 +232,10 @@ export function createRunStore(exec: SqlExecutor, ctx: SqlContext): RunStore {
 						parentWp,
 						input.stepName,
 						input.children.map(c => c.batchIndex),
+						input.delayMs ?? 0,
 					]
 				);
+				const enqueueById = new Map(inserted.map(r => [r.id, mapEnqueue(r)]));
 				// Internal keys never expire; any conflict is an invariant violation -> throws.
 				await db.query(
 					`INSERT INTO ${ctx.t("idempotency_keys")} (task_id, key, run_id, expires_at)
@@ -248,13 +262,11 @@ export function createRunStore(exec: SqlExecutor, ctx: SqlContext): RunStore {
 						STEP_KIND_BY_MODE[input.mode],
 					]
 				);
-				const enqueue: EnqueueRequest[] = input.children.map(c => ({
-					runId: c.id,
-					taskId: c.taskId,
-					queue: c.queue,
-					seq: 1,
-					delayMs: 0,
-				}));
+				const enqueue: EnqueueRequest[] = input.children.map(c => {
+					const request = enqueueById.get(c.id);
+					if (!request) throw new Error(`triggerChildren: child ${c.id} was not inserted`);
+					return request;
+				});
 				return { kind: "created", enqueue, waitpoint };
 			});
 		},
@@ -291,12 +303,16 @@ export function createRunStore(exec: SqlExecutor, ctx: SqlContext): RunStore {
 
 		async complete(owner, output) {
 			const r = await finish(owner, "completed", output, null);
-			return r.lost ? { kind: "lost" } : { kind: "completed", parent: r.parent };
+			return r.lost
+				? { kind: "lost" }
+				: { kind: "completed", parent: r.parent, expireJobsToRemove: r.expireJobsToRemove };
 		},
 
 		async fail(owner, error) {
 			const r = await finish(owner, "failed", null, error);
-			return r.lost ? { kind: "lost" } : { kind: "failed", parent: r.parent };
+			return r.lost
+				? { kind: "lost" }
+				: { kind: "failed", parent: r.parent, expireJobsToRemove: r.expireJobsToRemove };
 		},
 
 		async retry(owner, error, backoffMs) {
@@ -335,8 +351,7 @@ export function createRunStore(exec: SqlExecutor, ctx: SqlContext): RunStore {
 				if (locked.rowCount === 0) return { kind: "lost" };
 				const { rows: state } = await db.query<{ has_pending: boolean; sleeping: boolean }>(
 					`SELECT
-					   EXISTS (SELECT 1 FROM ${ctx.t("waitpoints")}
-					           WHERE run_id = $1 AND status = 'pending') AS has_pending,
+					   ${blockingWaitpointExistsSql(ctx, "$1")} AS has_pending,
 					   coalesce((SELECT max(wake_at) FROM ${ctx.t("steps")}
 					             WHERE run_id = $1 AND status = 'waiting' AND wake_at IS NOT NULL)
 					            > now(), false) AS sleeping`,
@@ -493,8 +508,7 @@ export function createRunStore(exec: SqlExecutor, ctx: SqlContext): RunStore {
 				`SELECT r.id, r.task_id, r.queue, r.enqueue_seq, 0::float8 AS delay_ms FROM ${runs} r
 				 WHERE r.status = 'waiting'
 				   AND r.run_after < now() - $1::float8 * interval '1 millisecond'
-				   AND NOT EXISTS (SELECT 1 FROM ${ctx.t("waitpoints")} w
-				                   WHERE w.run_id = r.id AND w.status = 'pending')
+				   AND NOT ${blockingWaitpointExistsSql(ctx, "r.id")}
 				 ORDER BY r.run_after LIMIT $2`,
 				[graceMs, limit]
 			);
@@ -506,8 +520,7 @@ export function createRunStore(exec: SqlExecutor, ctx: SqlContext): RunStore {
 				const { rows } = await db.query<{ id: string }>(
 					`SELECT r.id FROM ${runs} r
 					 WHERE r.status = 'waiting' AND r.run_after IS NULL
-					   AND NOT EXISTS (SELECT 1 FROM ${ctx.t("waitpoints")} w
-					                   WHERE w.run_id = r.id AND w.status = 'pending')
+					   AND NOT ${blockingWaitpointExistsSql(ctx, "r.id")}
 					 ORDER BY r.id LIMIT $1
 					 FOR UPDATE OF r SKIP LOCKED`,
 					[limit]
@@ -570,8 +583,13 @@ export function createRunStore(exec: SqlExecutor, ctx: SqlContext): RunStore {
 					 WHERE id = $1`,
 					[runId, jsonParam(error)]
 				);
+				const expireJobsToRemove = await timeOutWaitpointsOf(db, ctx, [runId]);
 				const wp = run.parent_waitpoint_id;
-				return { kind: "failed", parent: wp ? await resolveChildWaitpoint(db, ctx, wp) : null };
+				return {
+					kind: "failed",
+					parent: wp ? await resolveChildWaitpoint(db, ctx, wp) : null,
+					expireJobsToRemove,
+				};
 			});
 		},
 

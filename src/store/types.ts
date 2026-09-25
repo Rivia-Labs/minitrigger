@@ -77,6 +77,13 @@ export const DEFAULT_MAX_INLINE_STEP_OUTPUT_BYTES = 16 * 1024 * 1024;
 /** `runs.error.name` written by cancellation (decision 10). */
 export const CANCELED_ERROR_NAME = "Canceled";
 
+/**
+ * `error.message` of the children canceled because their parent's `child_run`/`batch` waitpoint
+ * timed out (`waitpoints.expire`). The executor maps exactly these to a `Timeout` result; a child
+ * that failed or was canceled on its own before the timeout keeps its real outcome.
+ */
+export const WAITPOINT_TIMEOUT_REASON = "Parent waitpoint timed out";
+
 // ---------------------------------------------------------------------------
 // Row types
 // ---------------------------------------------------------------------------
@@ -250,6 +257,8 @@ export interface TriggerChildrenInput {
 	waitpointId: string;
 	/** `expires_at = now() + timeoutMs`; null = no timeout. Ignored for `trigger`. */
 	timeoutMs: number | null;
+	/** Children's `run_after = now() + delayMs` (`step.trigger({ delay })`); default 0. */
+	delayMs?: number;
 	children: readonly NewChildRun[];
 }
 
@@ -269,8 +278,17 @@ export type SuspendResult =
 	| { kind: "requeued"; enqueue: EnqueueRequest }
 	| Lost;
 
-export type CompleteRunResult = { kind: "completed"; parent: WaitpointResolution | null } | Lost;
-export type FailRunResult = { kind: "failed"; parent: WaitpointResolution | null } | Lost;
+/**
+ * `expireJobsToRemove`: the finished run's own waitpoints that were still `pending` with
+ * `expires_at` and are now `timed_out` (as {@link CancelRunResult}); the caller removes
+ * `wp-${id}-expire` best-effort after commit.
+ */
+export type CompleteRunResult =
+	| { kind: "completed"; parent: WaitpointResolution | null; expireJobsToRemove: string[] }
+	| Lost;
+export type FailRunResult =
+	| { kind: "failed"; parent: WaitpointResolution | null; expireJobsToRemove: string[] }
+	| Lost;
 export type RetryRunResult = { kind: "retrying"; attempt: number; enqueue: EnqueueRequest } | Lost;
 export type ReleaseRunResult = { kind: "released"; enqueue: EnqueueRequest } | Lost;
 
@@ -293,7 +311,7 @@ export type CancelRunResult =
 export type RecoverStalledResult =
 	| { kind: "not_stalled" }
 	| { kind: "requeued"; attempt: number; enqueue: EnqueueRequest }
-	| { kind: "failed"; parent: WaitpointResolution | null };
+	| { kind: "failed"; parent: WaitpointResolution | null; expireJobsToRemove: string[] };
 
 export interface ChildResult {
 	runId: string;
@@ -369,14 +387,16 @@ export interface RunStore {
 	 * Final success. Guarded update to `completed`, `output`, `finished_at = now()`,
 	 * `run_after = NULL`, `execution_id = NULL`. If the run has `parent_waitpoint_id`,
 	 * resolves it in the same transaction (see "Child resolution" in the doc) —
-	 * lock parent first.
+	 * lock parent first. The run's own `pending` waitpoints become `timed_out` in the same
+	 * transaction (nothing can resume a finished run); see {@link CompleteRunResult}.
 	 */
 	complete(owner: Ownership, output: Json): Promise<CompleteRunResult>;
 
 	/**
 	 * Definitive failure (attempts exhausted, AbortTaskRunError, non-retryable). As {@link complete}.
 	 * Like completion, it does NOT cancel descendants: children started with `step.trigger` may
-	 * outlive their parent (only {@link cancel} and waitpoint expiry cancel children).
+	 * outlive their parent (only {@link cancel} and waitpoint expiry cancel children). Its own
+	 * `pending` waitpoints become `timed_out` (as `complete`/`cancel`).
 	 */
 	fail(owner: Ownership, error: SerializedError): Promise<FailRunResult>;
 
@@ -450,7 +470,8 @@ export interface RunStore {
 	 * Case 4, step 2, one run per transaction: lock parent (if any) then the run,
 	 * re-check stalled. `attempt < max_attempts` => `queued`, `attempt + 1`, `error`,
 	 * `run_after = now()`, `enqueue_seq + 1`; else final `failed` + child resolution.
-	 * Always `execution_id = NULL`. A final failure does NOT cancel descendants (as {@link fail}).
+	 * Always `execution_id = NULL`. A final failure does NOT cancel descendants (as {@link fail})
+	 * but times out the run's own pending waitpoints (`expireJobsToRemove`).
 	 */
 	recoverStalled(
 		runId: string,
@@ -577,6 +598,11 @@ export type CreateTokenResult =
 export type CompleteTokenResult =
 	| { kind: "not_found" }
 	| { kind: "not_pending"; status: WaitpointStatus }
+	/**
+	 * The token is not pending because its run already reached a terminal status (which times out
+	 * the run's own pending tokens). Checked under the run's `FOR UPDATE` lock.
+	 */
+	| { kind: "run_finished" }
 	| { kind: "completed"; resolution: WaitpointResolution };
 
 export type ExpireWaitpointResult =
@@ -597,7 +623,10 @@ export interface WaitpointStore {
 	 * `createToken(name)` in one transaction: ownership guard; insert waitpoint
 	 * `token`, `pending`, `expires_at = now() + timeoutMs` (null = none); insert step
 	 * `name` `completed` with output `{ id }` (decision 11). Caller schedules
-	 * `wp-${id}-expire` with `expireDelayMs` after commit.
+	 * `wp-${id}-expire` with `expireDelayMs` after commit. Idempotent by `(run_id, step_name)`:
+	 * an existing token waitpoint of that step is returned (its id; `expireDelayMs` only while
+	 * still `pending`), both inserts use `ON CONFLICT DO NOTHING`; a non-token waitpoint under the
+	 * name throws.
 	 */
 	createToken(
 		owner: Ownership,
@@ -608,7 +637,8 @@ export interface WaitpointStore {
 	 * `engine.tokens.complete` (decision 3). Read `run_id` unlocked, lock that run
 	 * FOR UPDATE, then `UPDATE waitpoints SET status='completed', output WHERE id AND
 	 * kind='token' AND status='pending'`, then the resume rule (no enqueue if the
-	 * run is `running` or has other pending waitpoints).
+	 * run is `running` or has other blocking waitpoints). Not pending: `run_finished` when the
+	 * token is `timed_out` and its run (read under the same lock) is terminal, else `not_pending`.
 	 */
 	completeToken(waitpointId: string, output: Json): Promise<CompleteTokenResult>;
 

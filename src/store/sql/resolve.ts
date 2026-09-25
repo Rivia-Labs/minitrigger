@@ -153,7 +153,25 @@ export async function lockParentOf(
 // ---------------------------------------------------------------------------
 
 /**
- * With the run already locked `FOR UPDATE`: if it is `waiting` and has no pending waitpoint,
+ * SQL predicate: the run `runIdExpr` has a `pending` waitpoint that BLOCKS its resume. Owner's
+ * interpretation of decision 3: only waitpoints the execution is actually awaiting block. A
+ * `token` counts only once its `${step_name}#wait` step (kind `wait`) exists, i.e. after
+ * `waitForToken` ran for it; a token created and not (yet) awaited never keeps a sleeping run
+ * from waking up. `child_run`/`batch` waitpoints always count (created with their waiting step).
+ * Used by `runs.suspend`, {@link applyResumeRule} and the reconciler's cases 2 and 3.
+ */
+export function blockingWaitpointExistsSql(ctx: SqlContext, runIdExpr: string): string {
+	return `EXISTS (SELECT 1 FROM ${ctx.t("waitpoints")} w
+	         WHERE w.run_id = ${runIdExpr} AND w.status = 'pending'
+	           AND (w.kind <> 'token' OR EXISTS (
+	             SELECT 1 FROM ${ctx.t("steps")} ws
+	             WHERE ws.run_id = w.run_id AND ws.name = w.step_name || '#wait'
+	               AND ws.kind = 'wait')))`;
+}
+
+/**
+ * With the run already locked `FOR UPDATE`: if it is `waiting` and has no blocking pending
+ * waitpoint ({@link blockingWaitpointExistsSql}),
  * bump `enqueue_seq`, set `run_after = greatest(max(wake_at of waiting sleeps), now())` and return
  * the enqueue request. Otherwise null (a `running` run is never enqueued here).
  */
@@ -171,8 +189,7 @@ export async function applyResumeRule(
 		       now()),
 		     updated_at = now()
 		 WHERE r.id = $1 AND r.status = 'waiting'
-		   AND NOT EXISTS (SELECT 1 FROM ${ctx.t("waitpoints")} w
-		                    WHERE w.run_id = r.id AND w.status = 'pending')
+		   AND NOT ${blockingWaitpointExistsSql(ctx, "r.id")}
 		 RETURNING ${ENQUEUE_RETURNING}`,
 		[runId]
 	);

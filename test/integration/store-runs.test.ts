@@ -111,6 +111,7 @@ describe("RunStore: terminal transitions and ownership", () => {
 		expect(await f.runs.complete(owner, [1, "two", { three: 3 }])).toEqual({
 			kind: "completed",
 			parent: null,
+			expireJobsToRemove: [],
 		});
 		const run = await f.runs.get(owner.runId);
 		expect(run).toMatchObject({
@@ -124,7 +125,11 @@ describe("RunStore: terminal transitions and ownership", () => {
 
 	it("fail stores the error; a second write from the same execution is lost", async () => {
 		const { owner } = await f.running();
-		expect(await f.runs.fail(owner, ERR)).toEqual({ kind: "failed", parent: null });
+		expect(await f.runs.fail(owner, ERR)).toEqual({
+			kind: "failed",
+			parent: null,
+			expireJobsToRemove: [],
+		});
 		expect((await f.runs.get(owner.runId))?.error).toEqual(ERR);
 		expect(await f.runs.complete(owner, 1)).toEqual({ kind: "lost" });
 	});
@@ -234,6 +239,38 @@ describe("RunStore: triggerChildren", () => {
 		expect(
 			(await f.idempotency.find("child-task", `__child:${owner.runId}:sub`))?.expiresAt
 		).toBeNull();
+	});
+
+	it("delayMs: children get run_after = now() + delay and a DB-computed enqueue delay", async () => {
+		const { owner } = await f.running();
+		const id = randomUUID();
+		const res = await f.runs.triggerChildren({
+			parent: owner,
+			stepName: "later",
+			seqIndex: 0,
+			mode: "trigger",
+			waitpointId: randomUUID(),
+			timeoutMs: null,
+			delayMs: 60_000,
+			children: [
+				{
+					id,
+					taskId: "child-task",
+					queue: "default",
+					payload: null,
+					maxAttempts: 1,
+					idempotencyKey: `__child:${owner.runId}:later`,
+					batchIndex: null,
+				},
+			],
+		});
+		if (res.kind !== "created") throw new Error("lost");
+		expect(res.enqueue[0]?.delayMs).toBeGreaterThan(59_000);
+		expect(res.enqueue[0]?.delayMs).toBeLessThanOrEqual(60_000);
+		const child = await f.runs.get(id);
+		expect((child?.runAfter?.getTime() ?? 0) - (child?.createdAt.getTime() ?? 0)).toBeGreaterThan(
+			59_000
+		);
 	});
 
 	it("batch mode: waitpoint with pending_count, children with batch_index, timeout", async () => {
@@ -350,13 +387,12 @@ describe("RunStore: recursive cancel", () => {
 			expect(byId.get(id)?.resolved_at).toBeInstanceOf(Date);
 		}
 		expect(byId.get(doneTok.waitpointId)?.status).toBe("completed");
+		// Canceled (terminal) runs: their tokens report run_finished.
 		expect(await f.waitpoints.completeToken(childTok.waitpointId, "late")).toEqual({
-			kind: "not_pending",
-			status: "timed_out",
+			kind: "run_finished",
 		});
 		expect(await f.waitpoints.completeToken(rootTok.waitpointId, "late")).toEqual({
-			kind: "not_pending",
-			status: "timed_out",
+			kind: "run_finished",
 		});
 	});
 });
@@ -413,6 +449,17 @@ describe("RunStore: list", () => {
 	});
 });
 
+/** A token plus its `tok#wait` step: only awaited tokens block a resume (decision 3, owner). */
+async function awaitedToken(owner: Ownership): Promise<void> {
+	const waitpointId = randomUUID();
+	await f.waitpoints.createToken(owner, { waitpointId, name: "tok", seqIndex: 0, timeoutMs: null });
+	await f.sql(
+		`INSERT INTO ${f.t("steps")} (run_id, name, seq_index, kind, status, output)
+		 VALUES ($1, 'tok#wait', 1, 'wait', 'waiting', $2::jsonb)`,
+		[owner.runId, JSON.stringify({ waitpointId })]
+	);
+}
+
 describe("RunStore: reconciler queries", () => {
 	it("listStaleQueued returns stale queued runs with the current seq", async () => {
 		const stale = await f.runs.create(f.newRun());
@@ -428,15 +475,10 @@ describe("RunStore: reconciler queries", () => {
 		expect(res.map(r => r.runId)).not.toContain(fresh.run.id);
 	});
 
-	it("listStaleWaiting ignores runs with a pending waitpoint", async () => {
+	it("listStaleWaiting ignores runs with a pending (awaited) waitpoint", async () => {
 		const a = await f.running();
 		const b = await f.running();
-		await f.waitpoints.createToken(b.owner, {
-			waitpointId: randomUUID(),
-			name: "tok",
-			seqIndex: 0,
-			timeoutMs: null,
-		});
+		await awaitedToken(b.owner);
 		await f.sql(
 			`UPDATE ${f.t("runs")} SET status = 'waiting', execution_id = NULL,
 			   run_after = now() - interval '1 minute' WHERE id = ANY($1::uuid[])`,
@@ -450,12 +492,7 @@ describe("RunStore: reconciler queries", () => {
 	it("repairOrphanWaiting resumes waiting runs with run_after NULL and nothing pending", async () => {
 		const orphan = await f.running();
 		const blocked = await f.running();
-		await f.waitpoints.createToken(blocked.owner, {
-			waitpointId: randomUUID(),
-			name: "tok",
-			seqIndex: 0,
-			timeoutMs: null,
-		});
+		await awaitedToken(blocked.owner);
 		await f.sql(
 			`UPDATE ${f.t("runs")} SET status = 'waiting', execution_id = NULL, run_after = NULL
 			 WHERE id = ANY($1::uuid[])`,
@@ -483,7 +520,7 @@ describe("RunStore: reconciler queries", () => {
 		const r1 = await f.runs.recoverStalled(retryable.owner.runId, 60_000, ERR);
 		expect(r1).toMatchObject({ kind: "requeued", attempt: 2, enqueue: { seq: 2, delayMs: 0 } });
 		const r2 = await f.runs.recoverStalled(exhausted.owner.runId, 60_000, ERR);
-		expect(r2).toEqual({ kind: "failed", parent: null });
+		expect(r2).toEqual({ kind: "failed", parent: null, expireJobsToRemove: [] });
 		expect(await f.runs.get(exhausted.owner.runId)).toMatchObject({
 			status: "failed",
 			executionId: null,

@@ -18,14 +18,18 @@ import {
 import { ConfigError, MinitriggerError } from "./errors.js";
 import {
 	ActiveExecutions,
+	afterResolution,
+	cancelLocally,
+	childTaskSpec,
 	createSystemDispatcher,
 	type ExecutorDeps,
 	enqueue,
 	executeRun,
+	taskQueueName,
 } from "./executor/index.js";
 import { type MigrateResult, migrate } from "./migrations/migrate.js";
 import { createRedisConnections } from "./queue/connections.js";
-import { systemQueueName, waitpointExpireJobId } from "./queue/ids.js";
+import { systemQueueName } from "./queue/ids.js";
 import { createTransport, type Transport } from "./queue/transport.js";
 import { buildRegistry, getTask, type Registry } from "./registry.js";
 import { createSqlStore } from "./store/sql/index.js";
@@ -36,16 +40,14 @@ import type {
 	RunStatus,
 	SerializedError,
 	Store,
-	WaitpointResolution,
+	WaitpointStatus,
 } from "./store/types.js";
 import type { AnyTask, PayloadArgs, RunHandle, TaskOutput, TaskPayload } from "./task.js";
-import { computeBackoffMs, DEFAULT_RETRY } from "./utils/backoff.js";
+import { computeBackoffMs } from "./utils/backoff.js";
 import { type Duration, parseDuration } from "./utils/duration.js";
 import { validateIdempotencyKey } from "./utils/identifiers.js";
 import { assertSerializable } from "./utils/serialization.js";
 
-/** Queue of a task that declares none (see `task.ts` / `registry.ts`). */
-const DEFAULT_QUEUE_NAME = "default";
 const DEFAULT_LIST_LIMIT = 20;
 /**
  * How long `stop()` waits, after handing back the still-active runs, for the in-flight
@@ -119,6 +121,33 @@ export interface EngineRuns {
 	replay<O = unknown>(run: string | RunHandle<O>): Promise<RunHandle<O>>;
 }
 
+/**
+ * Result of `engine.tokens.complete`. A completion that does not apply is a no-op
+ * `{ completed: false, reason }`:
+ * - `not_found`: unknown id (or not a token);
+ * - `completed`: the token was already completed;
+ * - `timed_out`: the token's own timeout fired first;
+ * - `run_finished`: the token's run already completed, failed or was canceled (every terminal
+ *   transition times out the run's pending tokens, so nothing will ever read this output).
+ */
+export type CompleteTokenOutcome =
+	| { completed: true }
+	| {
+			completed: false;
+			reason: "not_found" | Exclude<WaitpointStatus, "pending"> | "run_finished";
+	  };
+
+export interface EngineTokens {
+	/**
+	 * Completes a token created by `ctx.step.createToken` (decisions 3, 12): `output` is validated
+	 * like a payload (`maxPayloadBytes`; `undefined` is stored as `null`). Resumes the waiting run
+	 * only if it is `waiting` with nothing else blocking. When the token's run already finished
+	 * (completed/failed/canceled) the result is `{ completed: false, reason: "run_finished" }`,
+	 * not `timed_out`, even though the finished run timed out its pending tokens.
+	 */
+	complete(tokenId: string, output?: unknown): Promise<CompleteTokenOutcome>;
+}
+
 export interface Engine {
 	/** Applies pending migrations to `config.schema` (safe to call concurrently). */
 	migrate(): Promise<MigrateResult>;
@@ -132,7 +161,10 @@ export interface Engine {
 		...args: PayloadArgs<TaskPayload<T>, [options?: TriggerOptions]>
 	): Promise<RunHandle<TaskOutput<T>>>;
 	runs: EngineRuns;
+	tokens: EngineTokens;
 }
+
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 export function createEngine(config: EngineConfig): Engine {
 	const resolved = resolveConfig(config);
@@ -196,9 +228,9 @@ export function createEngine(config: EngineConfig): Engine {
 		const result = await store.runs.create({
 			id: randomUUID(),
 			taskId: task.id,
-			queue: queueOf(task),
+			queue: taskQueueName(task),
 			payload: payload as Json,
-			maxAttempts: task.options.retry?.maxAttempts ?? DEFAULT_RETRY.maxAttempts,
+			maxAttempts: childTaskSpec(task).maxAttempts,
 			delayMs,
 			...(idempotency ? { idempotency } : {}),
 		});
@@ -262,7 +294,7 @@ export function createEngine(config: EngineConfig): Engine {
 						inFlight.delete(execution);
 					}
 				},
-				processSystem: createSystemDispatcher({ logger }),
+				processSystem: createSystemDispatcher({ config: resolved, store, transport, active }),
 			});
 		})();
 		startPromise = attempt.then(
@@ -359,14 +391,6 @@ export function createEngine(config: EngineConfig): Engine {
 		return stopPromise;
 	}
 
-	async function resolveParent(parent: WaitpointResolution | null): Promise<void> {
-		if (!parent) return;
-		if (parent.resume) await enqueue(deps, parent.resume);
-		if (parent.hasExpireJob) {
-			await transport.removeSystemJob(waitpointExpireJobId(parent.waitpointId));
-		}
-	}
-
 	const runs: EngineRuns = {
 		async get<O>(run: string | RunHandle<O>): Promise<Run<O> | null> {
 			const record = await store.runs.get(runIdOf(run));
@@ -389,16 +413,10 @@ export function createEngine(config: EngineConfig): Engine {
 			const result = await store.runs.cancel(runIdOf(run), "canceled via engine.runs.cancel()");
 			if (result.kind !== "canceled") return result.kind;
 
-			for (const canceled of result.canceled) {
-				// Local executions only; cross-process abort via pub/sub comes in Phase 6. Either way
-				// ownership is already gone, so a zombie can't write anything.
-				active.get(canceled.runId)?.abort("canceled");
-				await transport.removeRunJob(canceled.queue, canceled.runId, canceled.enqueueSeq);
-			}
-			for (const waitpointId of result.expireJobsToRemove) {
-				await transport.removeSystemJob(waitpointExpireJobId(waitpointId));
-			}
-			await resolveParent(result.parent);
+			// Local executions only; cross-process abort via pub/sub comes in Phase 6. Either way
+			// ownership is already gone, so a zombie can't write anything.
+			await cancelLocally({ transport, active }, result.canceled);
+			await afterResolution(deps, result.parent, result.expireJobsToRemove);
 			return "canceled";
 		},
 
@@ -412,17 +430,42 @@ export function createEngine(config: EngineConfig): Engine {
 		},
 	};
 
+	const tokens: EngineTokens = {
+		async complete(tokenId: string, output?: unknown): Promise<CompleteTokenOutcome> {
+			const value = output === undefined ? null : output;
+			assertSerializable(value, {
+				label: "output of tokens.complete()",
+				maxBytes: resolved.limits.maxPayloadBytes,
+			});
+			if (typeof tokenId !== "string" || !UUID_PATTERN.test(tokenId)) {
+				return { completed: false, reason: "not_found" };
+			}
+			const result = await store.waitpoints.completeToken(tokenId, value as Json);
+			switch (result.kind) {
+				case "not_found":
+					return { completed: false, reason: "not_found" };
+				case "run_finished":
+					return { completed: false, reason: "run_finished" };
+				case "not_pending":
+					return {
+						completed: false,
+						reason: result.status === "pending" ? "completed" : result.status,
+					};
+				case "completed":
+					await afterResolution(deps, result.resolution, []);
+					return { completed: true };
+			}
+		},
+	};
+
 	return {
 		migrate: () => migrate(pool, resolved.schema),
 		start,
 		stop,
 		trigger,
 		runs,
+		tokens,
 	};
-}
-
-function queueOf(task: AnyTask): string {
-	return task.options.queue?.name ?? DEFAULT_QUEUE_NAME;
 }
 
 function runIdOf(run: string | RunHandle<unknown>): string {

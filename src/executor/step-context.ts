@@ -1,4 +1,5 @@
 import { AsyncLocalStorage } from "node:async_hooks";
+import { randomUUID } from "node:crypto";
 import { performance } from "node:perf_hooks";
 import {
 	DuplicateStepError,
@@ -7,8 +8,22 @@ import {
 	NestedStepError,
 	NonDeterminismError,
 } from "../errors.js";
-import type { ExecutionSnapshot, LoadedStep, StepKind, StepStore } from "../store/types.js";
-import type { StepApi } from "../task.js";
+import {
+	CANCELED_ERROR_NAME,
+	type ChildResult,
+	type EnqueueRequest,
+	type ExecutionSnapshot,
+	type LoadedStep,
+	type RunStore,
+	type SerializedError,
+	type StepKind,
+	type StepStore,
+	type TriggerChildrenInput,
+	WAITPOINT_TIMEOUT_REASON,
+	type WaitpointStore,
+	type WaitpointSummary,
+} from "../store/types.js";
+import type { AnyTask, RunHandle, StepApi, TokenHandle, WaitResult } from "../task.js";
 import { type Duration, parseDuration } from "../utils/duration.js";
 import { validateStepName } from "../utils/identifiers.js";
 import { assertSerializable, type Json, normalizeOutput } from "../utils/serialization.js";
@@ -66,10 +81,38 @@ export interface StepRegistration {
 	saved: LoadedStep | undefined;
 }
 
+/** What a child run needs from its task definition (`triggerChildren`). */
+export interface ChildTaskSpec {
+	id: string;
+	queue: string;
+	maxAttempts: number;
+}
+
+/**
+ * Phase 5 dependencies (tokens and subtasks). `enqueueRun` and `scheduleExpire` run after the
+ * store transaction committed and never throw: a lost enqueue is recovered by the reconciler
+ * from Postgres (decision 1; case 5 for a missing expire job).
+ */
+export interface StepWaitDeps {
+	runs: Pick<RunStore, "triggerChildren" | "listChildResults">;
+	waitpoints: Pick<WaitpointStore, "createToken" | "getToken">;
+	/** Child payloads follow the payload limit (decision 12). */
+	maxPayloadBytes: number;
+	/** Registered task -> child spec; throws `TaskNotRegisteredError`. */
+	resolveTask(task: AnyTask): ChildTaskSpec;
+	enqueueRun(request: EnqueueRequest): Promise<void>;
+	/** Adds `waitpoint-expire` with jobId `wp-${id}-expire` (deterministic: re-adding is a no-op). */
+	scheduleExpire(waitpointId: string, delayMs: number): Promise<void>;
+}
+
 export interface StepContextDeps {
 	steps: StepStore;
 	maxStepOutputBytes: number;
+	waits: StepWaitDeps;
 }
+
+/** `error.name` of a `WaitResult` whose waitpoint timed out. */
+export const TIMEOUT_ERROR_NAME = "Timeout";
 
 /**
  * `ctx.step` of one execution (Phase 4; decisions 2, 3, 5, 11, 12, 17).
@@ -100,6 +143,10 @@ export class StepContext {
 	 * while other step fns are in flight (`Promise.all`).
 	 */
 	private readonly stepScope = new AsyncLocalStorage<string>();
+	/** Waitpoints of the run at load time, by `step_name` (token: the `createToken` name). */
+	private readonly waitpointsByStep = new Map<string, WaitpointSummary>();
+	/** `createToken` calls registered in this execution, by name (for `waitForToken(name)`). */
+	private readonly tokens = new Map<string, Promise<TokenHandle>>();
 
 	readonly api: StepApi;
 
@@ -112,17 +159,28 @@ export class StepContext {
 			this.savedBySeq.set(step.seqIndex, step);
 			this.savedByName.set(step.name, step);
 		}
+		for (const wp of snapshot.waitpoints) this.waitpointsByStep.set(wp.stepName, wp);
 
-		const phase5 = (method: string) => (): Promise<never> =>
-			Promise.reject(new MinitriggerError(`ctx.step.${method} is implemented in Phase 5`));
 		this.api = {
 			run: ((name: string, fn: () => unknown) => this.run(name, fn)) as StepApi["run"],
 			sleep: (name, duration) => this.sleep(name, duration),
-			createToken: phase5("createToken"),
-			waitForToken: phase5("waitForToken"),
-			trigger: phase5("trigger"),
-			triggerAndWait: phase5("triggerAndWait"),
-			batchTriggerAndWait: phase5("batchTriggerAndWait"),
+			createToken: (name, opts) => this.createToken(name, opts),
+			waitForToken: (<T>(tokenOrName: TokenHandle | string) =>
+				this.waitForToken(tokenOrName) as Promise<WaitResult<T>>) as StepApi["waitForToken"],
+			trigger: ((name: string, task: AnyTask, payload?: unknown, opts?: { delay?: Duration }) =>
+				this.trigger(name, task, payload, opts)) as StepApi["trigger"],
+			triggerAndWait: ((
+				name: string,
+				task: AnyTask,
+				payload?: unknown,
+				opts?: { timeout?: Duration }
+			) => this.triggerAndWait(name, task, payload, opts)) as StepApi["triggerAndWait"],
+			batchTriggerAndWait: ((
+				name: string,
+				task: AnyTask,
+				payloads: readonly unknown[],
+				opts?: { timeout?: Duration }
+			) => this.batchTriggerAndWait(name, task, payloads, opts)) as StepApi["batchTriggerAndWait"],
 		};
 	}
 
@@ -238,7 +296,7 @@ export class StepContext {
 		} catch (error) {
 			return Promise.reject(error);
 		}
-		return this.state.trackInFlight(body(reg));
+		return this.state.trackInFlight(body(reg), name);
 	}
 
 	/** Marks the execution suspended (decision 2) and returns the signal to throw. */
@@ -380,9 +438,382 @@ export class StepContext {
 			}
 		);
 	}
+
+	// -------------------------------------------------------------------------
+	// Phase 5 step kinds: tokens and subtasks (decisions 3, 9, 10, 11, 12)
+	// -------------------------------------------------------------------------
+
+	/**
+	 * `ctx.step.createToken(name, { timeout })`: step `name` (kind `token`, output `{ id }`) and a
+	 * `token` waitpoint in one transaction; with a timeout, the `wp-${id}-expire` job after commit.
+	 * On replay the saved `{ id }` is returned; if the token is still pending with an expiry, the
+	 * expire job is re-added with the same deterministic jobId (a no-op while it exists; recreates
+	 * it if the first execution died between the commit and the enqueue).
+	 */
+	createToken(name: string, opts?: { timeout?: Duration }): Promise<TokenHandle> {
+		let timeoutMs: number | null = null;
+		let registered = false;
+		const promise = this.start(
+			"token",
+			name,
+			() => {
+				if (opts?.timeout !== undefined) timeoutMs = parseDuration(opts.timeout);
+			},
+			async reg => {
+				registered = true;
+				if (reg.saved !== undefined) {
+					const id = idOf(await this.savedOutput(reg.saved), reg.name);
+					const wp = this.waitpointsByStep.get(reg.name);
+					if (wp?.id === id && wp.status === "pending" && wp.expiresAt !== null) {
+						const delayMs = Math.max(0, Math.ceil(wp.expiresAt.getTime() - this.dbNowMs()));
+						await this.deps.waits.scheduleExpire(id, delayMs);
+					}
+					return { id, name: reg.name };
+				}
+				const result = await this.deps.waits.waitpoints.createToken(this.state.owner, {
+					waitpointId: randomUUID(),
+					name: reg.name,
+					seqIndex: reg.seqIndex,
+					timeoutMs,
+				});
+				if (result.kind === "lost") throw this.lost(`creating token "${reg.name}"`);
+				if (result.expireDelayMs !== null) {
+					await this.deps.waits.scheduleExpire(result.waitpointId, result.expireDelayMs);
+				}
+				return { id: result.waitpointId, name: reg.name };
+			}
+		);
+		// The body starts synchronously inside `start`: `registered` tells whether the call got a
+		// seq_index (a duplicate/invalid name did not).
+		if (registered) this.tokens.set(name, promise);
+		return promise;
+	}
+
+	/**
+	 * `ctx.step.waitForToken(tokenOrName)`: step `${name}#wait` (kind `wait`) holding only the
+	 * waitpoint reference (decision 10). A name without a `createToken` earlier in this execution
+	 * is `createToken(name)` followed by the wait (decision 11). Resolved -> the output read from
+	 * `waitpoints.output`; timed out -> `{ ok: false, error: { name: "Timeout" } }`; pending ->
+	 * suspends (the suspension transaction re-checks, decision 3).
+	 */
+	waitForToken(tokenOrName: TokenHandle | string): Promise<WaitResult<unknown>> {
+		let name: string;
+		let token: Promise<TokenHandle>;
+		if (typeof tokenOrName === "string") {
+			name = tokenOrName;
+			const existing = this.tokens.get(name);
+			if (existing !== undefined) {
+				token = existing;
+			} else {
+				token = this.createToken(name);
+				// Not registered (invalid/duplicate name, suspended, ...): its rejection says why.
+				if (!this.tokens.has(name)) return token as Promise<never>;
+			}
+		} else {
+			if (
+				tokenOrName === null ||
+				typeof tokenOrName !== "object" ||
+				typeof tokenOrName.id !== "string" ||
+				typeof tokenOrName.name !== "string"
+			) {
+				return Promise.reject(
+					this.fatal(
+						new MinitriggerError(
+							"ctx.step.waitForToken(token): token must be the handle returned by ctx.step.createToken or a token name"
+						)
+					)
+				);
+			}
+			try {
+				validateStepName(tokenOrName.name);
+			} catch (error) {
+				return Promise.reject(this.fatal(error as Error));
+			}
+			name = tokenOrName.name;
+			token = Promise.resolve({ id: tokenOrName.id, name: tokenOrName.name });
+		}
+
+		return this.startInternal("wait", `${name}#wait`, async reg => {
+			const { id } = await token;
+			if (reg.saved === undefined) {
+				const result = await this.deps.steps.insertWaitRef(this.state.owner, {
+					kind: "wait",
+					name: reg.name,
+					seqIndex: reg.seqIndex,
+					waitpointId: id,
+				});
+				if (result === "lost") throw this.lost(`recording wait "${reg.name}"`);
+			} else {
+				// Snapshot shortcut: still pending at load time -> suspend (the suspension
+				// transaction re-checks and requeues right away if it resolved meanwhile).
+				const wp = this.waitpointsByStep.get(name);
+				if (wp?.id === id) {
+					if (wp.status === "pending") throw this.suspend();
+					if (wp.status === "timed_out") return timedOut(`token "${name}"`);
+				}
+			}
+			// The token may already be resolved (completed while this execution was running):
+			// resume without suspending. The result is final, so a replay reads the same value.
+			const current = await this.deps.waits.waitpoints.getToken(id);
+			if (current === null || current.runId !== this.state.runId) {
+				throw this.fatal(
+					new MinitriggerError(
+						`ctx.step.waitForToken("${name}"): token ${id} does not belong to run ${this.state.runId}`
+					)
+				);
+			}
+			switch (current.status) {
+				case "completed":
+					return { ok: true, output: current.output };
+				case "timed_out":
+					return timedOut(`token "${name}"`);
+				case "pending":
+					throw this.suspend();
+			}
+		});
+	}
+
+	/**
+	 * `ctx.step.trigger(name, task, payload, { delay })`: child run with the internal key
+	 * `__child:${runId}:${name}` (decision 9), no waitpoint, memoized handle (step kind `trigger`,
+	 * output `{ id }`). The child is enqueued after commit.
+	 */
+	trigger(
+		name: string,
+		task: AnyTask,
+		payload: unknown,
+		opts: { delay?: Duration } | undefined
+	): Promise<RunHandle<unknown>> {
+		let spec!: ChildTaskSpec;
+		let json: Json = null;
+		let delayMs = 0;
+		return this.start(
+			"trigger",
+			name,
+			() => {
+				spec = this.deps.waits.resolveTask(task);
+				json = this.childPayload(spec.id, payload);
+				if (opts?.delay !== undefined) delayMs = parseDuration(opts.delay);
+			},
+			async reg => {
+				if (reg.saved !== undefined) {
+					return { id: idOf(await this.savedOutput(reg.saved), reg.name), taskId: spec.id };
+				}
+				const enqueue = await this.createChildren(reg, "trigger", spec, [json], null, delayMs);
+				const first = enqueue[0];
+				if (first === undefined) throw new Error("triggerChildren returned no child");
+				return { id: first.runId, taskId: spec.id };
+			}
+		);
+	}
+
+	/**
+	 * `ctx.step.triggerAndWait(name, task, payload, { timeout })`: child run + `child_run`
+	 * waitpoint + waiting step in ONE transaction (decision 10), then enqueue + suspend. On replay
+	 * the result is read from the child's `runs` row (never copied into `steps.output`).
+	 */
+	triggerAndWait(
+		name: string,
+		task: AnyTask,
+		payload: unknown,
+		opts: { timeout?: Duration } | undefined
+	): Promise<WaitResult<unknown>> {
+		let spec!: ChildTaskSpec;
+		let json: Json = null;
+		let timeoutMs: number | null = null;
+		return this.start(
+			"trigger_wait",
+			name,
+			() => {
+				spec = this.deps.waits.resolveTask(task);
+				json = this.childPayload(spec.id, payload);
+				if (opts?.timeout !== undefined) timeoutMs = parseDuration(opts.timeout);
+			},
+			async reg => {
+				if (reg.saved === undefined) {
+					await this.createChildren(reg, "wait", spec, [json], timeoutMs, 0);
+					throw this.suspend();
+				}
+				const [result] = await this.childResults(reg.name, 1);
+				if (result === undefined) throw new Error(`step "${reg.name}": child result missing`);
+				return result;
+			}
+		);
+	}
+
+	/**
+	 * `ctx.step.batchTriggerAndWait(name, task, payloads, { timeout })`: one `batch` waitpoint
+	 * with `pending_count`, one child per payload (`batch_index`, key
+	 * `__child:${runId}:${name}:${i}`); the parent is resumed once, when the count reaches 0.
+	 * Results come back in payload order. An empty `payloads` records nothing and returns `[]`.
+	 */
+	batchTriggerAndWait(
+		name: string,
+		task: AnyTask,
+		payloads: readonly unknown[],
+		opts: { timeout?: Duration } | undefined
+	): Promise<WaitResult<unknown>[]> {
+		let spec!: ChildTaskSpec;
+		let jsons: Json[] = [];
+		let timeoutMs: number | null = null;
+		return this.start(
+			"batch_wait",
+			name,
+			() => {
+				if (!Array.isArray(payloads)) {
+					throw new MinitriggerError(
+						`ctx.step.batchTriggerAndWait("${name}"): payloads must be an array`
+					);
+				}
+				spec = this.deps.waits.resolveTask(task);
+				jsons = payloads.map(p => this.childPayload(spec.id, p));
+				if (opts?.timeout !== undefined) timeoutMs = parseDuration(opts.timeout);
+			},
+			async reg => {
+				if (jsons.length === 0) return [];
+				if (reg.saved === undefined) {
+					await this.createChildren(reg, "batch", spec, jsons, timeoutMs, 0);
+					throw this.suspend();
+				}
+				return this.childResults(reg.name, jsons.length);
+			}
+		);
+	}
+
+	/** Validates a child payload like `engine.trigger` does (`undefined` -> `null`). */
+	private childPayload(taskId: string, payload: unknown): Json {
+		const value = payload === undefined ? null : payload;
+		assertSerializable(value, {
+			label: `payload of task "${taskId}"`,
+			maxBytes: this.deps.waits.maxPayloadBytes,
+		});
+		return value as Json;
+	}
+
+	/** `triggerChildren` (one transaction), then the enqueues and the expire job after commit. */
+	private async createChildren(
+		reg: StepRegistration,
+		mode: TriggerChildrenInput["mode"],
+		spec: ChildTaskSpec,
+		payloads: readonly Json[],
+		timeoutMs: number | null,
+		delayMs: number
+	): Promise<EnqueueRequest[]> {
+		const baseKey = `__child:${this.state.runId}:${reg.name}`;
+		const result = await this.deps.waits.runs.triggerChildren({
+			parent: this.state.owner,
+			stepName: reg.name,
+			seqIndex: reg.seqIndex,
+			mode,
+			waitpointId: randomUUID(),
+			timeoutMs,
+			delayMs,
+			children: payloads.map((payload, i) => ({
+				id: randomUUID(),
+				taskId: spec.id,
+				queue: spec.queue,
+				payload,
+				maxAttempts: spec.maxAttempts,
+				idempotencyKey: mode === "batch" ? `${baseKey}:${i}` : baseKey,
+				batchIndex: mode === "batch" ? i : null,
+			})),
+		});
+		if (result.kind === "lost") throw this.lost(`triggering the children of step "${reg.name}"`);
+		for (const request of result.enqueue) await this.deps.waits.enqueueRun(request);
+		const wp = result.waitpoint;
+		if (wp !== null && wp.expireDelayMs !== null) {
+			await this.deps.waits.scheduleExpire(wp.id, wp.expireDelayMs);
+		}
+		return result.enqueue;
+	}
+
+	/**
+	 * Replay of a child/batch wait: pending at load time -> suspend; otherwise ONE query by
+	 * `parent_waitpoint_id ORDER BY batch_index` (decision 10). In a timed-out batch, only the
+	 * children canceled BY the expiry (`error.message === WAITPOINT_TIMEOUT_REASON`) become
+	 * `Timeout`; children that completed, failed or were canceled on their own before the timeout
+	 * keep their real result.
+	 */
+	private async childResults(stepName: string, count: number): Promise<WaitResult<unknown>[]> {
+		const wp = this.waitpointsByStep.get(stepName);
+		if (wp === undefined) {
+			throw new MinitriggerError(
+				`run ${this.state.runId}: step "${stepName}" has no waitpoint (corrupted state)`
+			);
+		}
+		if (wp.status === "pending") throw this.suspend();
+		const timedOutWait = wp.status === "timed_out";
+		if (timedOutWait && wp.kind === "child_run") return [timedOut(`step "${stepName}"`)];
+		const children = await this.deps.waits.runs.listChildResults(wp.id);
+		if (children.length !== count) {
+			throw this.fatal(
+				new NonDeterminismError(
+					`non-deterministic replay of task "${this.state.taskId}" (run ${this.state.runId}): ` +
+						`step "${stepName}" has ${count} payload(s) now, but ${children.length} child run(s) ` +
+						"were triggered in an earlier execution"
+				)
+			);
+		}
+		return children.map(child =>
+			timedOutWait && canceledByTimeout(child) ? timedOut(`step "${stepName}"`) : childResult(child)
+		);
+	}
 }
 
 function noop(): void {}
+
+/** `{ id }` output of a `token`/`trigger` step. */
+function idOf(output: Json | null, stepName: string): string {
+	const id = (output as { id?: unknown } | null)?.id;
+	if (typeof id !== "string") {
+		throw new MinitriggerError(`step "${stepName}" has no saved id (corrupted state)`);
+	}
+	return id;
+}
+
+/** A child canceled by its parent's waitpoint expiry (not failed/canceled on its own before). */
+function canceledByTimeout(child: ChildResult): boolean {
+	return child.status === "canceled" && child.error?.message === WAITPOINT_TIMEOUT_REASON;
+}
+
+function timedOut(what: string): { ok: false; error: SerializedError } {
+	return {
+		ok: false,
+		error: { name: TIMEOUT_ERROR_NAME, message: `${what} timed out`, retryable: false },
+	};
+}
+
+/** A terminal child run as a `WaitResult` (decision 10). */
+function childResult(child: ChildResult): WaitResult<unknown> {
+	switch (child.status) {
+		case "completed":
+			return { ok: true, output: child.output };
+		case "failed":
+			return {
+				ok: false,
+				error: child.error ?? { name: "Error", message: "child run failed", retryable: false },
+			};
+		case "canceled":
+			return {
+				ok: false,
+				error: {
+					name: CANCELED_ERROR_NAME,
+					message: child.error?.message ?? "child run was canceled",
+					retryable: false,
+				},
+			};
+		default:
+			// Unreachable: a resolved waitpoint means every child is terminal.
+			return {
+				ok: false,
+				error: {
+					name: "Error",
+					message: `child run ${child.runId} is ${child.status}`,
+					retryable: false,
+				},
+			};
+	}
+}
 
 /** Builds `ctx.step` for one execution from its snapshot. */
 export function createStepContext(

@@ -15,15 +15,27 @@ const f = useRunFixtures(ns);
 
 const ERR: SerializedError = { name: "TypeError", message: "bad", retryable: false };
 
-async function token(owner: Ownership, name: string, timeoutMs: number | null = null) {
+/**
+ * A token plus (unless `awaited` is false) the `${name}#wait` step `waitForToken` writes: only an
+ * awaited token blocks the run's resume (owner's interpretation of decision 3).
+ */
+async function token(
+	owner: Ownership,
+	name: string,
+	timeoutMs: number | null = null,
+	awaited = true
+) {
 	const waitpointId = randomUUID();
-	const res = await f.waitpoints.createToken(owner, {
-		waitpointId,
-		name,
-		seqIndex: Number.parseInt(name.replace(/\D/g, "") || "0", 10),
-		timeoutMs,
-	});
+	const seqIndex = Number.parseInt(name.replace(/\D/g, "") || "0", 10);
+	const res = await f.waitpoints.createToken(owner, { waitpointId, name, seqIndex, timeoutMs });
 	if (res.kind !== "created") throw new Error("createToken lost");
+	if (awaited) {
+		await f.sql(
+			`INSERT INTO ${f.t("steps")} (run_id, name, seq_index, kind, status, output)
+			 VALUES ($1, $2, $3, 'wait', 'waiting', $4::jsonb)`,
+			[owner.runId, `${name}#wait`, 100 + seqIndex, JSON.stringify({ waitpointId })]
+		);
+	}
 	return { waitpointId, res };
 }
 
@@ -85,7 +97,7 @@ async function wpRow(id: string) {
 describe("WaitpointStore: tokens", () => {
 	it("createToken writes a pending waitpoint and the step { id }; lost without ownership", async () => {
 		const { owner } = await f.running();
-		const { waitpointId, res } = await token(owner, "t0", 30_000);
+		const { waitpointId, res } = await token(owner, "t0", 30_000, false);
 		expect(res.expiresAt).toBeInstanceOf(Date);
 		expect(res.expireDelayMs).toBeGreaterThan(29_000);
 		expect(res.expireDelayMs).toBeLessThanOrEqual(30_000);
@@ -104,6 +116,57 @@ describe("WaitpointStore: tokens", () => {
 			{ waitpointId: randomUUID(), name: "t1", seqIndex: 1, timeoutMs: null }
 		);
 		expect(lost).toEqual({ kind: "lost" });
+	});
+
+	it("createToken is idempotent by (run_id, step_name): the existing token is returned", async () => {
+		const { owner } = await f.running();
+		const first = await token(owner, "t0", 60_000);
+		const again = await f.waitpoints.createToken(owner, {
+			waitpointId: randomUUID(),
+			name: "t0",
+			seqIndex: 0,
+			timeoutMs: 60_000,
+		});
+		expect(again).toMatchObject({ kind: "created", waitpointId: first.waitpointId });
+		expect(again.kind === "created" && again.expireDelayMs).toBeGreaterThan(50_000);
+		const count = await f.sql<{ n: number }>(
+			`SELECT count(*)::int AS n FROM ${f.t("waitpoints")} WHERE run_id = $1`,
+			[owner.runId]
+		);
+		expect(count[0]?.n).toBe(1);
+		// No longer pending -> no expire delay to schedule.
+		await f.waitpoints.completeToken(first.waitpointId, 1);
+		const done = await f.waitpoints.createToken(owner, {
+			waitpointId: randomUUID(),
+			name: "t0",
+			seqIndex: 0,
+			timeoutMs: 60_000,
+		});
+		expect(done).toMatchObject({ waitpointId: first.waitpointId, expireDelayMs: null });
+	});
+
+	it("fail/complete time out the run's own pending waitpoints (expireJobsToRemove)", async () => {
+		const a = await f.running();
+		const withExpiry = await token(a.owner, "t0", 60_000);
+		const noExpiry = await token(a.owner, "t1");
+		expect(await f.runs.fail(a.owner, ERR)).toEqual({
+			kind: "failed",
+			parent: null,
+			expireJobsToRemove: [withExpiry.waitpointId],
+		});
+		expect((await wpRow(withExpiry.waitpointId))?.status).toBe("timed_out");
+		expect((await wpRow(noExpiry.waitpointId))?.status).toBe("timed_out");
+		// The run is terminal: `run_finished`, not a misleading `timed_out`.
+		expect(await f.waitpoints.completeToken(noExpiry.waitpointId, 1)).toEqual({
+			kind: "run_finished",
+		});
+
+		const b = await f.running();
+		const tok = await token(b.owner, "t0", 60_000);
+		expect(await f.runs.complete(b.owner, 1)).toMatchObject({
+			expireJobsToRemove: [tok.waitpointId],
+		});
+		expect((await wpRow(tok.waitpointId))?.status).toBe("timed_out");
 	});
 
 	it("completeToken: not_found, completed, then not_pending", async () => {
@@ -159,6 +222,73 @@ describe("WaitpointStore: tokens", () => {
 			const resumes = results.filter(r => r.kind === "completed" && r.resolution.resume);
 			expect(resumes).toHaveLength(1);
 		}
+	});
+
+	it("completeToken on a finished (completed or canceled) run: run_finished; an already completed token stays completed", async () => {
+		const { owner } = await f.running();
+		const done = await token(owner, "t0");
+		const open = await token(owner, "t1");
+		await f.waitpoints.completeToken(done.waitpointId, 1);
+		await f.runs.complete(owner, null);
+		expect(await f.waitpoints.completeToken(done.waitpointId, 2)).toEqual({
+			kind: "not_pending",
+			status: "completed",
+		});
+		expect(await f.waitpoints.completeToken(open.waitpointId, 2)).toEqual({
+			kind: "run_finished",
+		});
+		const c = await f.running();
+		const tok = await token(c.owner, "t0");
+		await f.runs.cancel(c.owner.runId, "stop");
+		expect(await f.waitpoints.completeToken(tok.waitpointId, 1)).toEqual({ kind: "run_finished" });
+	});
+
+	it("expiry racing completion: exactly one wins and the run is resumed once (10 rounds)", async () => {
+		for (let round = 0; round < 10; round++) {
+			const { owner } = await f.running();
+			const { waitpointId } = await token(owner, "t0", 60_000);
+			await f.runs.suspend(owner);
+			await f.sql(
+				`UPDATE ${f.t("waitpoints")} SET expires_at = now() - interval '1 second' WHERE id = $1`,
+				[waitpointId]
+			);
+			const [completed, expired] = await Promise.all([
+				f.waitpoints.completeToken(waitpointId, round),
+				f.waitpoints.expire(waitpointId),
+			]);
+			const wins = [completed.kind === "completed", expired.kind === "expired"].filter(Boolean);
+			expect(wins).toHaveLength(1);
+			const resumes = [
+				completed.kind === "completed" ? completed.resolution.resume : null,
+				expired.kind === "expired" ? expired.resolution.resume : null,
+			].filter(r => r !== null);
+			expect(resumes).toHaveLength(1);
+			const status = (await wpRow(waitpointId))?.status;
+			expect(status).toBe(completed.kind === "completed" ? "completed" : "timed_out");
+			if (completed.kind !== "completed") {
+				expect(completed).toEqual({ kind: "not_pending", status: "timed_out" });
+			}
+			expect(await f.runs.get(owner.runId)).toMatchObject({ status: "waiting", enqueueSeq: 3 });
+		}
+	});
+
+	it("only awaited tokens block: a created-but-not-awaited token lets a sleeping run wake up", async () => {
+		const { owner } = await f.running();
+		const { waitpointId } = await token(owner, "t0", null, false);
+		await sleepStep(owner.runId, "nap", 1, 60_000);
+		const suspended = await f.runs.suspend(owner);
+		if (suspended.kind !== "sleeping") throw new Error(`expected sleeping, got ${suspended.kind}`);
+		expect(suspended.enqueue.delayMs).toBeGreaterThan(55_000);
+		// Completing it while the run sleeps: the resume still waits for the sleep's wake_at.
+		const res = await f.waitpoints.completeToken(waitpointId, null);
+		const resume = res.kind === "completed" ? res.resolution.resume : null;
+		expect(resume?.delayMs).toBeGreaterThan(55_000);
+
+		// Once awaited (the `#wait` step exists) the same token blocks.
+		const b = await f.running();
+		await token(b.owner, "t0", null, true);
+		await sleepStep(b.owner.runId, "nap", 1, 60_000);
+		expect(await f.runs.suspend(b.owner)).toEqual({ kind: "waiting_on_waitpoints" });
 	});
 
 	it("token + future sleep: completing the token resumes at the sleep's wake_at", async () => {
@@ -345,7 +475,11 @@ describe("Child resolution (decision 10)", () => {
 		await f.sql(`UPDATE ${f.t("waitpoints")} SET status = 'timed_out' WHERE id = $1`, [
 			waitpointId,
 		]);
-		expect(await f.runs.complete(childOwner, 1)).toEqual({ kind: "completed", parent: null });
+		expect(await f.runs.complete(childOwner, 1)).toEqual({
+			kind: "completed",
+			parent: null,
+			expireJobsToRemove: [],
+		});
 	});
 
 	it("parent still running -> waitpoint completed but no enqueue", async () => {
@@ -356,6 +490,7 @@ describe("Child resolution (decision 10)", () => {
 		expect(res).toEqual({
 			kind: "completed",
 			parent: { waitpointId, hasExpireJob: false, resume: null },
+			expireJobsToRemove: [],
 		});
 		expect(await f.runs.suspend(parent.owner)).toMatchObject({ kind: "requeued" });
 	});
@@ -438,9 +573,9 @@ describe("Child resolution (decision 10)", () => {
 		expect(res.expireJobsToRemove).toEqual([withExpiry.waitpointId]);
 		expect((await wpRow(withExpiry.waitpointId))?.status).toBe("timed_out");
 		expect((await wpRow(noExpiry.waitpointId))?.status).toBe("timed_out");
+		// The canceled child is terminal: its tokens report run_finished.
 		expect(await f.waitpoints.completeToken(noExpiry.waitpointId, "late")).toEqual({
-			kind: "not_pending",
-			status: "timed_out",
+			kind: "run_finished",
 		});
 	});
 });

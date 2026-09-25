@@ -32,6 +32,12 @@ export interface ReconcilerOptions {
 	batchSize: number;
 	/** Phase 8 hook: bidirectional reconciliation of schedules. Called last, isolated like the rest. */
 	reconcileSchedules?: () => Promise<void>;
+	/**
+	 * Called with the ids of the runs canceled by an expiry (case 5), after their pending run jobs
+	 * were removed. The engine aborts local executions and publishes the cancel (Phase 6). A throw
+	 * is logged and counted in `errors`; the parent's resume still happens.
+	 */
+	onCanceled?: (runIds: readonly string[]) => void | Promise<void>;
 }
 
 export interface StalledReport {
@@ -57,8 +63,16 @@ export interface Reconciler {
 }
 
 export function createReconciler(options: ReconcilerOptions): Reconciler {
-	const { store, transport, logger, graceMs, stallTimeoutMs, batchSize, reconcileSchedules } =
-		options;
+	const {
+		store,
+		transport,
+		logger,
+		graceMs,
+		stallTimeoutMs,
+		batchSize,
+		reconcileSchedules,
+		onCanceled,
+	} = options;
 
 	function toEnqueueInput(req: EnqueueRequest): EnqueueRunInput {
 		return { queue: req.queue, runId: req.runId, seq: req.seq, delayMs: req.delayMs };
@@ -161,15 +175,40 @@ export function createReconciler(options: ReconcilerOptions): Reconciler {
 			}
 			report.stalled.failed++;
 			await applyResolution(result.parent);
+			for (const id of result.expireJobsToRemove) {
+				await transport.removeSystemJob(waitpointExpireJobId(id));
+			}
 		});
 	}
 
-	// --- Case 5: pending waitpoints past expires_at -> expire -> enqueue resume, remove expire jobs. ---
+	// --- Case 5: pending waitpoints past expires_at -> expire -> cancel children's jobs, enqueue
+	// resume, remove expire jobs. ---
 	async function reconcileExpiredWaitpoints(report: ReconcileReport): Promise<void> {
 		const ids = await store.waitpoints.listExpired(batchSize);
 		await forEachItem(ids, "expiredWaitpoints", report, async waitpointId => {
 			const result = await store.waitpoints.expire(waitpointId);
 			if (result.kind === "noop" || result.kind === "not_due") return; // No-op, per spec.
+			// Children canceled by the expiry (decision 10): drop their pending run jobs
+			// (best-effort; a leftover job is a no-op anyway, `acquire` rejects a canceled run).
+			for (const child of result.canceledChildren) {
+				try {
+					await transport.removeRunJob(child.queue, child.runId, child.enqueueSeq);
+				} catch (err) {
+					logger.warn(
+						{ err, runId: child.runId },
+						"reconciler: failed to remove the run job of a canceled child"
+					);
+				}
+			}
+			if (result.canceledChildren.length > 0 && onCanceled) {
+				try {
+					await onCanceled(result.canceledChildren.map(c => c.runId));
+				} catch (err) {
+					// Isolated: the parent's resume below must still happen.
+					report.errors++;
+					logger.error({ err, waitpointId }, "reconciler: onCanceled hook failed");
+				}
+			}
 			await applyResolution(result.resolution);
 			// This waitpoint's own expire job already fired (that's how it got here); best-effort
 			// cleanup in case a duplicate/late one is still scheduled (decision 10: aggressive removal).

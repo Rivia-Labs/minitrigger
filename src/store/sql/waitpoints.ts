@@ -3,21 +3,25 @@ import type {
 	CreateTokenResult,
 	ExpireWaitpointResult,
 	Json,
+	RunStatus,
 	WaitpointKind,
 	WaitpointStatus,
 	WaitpointStore,
 } from "../types.js";
+import { WAITPOINT_TIMEOUT_REASON } from "../types.js";
 import { atomic, direct, type SqlContext, type SqlExecutor } from "./db.js";
 import {
 	applyResumeRule,
 	cancelDescendants,
+	isTerminal,
 	jsonParam,
 	nowPlusMs,
 	timeOutWaitpointsOf,
 } from "./resolve.js";
 
-/** `cancel` reason written on children canceled because their parent's waitpoint timed out. */
-export const WAITPOINT_TIMEOUT_REASON = "Parent waitpoint timed out";
+/** Remaining time until `expires_at` in ms (DB clock, decision 17); NULL without `expires_at`. */
+const EXPIRE_DELAY_SQL =
+	"greatest(0, round(extract(epoch from (expires_at - now())) * 1000))::float8";
 
 export function createWaitpointStore(exec: SqlExecutor, ctx: SqlContext): WaitpointStore {
 	const runs = ctx.t("runs");
@@ -32,26 +36,53 @@ export function createWaitpointStore(exec: SqlExecutor, ctx: SqlContext): Waitpo
 					[owner.runId, owner.executionId]
 				);
 				if (guard.rowCount === 0) return { kind: "lost" };
-				const { rows } = await db.query<{ expires_at: Date | null; delay_ms: number | null }>(
+				// Idempotent by (run_id, step_name): a token already recorded under this name (same
+				// step) is returned as-is instead of creating a second waitpoint.
+				const inserted = await db.query<{
+					id: string;
+					delay_ms: number | null;
+					expires_at: Date | null;
+				}>(
 					`INSERT INTO ${waitpoints} (id, run_id, step_name, kind, status, expires_at)
 					 VALUES ($1, $2, $3, 'token', 'pending',
 					   CASE WHEN $4::float8 IS NULL THEN NULL ELSE ${nowPlusMs("$4")} END)
-					 RETURNING expires_at,
-					   greatest(0, round(extract(epoch from (expires_at - now())) * 1000))::float8
-					     AS delay_ms`,
+					 ON CONFLICT (run_id, step_name) DO NOTHING
+					 RETURNING id, expires_at, ${EXPIRE_DELAY_SQL} AS delay_ms`,
 					[token.waitpointId, owner.runId, token.name, token.timeoutMs]
 				);
+				let row = inserted.rows[0];
+				if (!row) {
+					const { rows: existing } = await db.query<{
+						id: string;
+						kind: WaitpointKind;
+						expires_at: Date | null;
+						delay_ms: number | null;
+					}>(
+						`SELECT id, kind, expires_at,
+						   CASE WHEN status = 'pending' THEN ${EXPIRE_DELAY_SQL} END AS delay_ms
+						 FROM ${waitpoints} WHERE run_id = $1 AND step_name = $2`,
+						[owner.runId, token.name]
+					);
+					const found = existing[0];
+					if (found?.kind !== "token") {
+						throw new Error(
+							`createToken: step "${token.name}" of run ${owner.runId} already has a ` +
+								`${found?.kind ?? "missing"} waitpoint`
+						);
+					}
+					row = found;
+				}
 				await db.query(
 					`INSERT INTO ${ctx.t("steps")} (run_id, name, seq_index, kind, status, output)
-					 VALUES ($1, $2, $3, 'token', 'completed', $4::jsonb)`,
-					[owner.runId, token.name, token.seqIndex, jsonParam({ id: token.waitpointId })]
+					 VALUES ($1, $2, $3, 'token', 'completed', $4::jsonb)
+					 ON CONFLICT (run_id, name) DO NOTHING`,
+					[owner.runId, token.name, token.seqIndex, jsonParam({ id: row.id })]
 				);
-				const row = rows[0];
 				return {
 					kind: "created",
-					waitpointId: token.waitpointId,
-					expiresAt: row?.expires_at ?? null,
-					expireDelayMs: row?.delay_ms ?? null,
+					waitpointId: row.id,
+					expiresAt: row.expires_at,
+					expireDelayMs: row.delay_ms,
 				};
 			});
 		},
@@ -65,7 +96,11 @@ export function createWaitpointStore(exec: SqlExecutor, ctx: SqlContext): Waitpo
 				const wp = found[0];
 				if (wp?.kind !== "token") return { kind: "not_found" };
 				// Decision 3: lock the waiting run before touching its waitpoints.
-				await db.query(`SELECT 1 FROM ${runs} WHERE id = $1 FOR UPDATE`, [wp.run_id]);
+				const { rows: owning } = await db.query<{ status: RunStatus }>(
+					`SELECT status FROM ${runs} WHERE id = $1 FOR UPDATE`,
+					[wp.run_id]
+				);
+				const runStatus = owning[0]?.status;
 				const { rows } = await db.query<{ has_expiry: boolean }>(
 					`UPDATE ${waitpoints}
 					 SET status = 'completed', output = $2::jsonb, resolved_at = now()
@@ -80,7 +115,13 @@ export function createWaitpointStore(exec: SqlExecutor, ctx: SqlContext): Waitpo
 						[waitpointId]
 					);
 					const status = cur[0]?.status;
-					return status ? { kind: "not_pending", status } : { kind: "not_found" };
+					if (!status) return { kind: "not_found" };
+					// Every terminal transition times out the run's own pending tokens: report that
+					// the run is gone rather than a misleading `timed_out`.
+					if (status === "timed_out" && runStatus !== undefined && isTerminal(runStatus)) {
+						return { kind: "run_finished" };
+					}
+					return { kind: "not_pending", status };
 				}
 				const resume = await applyResumeRule(db, ctx, wp.run_id);
 				return {
