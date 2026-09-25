@@ -30,6 +30,8 @@ describe("IdempotencyStore / RunStore.create with idempotency (decision 9)", () 
 			queue: "default",
 			seq: 1,
 			delayMs: 0,
+			status: "queued",
+			updatedAt: result.run.updatedAt,
 		});
 		const found = await f.idempotency.find("task-a", "k-new");
 		expect(found?.runId).toBe(input.id);

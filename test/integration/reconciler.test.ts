@@ -251,7 +251,9 @@ describe("createReconciler: case 4 (stalled)", () => {
 			],
 		});
 		if (created.kind !== "created") throw new Error("expected created");
-		expect(await store().runs.suspend(parent.owner)).toEqual({ kind: "waiting_on_waitpoints" });
+		expect(await store().runs.suspend(parent.owner)).toMatchObject({
+			kind: "waiting_on_waitpoints",
+		});
 
 		const childOwner = await f.acquire(childId);
 		await f.sql(
@@ -297,7 +299,7 @@ describe("createReconciler: case 5 (expired waitpoints)", () => {
 		});
 		if (created.kind !== "created") throw new Error("expected created");
 		await awaitToken(owner.runId, "tok", waitpointId);
-		expect(await store().runs.suspend(owner)).toEqual({ kind: "waiting_on_waitpoints" });
+		expect(await store().runs.suspend(owner)).toMatchObject({ kind: "waiting_on_waitpoints" });
 		await f.sql(
 			`UPDATE ${f.t("waitpoints")} SET expires_at = now() - interval '1 second' WHERE id = $1`,
 			[waitpointId]
@@ -360,7 +362,9 @@ describe("createReconciler: case 5 (expired waitpoints)", () => {
 		// Delayed so no worker could pick it up; the reconciler must remove it.
 		await transport.enqueueRun({ ...childJob, delayMs: 3_600_000 });
 		expect(await rawQueue(QUEUE).getJob(runJobId(childId, childJob.seq))).toBeDefined();
-		expect(await store().runs.suspend(parent.owner)).toEqual({ kind: "waiting_on_waitpoints" });
+		expect(await store().runs.suspend(parent.owner)).toMatchObject({
+			kind: "waiting_on_waitpoints",
+		});
 		await f.sql(
 			`UPDATE ${f.t("waitpoints")} SET expires_at = now() - interval '1 second' WHERE id = $1`,
 			[waitpointId]

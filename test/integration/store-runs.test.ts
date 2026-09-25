@@ -108,12 +108,15 @@ describe("RunStore: create / acquire / heartbeat", () => {
 describe("RunStore: terminal transitions and ownership", () => {
 	it("complete sets output/finished_at and clears execution_id and run_after", async () => {
 		const { owner } = await f.running();
-		expect(await f.runs.complete(owner, [1, "two", { three: 3 }])).toEqual({
+		const res = await f.runs.complete(owner, [1, "two", { three: 3 }]);
+		if (res.kind !== "completed") throw new Error("expected completed");
+		const run = await f.runs.get(owner.runId);
+		expect(res).toEqual({
 			kind: "completed",
+			updatedAt: run?.updatedAt,
 			parent: null,
 			expireJobsToRemove: [],
 		});
-		const run = await f.runs.get(owner.runId);
 		expect(run).toMatchObject({
 			status: "completed",
 			output: [1, "two", { three: 3 }],
@@ -125,12 +128,16 @@ describe("RunStore: terminal transitions and ownership", () => {
 
 	it("fail stores the error; a second write from the same execution is lost", async () => {
 		const { owner } = await f.running();
-		expect(await f.runs.fail(owner, ERR)).toEqual({
+		const res = await f.runs.fail(owner, ERR);
+		if (res.kind !== "failed") throw new Error("expected failed");
+		const run = await f.runs.get(owner.runId);
+		expect(res).toEqual({
 			kind: "failed",
+			updatedAt: run?.updatedAt,
 			parent: null,
 			expireJobsToRemove: [],
 		});
-		expect((await f.runs.get(owner.runId))?.error).toEqual(ERR);
+		expect(run?.error).toEqual(ERR);
 		expect(await f.runs.complete(owner, 1)).toEqual({ kind: "lost" });
 	});
 
@@ -226,10 +233,18 @@ describe("RunStore: triggerChildren", () => {
 		const { owner } = await f.running();
 		const { childIds, res } = await spawn(owner, "trigger");
 		expect(res.waitpoint).toBeNull();
-		expect(res.enqueue).toEqual([
-			{ runId: childIds[0], taskId: "child-task", queue: "default", seq: 1, delayMs: 0 },
-		]);
 		const child = await f.runs.get(childIds[0] ?? "");
+		expect(res.enqueue).toEqual([
+			{
+				runId: childIds[0],
+				taskId: "child-task",
+				queue: "default",
+				seq: 1,
+				delayMs: 0,
+				status: "queued",
+				updatedAt: child?.updatedAt,
+			},
+		]);
 		expect(child).toMatchObject({ parentRunId: owner.runId, parentWaitpointId: null });
 		const steps = await f.sql<{ status: string; output: unknown }>(
 			`SELECT status, output FROM ${f.t("steps")} WHERE run_id = $1`,
@@ -470,7 +485,15 @@ describe("RunStore: reconciler queries", () => {
 		);
 		const res = await f.runs.listStaleQueued(30_000, 10);
 		expect(res).toEqual([
-			{ runId: stale.run.id, taskId: "task-a", queue: "default", seq: 4, delayMs: 0 },
+			{
+				runId: stale.run.id,
+				taskId: "task-a",
+				queue: "default",
+				seq: 4,
+				delayMs: 0,
+				status: "queued",
+				updatedAt: stale.run.updatedAt,
+			},
 		]);
 		expect(res.map(r => r.runId)).not.toContain(fresh.run.id);
 	});
@@ -499,8 +522,17 @@ describe("RunStore: reconciler queries", () => {
 			[[orphan.owner.runId, blocked.owner.runId]]
 		);
 		const res = await f.runs.repairOrphanWaiting(10);
+		const orphanRun = await f.runs.get(orphan.owner.runId);
 		expect(res).toEqual([
-			{ runId: orphan.owner.runId, taskId: "task-a", queue: "default", seq: 2, delayMs: 0 },
+			{
+				runId: orphan.owner.runId,
+				taskId: "task-a",
+				queue: "default",
+				seq: 2,
+				delayMs: 0,
+				status: "waiting",
+				updatedAt: orphanRun?.updatedAt,
+			},
 		]);
 		const row = await rawRun(orphan.owner.runId);
 		expect(row?.run_after).toBeInstanceOf(Date);
@@ -518,10 +550,20 @@ describe("RunStore: reconciler queries", () => {
 		expect(new Set(stalled)).toEqual(new Set([retryable.owner.runId, exhausted.owner.runId]));
 
 		const r1 = await f.runs.recoverStalled(retryable.owner.runId, 60_000, ERR);
-		expect(r1).toMatchObject({ kind: "requeued", attempt: 2, enqueue: { seq: 2, delayMs: 0 } });
+		expect(r1).toMatchObject({
+			kind: "requeued",
+			attempt: 2,
+			enqueue: { seq: 2, delayMs: 0, status: "queued" },
+		});
 		const r2 = await f.runs.recoverStalled(exhausted.owner.runId, 60_000, ERR);
-		expect(r2).toEqual({ kind: "failed", parent: null, expireJobsToRemove: [] });
-		expect(await f.runs.get(exhausted.owner.runId)).toMatchObject({
+		const exhaustedRun = await f.runs.get(exhausted.owner.runId);
+		expect(r2).toEqual({
+			kind: "failed",
+			updatedAt: exhaustedRun?.updatedAt,
+			parent: null,
+			expireJobsToRemove: [],
+		});
+		expect(exhaustedRun).toMatchObject({
 			status: "failed",
 			executionId: null,
 		});

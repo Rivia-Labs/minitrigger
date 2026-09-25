@@ -105,10 +105,12 @@ export interface EnqueueRow {
 	queue: string;
 	enqueue_seq: number;
 	delay_ms: number;
+	status: RunStatus;
+	updated_at: Date;
 }
 
 /** RETURNING list producing an {@link EnqueueRow}. */
-export const ENQUEUE_RETURNING = `id, task_id, queue, enqueue_seq, ${DELAY_MS_SQL} AS delay_ms`;
+export const ENQUEUE_RETURNING = `id, task_id, queue, enqueue_seq, status, updated_at, ${DELAY_MS_SQL} AS delay_ms`;
 
 export function mapEnqueue(row: EnqueueRow): EnqueueRequest {
 	return {
@@ -117,6 +119,8 @@ export function mapEnqueue(row: EnqueueRow): EnqueueRequest {
 		queue: row.queue,
 		seq: row.enqueue_seq,
 		delayMs: row.delay_ms,
+		status: row.status,
+		updatedAt: row.updated_at,
 	};
 }
 
@@ -240,21 +244,27 @@ interface LockedChildRow {
 	enqueue_seq: number;
 }
 
-/** Sets the given (already locked, non-terminal) runs to `canceled`. */
+/**
+ * Sets the given (already locked, non-terminal) runs to `canceled`. Returns each canceled run's
+ * new `updated_at` (Phase 7 perf: so callers can fill {@link CanceledRun.updatedAt} without a
+ * separate `runs.get`).
+ */
 export async function markCanceled(
 	db: Db,
 	ctx: SqlContext,
 	ids: readonly string[],
 	reason: string
-): Promise<void> {
-	if (ids.length === 0) return;
-	await db.query(
+): Promise<Map<string, Date>> {
+	if (ids.length === 0) return new Map();
+	const { rows } = await db.query<{ id: string; updated_at: Date }>(
 		`UPDATE ${ctx.t("runs")}
 		 SET status = 'canceled', execution_id = NULL, run_after = NULL, finished_at = now(),
 		     error = $2::jsonb, updated_at = now()
-		 WHERE id = ANY($1::uuid[]) AND status NOT IN ${TERMINAL_SQL}`,
+		 WHERE id = ANY($1::uuid[]) AND status NOT IN ${TERMINAL_SQL}
+		 RETURNING id, updated_at`,
 		[ids, jsonParam(canceledError(reason))]
 	);
+	return new Map(rows.map(r => [r.id, r.updated_at]));
 }
 
 /**
@@ -288,18 +298,21 @@ export async function cancelDescendants(
 		const fresh = level.filter(row => !visited.has(row.id));
 		for (const row of fresh) visited.add(row.id);
 		const toCancel = fresh.filter(row => !isTerminal(row.status));
-		await markCanceled(
+		const updatedAt = await markCanceled(
 			db,
 			ctx,
 			toCancel.map(row => row.id),
 			reason
 		);
 		for (const row of toCancel) {
+			const at = updatedAt.get(row.id);
+			if (!at) throw new Error(`cancelDescendants: run ${row.id} was not updated`);
 			canceled.push({
 				runId: row.id,
 				queue: row.queue,
 				enqueueSeq: row.enqueue_seq,
 				previousStatus: row.status as CanceledRun["previousStatus"],
+				updatedAt: at,
 			});
 		}
 		level = await lockChildLevel(

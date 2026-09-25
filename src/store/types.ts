@@ -188,6 +188,13 @@ export interface EnqueueRequest {
 	seq: number;
 	/** Computed by the DB from `run_after - now()`, clamped to >= 0. */
 	delayMs: number;
+	/**
+	 * The run's status at the moment this was computed (Phase 7 perf: `queued` for a fresh
+	 * enqueue, `waiting` for a resume/sleep). Lets the caller publish it without a `runs.get`.
+	 */
+	status: RunStatus;
+	/** The run row's `updated_at` at the moment this was computed (same DB write, no `runs.get`). */
+	updatedAt: Date;
 }
 
 /**
@@ -208,6 +215,8 @@ export interface CanceledRun {
 	queue: string;
 	enqueueSeq: number;
 	previousStatus: "queued" | "running" | "waiting";
+	/** The run row's `updated_at` after this cancel (status is always `canceled`; no `runs.get` needed). */
+	updatedAt: Date;
 }
 
 // ---------------------------------------------------------------------------
@@ -273,7 +282,9 @@ export type TriggerChildrenResult =
 	| Lost;
 
 export type SuspendResult =
-	| { kind: "waiting_on_waitpoints" }
+	// `kind` isn't a `RunStatus` here (unlike `sleeping`/`requeued`, whose status lives on
+	// `enqueue`), so the actual status ("waiting") is spelled out for the caller.
+	| { kind: "waiting_on_waitpoints"; status: "waiting"; updatedAt: Date }
 	| { kind: "sleeping"; enqueue: EnqueueRequest }
 	| { kind: "requeued"; enqueue: EnqueueRequest }
 	| Lost;
@@ -281,13 +292,24 @@ export type SuspendResult =
 /**
  * `expireJobsToRemove`: the finished run's own waitpoints that were still `pending` with
  * `expires_at` and are now `timed_out` (as {@link CancelRunResult}); the caller removes
- * `wp-${id}-expire` best-effort after commit.
+ * `wp-${id}-expire` best-effort after commit. `updatedAt` is the run row's `updated_at` from the
+ * same write (`kind` is already its new status; Phase 7 perf: no `runs.get` needed).
  */
 export type CompleteRunResult =
-	| { kind: "completed"; parent: WaitpointResolution | null; expireJobsToRemove: string[] }
+	| {
+			kind: "completed";
+			updatedAt: Date;
+			parent: WaitpointResolution | null;
+			expireJobsToRemove: string[];
+	  }
 	| Lost;
 export type FailRunResult =
-	| { kind: "failed"; parent: WaitpointResolution | null; expireJobsToRemove: string[] }
+	| {
+			kind: "failed";
+			updatedAt: Date;
+			parent: WaitpointResolution | null;
+			expireJobsToRemove: string[];
+	  }
 	| Lost;
 export type RetryRunResult = { kind: "retrying"; attempt: number; enqueue: EnqueueRequest } | Lost;
 export type ReleaseRunResult = { kind: "released"; enqueue: EnqueueRequest } | Lost;
@@ -311,7 +333,12 @@ export type CancelRunResult =
 export type RecoverStalledResult =
 	| { kind: "not_stalled" }
 	| { kind: "requeued"; attempt: number; enqueue: EnqueueRequest }
-	| { kind: "failed"; parent: WaitpointResolution | null; expireJobsToRemove: string[] };
+	| {
+			kind: "failed";
+			updatedAt: Date;
+			parent: WaitpointResolution | null;
+			expireJobsToRemove: string[];
+	  };
 
 export interface ChildResult {
 	runId: string;

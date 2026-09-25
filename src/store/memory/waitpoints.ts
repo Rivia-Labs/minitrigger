@@ -43,11 +43,10 @@ export function createWaitpointStore(exec: Exec): WaitpointStore {
 							`createToken: step "${token.name}" of run ${runId} already has a ${row.kind} waitpoint`
 						);
 					}
-					// `greatest(0, NULL)` is 0 in Postgres: a pending token without timeout reports 0.
 					delay =
 						row.status === "pending"
 							? row.expiresAt === null
-								? 0
+								? null
 								: delayMs(row.expiresAt, tx.now)
 							: null;
 				} else {
@@ -66,7 +65,7 @@ export function createWaitpointStore(exec: Exec): WaitpointStore {
 						resolvedAt: null,
 					};
 					tx.set(tx.db.waitpoints, id, row);
-					delay = row.expiresAt === null ? 0 : delayMs(row.expiresAt, tx.now);
+					delay = row.expiresAt === null ? null : delayMs(row.expiresAt, tx.now);
 				}
 				insertStep(
 					tx,

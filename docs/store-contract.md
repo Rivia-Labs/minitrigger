@@ -17,7 +17,28 @@ the SQL shape it must use. `$schema` is always `escapeIdentifier(schema)`.
   parent, then lock/update the run and re-validate.
 - **Time** (dec. 17): every timestamp comes from `now()`; every returned `delayMs` is
   `greatest(0, round(extract(epoch from run_after - now()) * 1000))` computed in the same SQL.
-  Intervals from ms: `now() + $n * interval '1 millisecond'`.
+  Intervals from ms: `now() + $n * interval '1 millisecond'`. `run_after` is never NULL where
+  `delayMs` is computed from it, so this shape is safe there. `expiresAt`/`expireDelayMs`
+  (`triggerChildren`'s `waitpoint`, `WaitpointStore.createToken`) are different: `expires_at` CAN be
+  NULL (no timeout), and `greatest(0, NULL)` is **0**, not NULL, in Postgres (`GREATEST`/`LEAST`
+  ignore NULL arguments and only return NULL when every argument is NULL). Their SQL must be
+  `CASE WHEN expires_at IS NULL THEN NULL ELSE greatest(0, round(extract(epoch from
+  (expires_at - now())) * 1000)) END` so a waitpoint without a timeout reports `expireDelayMs:
+  null`, never `0` (which would make the caller schedule a `wp-${id}-expire` job that fires
+  immediately). The in-memory store mirrors this explicitly instead of computing `greatest`.
+- **`EnqueueRequest`/`CanceledRun`/transition results carry `updatedAt` (and `status` where it
+  isn't already implied by `kind`)** (Phase 7 perf): every `RunStore`/`WaitpointStore` method that
+  changes a run's status returns that row's new `status`/`updated_at` from the same write, so
+  callers (the engine's `RunNotifier`) never need an extra `runs.get` per transition. Concretely:
+  `EnqueueRequest` (used by `create`'s `enqueue`, `triggerChildren`'s per-child `enqueue`, `retry`,
+  `release`, `suspend`'s `sleeping`/`requeued`, `recoverStalled`'s `requeued`,
+  `listStaleQueued`/`listStaleWaiting`/`repairOrphanWaiting`, and `WaitpointResolution.resume`) now
+  has `status`/`updatedAt`; `CanceledRun` (one per canceled run in `CancelRunResult`) has
+  `updatedAt` (status is always `canceled`); `CompleteRunResult`/`FailRunResult`/
+  `RecoverStalledResult`'s `failed` variant have a top-level `updatedAt` (`kind` is already the new
+  status: `completed`/`failed`); `SuspendResult`'s `waiting_on_waitpoints` variant has both `status:
+  "waiting"` and `updatedAt` (its `kind` string is not a `RunStatus`, unlike `sleeping`/`requeued`
+  whose status lives on `enqueue`).
 - **Ownership guard** (dec. 5): `EXISTS (SELECT 1 FROM runs WHERE id=$1 AND execution_id=$2 AND
   status='running' FOR SHARE)` for writes to other tables; for writes to the run row itself, the
   same predicate in the `UPDATE ... WHERE`. rowCount 0 → return `{ kind: "lost" }` / `"lost"`.

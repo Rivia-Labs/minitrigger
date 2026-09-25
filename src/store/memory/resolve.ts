@@ -68,6 +68,8 @@ export function enqueueOf(row: RunRow, now: number): EnqueueRequest {
 		queue: row.queue,
 		seq: row.enqueueSeq,
 		delayMs: row.runAfter === null ? 0 : delayMs(row.runAfter, now),
+		status: row.status,
+		updatedAt: toDate(row.updatedAt),
 	};
 }
 
@@ -224,6 +226,7 @@ export function cancelDescendants(
 				queue: r.queue,
 				enqueueSeq: r.enqueueSeq,
 				previousStatus: r.status as CanceledRun["previousStatus"],
+				updatedAt: toDate(tx.now),
 			});
 		}
 		level = childLevel(tx, new Set(fresh.map(r => r.id)));

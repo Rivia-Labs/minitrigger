@@ -19,9 +19,15 @@ import {
 	timeOutWaitpointsOf,
 } from "./resolve.js";
 
-/** Remaining time until `expires_at` in ms (DB clock, decision 17); NULL without `expires_at`. */
+/**
+ * Remaining time until `expires_at` in ms (DB clock, decision 17); NULL without `expires_at`.
+ * `greatest(0, NULL)` alone would be 0 in Postgres (GREATEST/LEAST ignore NULL arguments), so the
+ * NULL case is handled explicitly instead.
+ */
 const EXPIRE_DELAY_SQL =
-	"greatest(0, round(extract(epoch from (expires_at - now())) * 1000))::float8";
+	"CASE WHEN expires_at IS NULL THEN NULL " +
+	"ELSE greatest(0, round(extract(epoch from (expires_at - now())) * 1000)) " +
+	"END::float8";
 
 export function createWaitpointStore(exec: SqlExecutor, ctx: SqlContext): WaitpointStore {
 	const runs = ctx.t("runs");

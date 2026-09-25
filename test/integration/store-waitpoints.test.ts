@@ -149,8 +149,12 @@ describe("WaitpointStore: tokens", () => {
 		const a = await f.running();
 		const withExpiry = await token(a.owner, "t0", 60_000);
 		const noExpiry = await token(a.owner, "t1");
-		expect(await f.runs.fail(a.owner, ERR)).toEqual({
+		const failRes = await f.runs.fail(a.owner, ERR);
+		if (failRes.kind !== "failed") throw new Error("expected failed");
+		const aRun = await f.runs.get(a.owner.runId);
+		expect(failRes).toEqual({
 			kind: "failed",
+			updatedAt: aRun?.updatedAt,
 			parent: null,
 			expireJobsToRemove: [withExpiry.waitpointId],
 		});
@@ -190,7 +194,7 @@ describe("WaitpointStore: tokens", () => {
 		const { owner } = await f.running();
 		const a = await token(owner, "t0", 60_000);
 		const b = await token(owner, "t1");
-		expect(await f.runs.suspend(owner)).toEqual({ kind: "waiting_on_waitpoints" });
+		expect(await f.runs.suspend(owner)).toMatchObject({ kind: "waiting_on_waitpoints" });
 		const results = await Promise.all([
 			f.waitpoints.completeToken(a.waitpointId, "a"),
 			f.waitpoints.completeToken(b.waitpointId, "b"),
@@ -288,7 +292,7 @@ describe("WaitpointStore: tokens", () => {
 		const b = await f.running();
 		await token(b.owner, "t0", null, true);
 		await sleepStep(b.owner.runId, "nap", 1, 60_000);
-		expect(await f.runs.suspend(b.owner)).toEqual({ kind: "waiting_on_waitpoints" });
+		expect(await f.runs.suspend(b.owner)).toMatchObject({ kind: "waiting_on_waitpoints" });
 	});
 
 	it("token + future sleep: completing the token resumes at the sleep's wake_at", async () => {
@@ -359,8 +363,15 @@ describe("RunStore.suspend (decision 3)", () => {
 		const { owner } = await f.running();
 		await token(owner, "t0");
 		await sleepStep(owner.runId, "nap", 1, 60_000);
-		expect(await f.runs.suspend(owner)).toEqual({ kind: "waiting_on_waitpoints" });
-		expect(await f.runs.get(owner.runId)).toMatchObject({
+		const suspended = await f.runs.suspend(owner);
+		const afterSuspend = await f.runs.get(owner.runId);
+		// Phase 7 perf: `suspend`'s `waiting_on_waitpoints` carries the row's own status/updatedAt.
+		expect(suspended).toEqual({
+			kind: "waiting_on_waitpoints",
+			status: "waiting",
+			updatedAt: afterSuspend?.updatedAt,
+		});
+		expect(afterSuspend).toMatchObject({
 			status: "waiting",
 			runAfter: null,
 			executionId: null,
@@ -371,7 +382,7 @@ describe("RunStore.suspend (decision 3)", () => {
 	it("waiting_on_waitpoints bumps enqueue_seq: a stale redelivery of the old job cannot acquire", async () => {
 		const { run, owner } = await f.running();
 		await token(owner, "t0");
-		expect(await f.runs.suspend(owner)).toEqual({ kind: "waiting_on_waitpoints" });
+		expect(await f.runs.suspend(owner)).toMatchObject({ kind: "waiting_on_waitpoints" });
 		expect(await f.runs.acquire(owner.runId, randomUUID(), run.enqueueSeq)).toBeNull();
 		expect(await f.runs.get(owner.runId)).toMatchObject({
 			status: "waiting",
@@ -418,7 +429,7 @@ describe("Child resolution (decision 10)", () => {
 	async function waitingParentWithChild() {
 		const parent = await f.running({ taskId: "parent" });
 		const { waitpointId, childIds } = await spawn(parent.owner, "wait", 1);
-		expect(await f.runs.suspend(parent.owner)).toEqual({ kind: "waiting_on_waitpoints" });
+		expect(await f.runs.suspend(parent.owner)).toMatchObject({ kind: "waiting_on_waitpoints" });
 		const childOwner = await f.acquire(childIds[0] ?? "");
 		return { parent, waitpointId, childOwner };
 	}
@@ -475,8 +486,12 @@ describe("Child resolution (decision 10)", () => {
 		await f.sql(`UPDATE ${f.t("waitpoints")} SET status = 'timed_out' WHERE id = $1`, [
 			waitpointId,
 		]);
-		expect(await f.runs.complete(childOwner, 1)).toEqual({
+		const completeRes = await f.runs.complete(childOwner, 1);
+		if (completeRes.kind !== "completed") throw new Error("expected completed");
+		const childRun = await f.runs.get(childOwner.runId);
+		expect(completeRes).toEqual({
 			kind: "completed",
+			updatedAt: childRun?.updatedAt,
 			parent: null,
 			expireJobsToRemove: [],
 		});
@@ -487,8 +502,11 @@ describe("Child resolution (decision 10)", () => {
 		const { waitpointId, childIds } = await spawn(parent.owner, "wait", 1);
 		const childOwner = await f.acquire(childIds[0] ?? "");
 		const res = await f.runs.complete(childOwner, 1);
+		if (res.kind !== "completed") throw new Error("expected completed");
+		const childRun = await f.runs.get(childOwner.runId);
 		expect(res).toEqual({
 			kind: "completed",
+			updatedAt: childRun?.updatedAt,
 			parent: { waitpointId, hasExpireJob: false, resume: null },
 			expireJobsToRemove: [],
 		});

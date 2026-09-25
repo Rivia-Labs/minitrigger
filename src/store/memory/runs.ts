@@ -40,6 +40,7 @@ import {
 	type MemTx,
 	type RunRow,
 	sqlLimit,
+	toDate,
 	toJsonb,
 	truncMs,
 	uniqueViolation,
@@ -126,7 +127,12 @@ function createOnce(tx: MemTx, input: NewRun): CreateOnce {
 
 type Finished =
 	| { lost: true }
-	| { lost: false; parent: WaitpointResolution | null; expireJobsToRemove: string[] };
+	| {
+			lost: false;
+			updatedAt: Date;
+			parent: WaitpointResolution | null;
+			expireJobsToRemove: string[];
+	  };
 
 function finish(
 	tx: MemTx,
@@ -150,6 +156,7 @@ function finish(
 	const wp = row.parentWaitpointId;
 	return {
 		lost: false,
+		updatedAt: toDate(tx.now),
 		parent: wp ? resolveChildWaitpoint(tx, wp) : null,
 		expireJobsToRemove,
 	};
@@ -200,8 +207,7 @@ export function createRunStore(exec: Exec): RunStore {
 					waitpoint = {
 						id,
 						expiresAt: expiresAt === null ? null : new Date(expiresAt),
-						// `greatest(0, NULL)` is 0 in Postgres: no timeout still reports 0 (SQL parity).
-						expireDelayMs: expiresAt === null ? 0 : delayMs(expiresAt, tx.now),
+						expireDelayMs: expiresAt === null ? null : delayMs(expiresAt, tx.now),
 					};
 				}
 
@@ -291,14 +297,24 @@ export function createRunStore(exec: Exec): RunStore {
 			const r = await exec.run(tx => finish(tx, owner, "completed", output, null));
 			return r.lost
 				? { kind: "lost" }
-				: { kind: "completed", parent: r.parent, expireJobsToRemove: r.expireJobsToRemove };
+				: {
+						kind: "completed",
+						updatedAt: r.updatedAt,
+						parent: r.parent,
+						expireJobsToRemove: r.expireJobsToRemove,
+					};
 		},
 
 		async fail(owner, error) {
 			const r = await exec.run(tx => finish(tx, owner, "failed", null, error));
 			return r.lost
 				? { kind: "lost" }
-				: { kind: "failed", parent: r.parent, expireJobsToRemove: r.expireJobsToRemove };
+				: {
+						kind: "failed",
+						updatedAt: r.updatedAt,
+						parent: r.parent,
+						expireJobsToRemove: r.expireJobsToRemove,
+					};
 		},
 
 		retry(owner, error, backoffMs) {
@@ -345,7 +361,7 @@ export function createRunStore(exec: Exec): RunStore {
 						enqueueSeq: row.enqueueSeq + 1,
 						updatedAt: tx.now,
 					});
-					return { kind: "waiting_on_waitpoints" };
+					return { kind: "waiting_on_waitpoints", status: "waiting", updatedAt: toDate(tx.now) };
 				}
 				const wake = maxWakeAt(tx, row.id);
 				const sleeping = wake !== null && wake > tx.now;
@@ -376,6 +392,7 @@ export function createRunStore(exec: Exec): RunStore {
 						queue: root.queue,
 						enqueueSeq: root.enqueueSeq,
 						previousStatus: root.status as CanceledRun["previousStatus"],
+						updatedAt: toDate(tx.now),
 					},
 				];
 				canceled.push(...cancelDescendants(tx, { parentRunIds: [id] }, reason));
@@ -544,6 +561,7 @@ export function createRunStore(exec: Exec): RunStore {
 				const wp = row.parentWaitpointId;
 				return {
 					kind: "failed",
+					updatedAt: toDate(tx.now),
 					parent: wp ? resolveChildWaitpoint(tx, wp) : null,
 					expireJobsToRemove,
 				};

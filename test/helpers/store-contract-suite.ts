@@ -218,12 +218,16 @@ export function defineStoreContractSuite(get: () => StoreHarness): void {
 			const retried = await s().runs.retry(owner, ERR, 0);
 			if (retried.kind !== "retrying") throw new Error("retry lost");
 			const again = await acquire(owner.runId);
-			expect(await s().runs.complete(again, [1, "two", { three: 3 }])).toEqual({
+			const res = await s().runs.complete(again, [1, "two", { three: 3 }]);
+			if (res.kind !== "completed") throw new Error("expected completed");
+			const run = await s().runs.get(owner.runId);
+			// Phase 7 perf: the result's `updatedAt` is the same DB write, no extra `runs.get`.
+			expect(res).toEqual({
 				kind: "completed",
+				updatedAt: run?.updatedAt,
 				parent: null,
 				expireJobsToRemove: [],
 			});
-			const run = await s().runs.get(owner.runId);
 			expect(run).toMatchObject({
 				status: "completed",
 				output: [1, "two", { three: 3 }],
@@ -237,13 +241,17 @@ export function defineStoreContractSuite(get: () => StoreHarness): void {
 
 		it("fail stores the error; a second write from the same execution is lost", async () => {
 			const { owner } = await running();
-			expect(await s().runs.fail(owner, ERR)).toEqual({
+			const res = await s().runs.fail(owner, ERR);
+			if (res.kind !== "failed") throw new Error("expected failed");
+			const run = await s().runs.get(owner.runId);
+			expect(res).toEqual({
 				kind: "failed",
+				updatedAt: run?.updatedAt,
 				parent: null,
 				expireJobsToRemove: [],
 			});
-			expect((await s().runs.get(owner.runId))?.error).toEqual(ERR);
-			expect((await s().runs.get(owner.runId))?.output).toBeNull();
+			expect(run?.error).toEqual(ERR);
+			expect(run?.output).toBeNull();
 			expect(await s().runs.complete(owner, 1)).toEqual({ kind: "lost" });
 		});
 
@@ -255,23 +263,32 @@ export function defineStoreContractSuite(get: () => StoreHarness): void {
 			expect(res.enqueue.seq).toBe(2);
 			expect(res.enqueue.delayMs).toBeGreaterThan(1_000);
 			expect(res.enqueue.delayMs).toBeLessThanOrEqual(2_000);
-			expect(await s().runs.get(owner.runId)).toMatchObject({
+			const run = await s().runs.get(owner.runId);
+			expect(run).toMatchObject({
 				status: "queued",
 				executionId: null,
 				error: ERR,
 			});
+			// Phase 7 perf: `enqueue.status`/`updatedAt` come from the same write as `runs.get`.
+			expect(res.enqueue.status).toBe("queued");
+			expect(res.enqueue.updatedAt).toEqual(run?.updatedAt);
 			expect(await s().runs.retry(owner, ERR, 0)).toEqual({ kind: "lost" });
 		});
 
 		it("release keeps attempt, bumps seq; the zombie cannot write", async () => {
 			const { owner } = await running();
 			const res = await s().runs.release(owner);
-			expect(res).toMatchObject({ kind: "released", enqueue: { seq: 2, delayMs: 0 } });
-			expect(await s().runs.get(owner.runId)).toMatchObject({
+			expect(res).toMatchObject({
+				kind: "released",
+				enqueue: { seq: 2, delayMs: 0, status: "queued" },
+			});
+			const run = await s().runs.get(owner.runId);
+			expect(run).toMatchObject({
 				status: "queued",
 				attempt: 1,
 				executionId: null,
 			});
+			if (res.kind === "released") expect(res.enqueue.updatedAt).toEqual(run?.updatedAt);
 			expect(await s().runs.complete(owner, null)).toEqual({ kind: "lost" });
 			expect(await s().runs.heartbeat(owner.runId, owner.executionId, 1_000)).toBe("lost");
 			expect(await s().runs.suspend(owner)).toEqual({ kind: "lost" });
@@ -283,10 +300,17 @@ export function defineStoreContractSuite(get: () => StoreHarness): void {
 		it("cancel then complete -> lost; already_finished; not_found", async () => {
 			const { owner } = await running();
 			const res = await s().runs.cancel(owner.runId, "user asked");
+			const run = await s().runs.get(owner.runId);
 			expect(res).toEqual({
 				kind: "canceled",
 				canceled: [
-					{ runId: owner.runId, queue: "default", previousStatus: "running", enqueueSeq: 1 },
+					{
+						runId: owner.runId,
+						queue: "default",
+						previousStatus: "running",
+						enqueueSeq: 1,
+						updatedAt: run?.updatedAt,
+					},
 				],
 				parent: null,
 				expireJobsToRemove: [],
@@ -327,10 +351,20 @@ export function defineStoreContractSuite(get: () => StoreHarness): void {
 			const { owner } = await running();
 			const { childIds, res } = await spawn(owner, "trigger");
 			expect(res.waitpoint).toBeNull();
+			const child = await s().runs.get(childIds[0] ?? "");
+			// Phase 7 perf: each child's enqueue already carries its status/updatedAt (no `runs.get`).
 			expect(res.enqueue).toEqual([
-				{ runId: childIds[0], taskId: "child-task", queue: "default", seq: 1, delayMs: 0 },
+				{
+					runId: childIds[0],
+					taskId: "child-task",
+					queue: "default",
+					seq: 1,
+					delayMs: 0,
+					status: "queued",
+					updatedAt: child?.updatedAt,
+				},
 			]);
-			expect(await s().runs.get(childIds[0] ?? "")).toMatchObject({
+			expect(child).toMatchObject({
 				parentRunId: owner.runId,
 				parentWaitpointId: null,
 				parentStepName: "sub",
@@ -378,10 +412,10 @@ export function defineStoreContractSuite(get: () => StoreHarness): void {
 			);
 		});
 
-		it("wait mode without timeout: expireDelayMs is 0 (greatest(0, NULL)), expiresAt null", async () => {
+		it("wait mode without timeout: expireDelayMs is null (not greatest(0, NULL)), expiresAt null", async () => {
 			const { owner } = await running();
 			const { res, waitpointId } = await spawn(owner, "wait");
-			expect(res.waitpoint).toEqual({ id: waitpointId, expiresAt: null, expireDelayMs: 0 });
+			expect(res.waitpoint).toEqual({ id: waitpointId, expiresAt: null, expireDelayMs: null });
 			const steps = await s().steps.list(owner.runId);
 			expect(steps.map(x => [x.kind, x.status, x.output])).toEqual([
 				["trigger_wait", "waiting", { waitpointId }],
@@ -484,7 +518,9 @@ export function defineStoreContractSuite(get: () => StoreHarness): void {
 		it("canceling a child resolves the parent's waitpoint and resumes the waiting parent", async () => {
 			const parent = await running({ taskId: "parent" });
 			const { waitpointId, childIds } = await spawn(parent.owner, "wait", 1);
-			expect(await s().runs.suspend(parent.owner)).toEqual({ kind: "waiting_on_waitpoints" });
+			expect(await s().runs.suspend(parent.owner)).toMatchObject({
+				kind: "waiting_on_waitpoints",
+			});
 			const res = await s().runs.cancel(childIds[0] ?? "", "nope");
 			if (res.kind !== "canceled") throw new Error("expected canceled");
 			expect(res.parent).toMatchObject({
@@ -562,8 +598,19 @@ export function defineStoreContractSuite(get: () => StoreHarness): void {
 			await get().advance(60_000);
 			const fresh = await s().runs.create(newRun());
 			const res = await s().runs.listStaleQueued(30_000, 10);
+			// Fetched after `advance()`: the SQL store shifts stored `updated_at` back, the memory
+			// store moves its clock forward instead, so only a fresh read is comparable either way.
+			const staleRow = await s().runs.get(stale.run.id);
 			expect(res).toEqual([
-				{ runId: stale.run.id, taskId: "task-a", queue: "default", seq: 1, delayMs: 0 },
+				{
+					runId: stale.run.id,
+					taskId: "task-a",
+					queue: "default",
+					seq: 1,
+					delayMs: 0,
+					status: "queued",
+					updatedAt: staleRow?.updatedAt,
+				},
 			]);
 			expect(res.map(r => r.runId)).not.toContain(fresh.run.id);
 		});
@@ -575,11 +622,20 @@ export function defineStoreContractSuite(get: () => StoreHarness): void {
 			expect((await s().runs.suspend(a.owner)).kind).toBe("sleeping");
 			await token(b.owner, "t0");
 			await sleepStep(b.owner, "nap", 1, 1_000);
-			expect(await s().runs.suspend(b.owner)).toEqual({ kind: "waiting_on_waitpoints" });
+			expect(await s().runs.suspend(b.owner)).toMatchObject({ kind: "waiting_on_waitpoints" });
 			await get().advance(60_000);
 			const res = await s().runs.listStaleWaiting(30_000, 10);
+			const aRow = await s().runs.get(a.owner.runId);
 			expect(res).toEqual([
-				{ runId: a.owner.runId, taskId: "task-a", queue: "default", seq: 2, delayMs: 0 },
+				{
+					runId: a.owner.runId,
+					taskId: "task-a",
+					queue: "default",
+					seq: 2,
+					delayMs: 0,
+					status: "waiting",
+					updatedAt: aRow?.updatedAt,
+				},
 			]);
 		});
 
@@ -592,12 +648,23 @@ export function defineStoreContractSuite(get: () => StoreHarness): void {
 				executionId: null,
 				runAfter: null,
 			});
-			expect(await s().runs.suspend(blocked.owner)).toEqual({ kind: "waiting_on_waitpoints" });
+			expect(await s().runs.suspend(blocked.owner)).toMatchObject({
+				kind: "waiting_on_waitpoints",
+			});
 			const res = await s().runs.repairOrphanWaiting(10);
+			const orphanRow = await s().runs.get(orphan.owner.runId);
 			expect(res).toEqual([
-				{ runId: orphan.owner.runId, taskId: "task-a", queue: "default", seq: 2, delayMs: 0 },
+				{
+					runId: orphan.owner.runId,
+					taskId: "task-a",
+					queue: "default",
+					seq: 2,
+					delayMs: 0,
+					status: "waiting",
+					updatedAt: orphanRow?.updatedAt,
+				},
 			]);
-			expect((await s().runs.get(orphan.owner.runId))?.runAfter).toBeInstanceOf(Date);
+			expect(orphanRow?.runAfter).toBeInstanceOf(Date);
 			expect(await s().runs.repairOrphanWaiting(10)).toEqual([]);
 		});
 
@@ -611,10 +678,20 @@ export function defineStoreContractSuite(get: () => StoreHarness): void {
 			expect(new Set(stalled)).toEqual(new Set([retryable.owner.runId, exhausted.owner.runId]));
 
 			const r1 = await s().runs.recoverStalled(retryable.owner.runId, 60_000, ERR);
-			expect(r1).toMatchObject({ kind: "requeued", attempt: 2, enqueue: { seq: 2, delayMs: 0 } });
+			expect(r1).toMatchObject({
+				kind: "requeued",
+				attempt: 2,
+				enqueue: { seq: 2, delayMs: 0, status: "queued" },
+			});
 			const r2 = await s().runs.recoverStalled(exhausted.owner.runId, 60_000, ERR);
-			expect(r2).toEqual({ kind: "failed", parent: null, expireJobsToRemove: [] });
-			expect(await s().runs.get(exhausted.owner.runId)).toMatchObject({
+			const exhaustedRun = await s().runs.get(exhausted.owner.runId);
+			expect(r2).toEqual({
+				kind: "failed",
+				updatedAt: exhaustedRun?.updatedAt,
+				parent: null,
+				expireJobsToRemove: [],
+			});
+			expect(exhaustedRun).toMatchObject({
 				status: "failed",
 				executionId: null,
 				error: ERR,
@@ -680,8 +757,12 @@ export function defineStoreContractSuite(get: () => StoreHarness): void {
 				parentStepName: "c",
 			});
 			const childOwner = await acquire(childIds[0] ?? "");
-			expect(await s().runs.complete(childOwner, 1)).toEqual({
+			const completeRes = await s().runs.complete(childOwner, 1);
+			if (completeRes.kind !== "completed") throw new Error("expected completed");
+			const childRun = await s().runs.get(childOwner.runId);
+			expect(completeRes).toEqual({
 				kind: "completed",
+				updatedAt: childRun?.updatedAt,
 				parent: null,
 				expireJobsToRemove: [],
 			});
@@ -698,12 +779,15 @@ export function defineStoreContractSuite(get: () => StoreHarness): void {
 			const result = await s().runs.create(input);
 			if (result.kind !== "created") throw new Error("expected created");
 			expect(result.run.id).toBe(input.id);
+			// Phase 7 perf: `enqueue.status`/`updatedAt` mirror `result.run` from the same insert.
 			expect(result.enqueue).toEqual({
 				runId: input.id,
 				taskId: "task-a",
 				queue: "default",
 				seq: 1,
 				delayMs: 0,
+				status: "queued",
+				updatedAt: result.run.updatedAt,
 			});
 			expect((await s().idempotency.find("task-a", "k-new"))?.runId).toBe(input.id);
 		});
@@ -837,10 +921,10 @@ export function defineStoreContractSuite(get: () => StoreHarness): void {
 			expect(lost).toEqual({ kind: "lost" });
 		});
 
-		it("createToken without timeout reports expireDelayMs 0 (greatest(0, NULL))", async () => {
+		it("createToken without timeout reports expireDelayMs null (not greatest(0, NULL))", async () => {
 			const { owner } = await running();
 			const { res } = await token(owner, "t0", null, false);
-			expect(res).toMatchObject({ expiresAt: null, expireDelayMs: 0 });
+			expect(res).toMatchObject({ expiresAt: null, expireDelayMs: null });
 		});
 
 		it("createToken is idempotent by (run_id, step_name)", async () => {
@@ -879,8 +963,12 @@ export function defineStoreContractSuite(get: () => StoreHarness): void {
 			const a = await running();
 			const withExpiry = await token(a.owner, "t0", 60_000);
 			const noExpiry = await token(a.owner, "t1");
-			expect(await s().runs.fail(a.owner, ERR)).toEqual({
+			const failRes = await s().runs.fail(a.owner, ERR);
+			if (failRes.kind !== "failed") throw new Error("expected failed");
+			const aRun = await s().runs.get(a.owner.runId);
+			expect(failRes).toEqual({
 				kind: "failed",
+				updatedAt: aRun?.updatedAt,
 				parent: null,
 				expireJobsToRemove: [withExpiry.waitpointId],
 			});
@@ -920,7 +1008,7 @@ export function defineStoreContractSuite(get: () => StoreHarness): void {
 			const { owner } = await running();
 			const a = await token(owner, "t0", 60_000);
 			const b = await token(owner, "t1");
-			expect(await s().runs.suspend(owner)).toEqual({ kind: "waiting_on_waitpoints" });
+			expect(await s().runs.suspend(owner)).toMatchObject({ kind: "waiting_on_waitpoints" });
 			const results = await Promise.all([
 				s().waitpoints.completeToken(a.waitpointId, "a"),
 				s().waitpoints.completeToken(b.waitpointId, "b"),
@@ -1011,7 +1099,7 @@ export function defineStoreContractSuite(get: () => StoreHarness): void {
 			const b = await running();
 			await token(b.owner, "t0", null, true);
 			await sleepStep(b.owner, "nap", 1, 60_000);
-			expect(await s().runs.suspend(b.owner)).toEqual({ kind: "waiting_on_waitpoints" });
+			expect(await s().runs.suspend(b.owner)).toMatchObject({ kind: "waiting_on_waitpoints" });
 		});
 
 		it("token + future sleep: completing the token resumes at the sleep's wake_at", async () => {
@@ -1076,8 +1164,15 @@ export function defineStoreContractSuite(get: () => StoreHarness): void {
 			const { run, owner } = await running();
 			await token(owner, "t0");
 			await sleepStep(owner, "nap", 1, 60_000);
-			expect(await s().runs.suspend(owner)).toEqual({ kind: "waiting_on_waitpoints" });
-			expect(await s().runs.get(owner.runId)).toMatchObject({
+			const suspended = await s().runs.suspend(owner);
+			const afterSuspend = await s().runs.get(owner.runId);
+			// Phase 7 perf: `suspend`'s `waiting_on_waitpoints` carries the row's own status/updatedAt.
+			expect(suspended).toEqual({
+				kind: "waiting_on_waitpoints",
+				status: "waiting",
+				updatedAt: afterSuspend?.updatedAt,
+			});
+			expect(afterSuspend).toMatchObject({
 				status: "waiting",
 				runAfter: null,
 				executionId: null,
@@ -1150,7 +1245,9 @@ export function defineStoreContractSuite(get: () => StoreHarness): void {
 		async function waitingParentWithChild(timeoutMs: number | null = null) {
 			const parent = await running({ taskId: "parent" });
 			const { waitpointId, childIds } = await spawn(parent.owner, "wait", 1, "s", timeoutMs);
-			expect(await s().runs.suspend(parent.owner)).toEqual({ kind: "waiting_on_waitpoints" });
+			expect(await s().runs.suspend(parent.owner)).toMatchObject({
+				kind: "waiting_on_waitpoints",
+			});
 			const childOwner = await acquire(childIds[0] ?? "");
 			return { parent, waitpointId, childOwner };
 		}
@@ -1194,15 +1291,23 @@ export function defineStoreContractSuite(get: () => StoreHarness): void {
 			// The parent finishes while its child runs: its own waitpoint times out (not canceled).
 			const parent = await running({ taskId: "parent" });
 			const { waitpointId, childIds } = await spawn(parent.owner, "wait", 1);
-			expect(await s().runs.complete(parent.owner, "early")).toEqual({
+			const parentComplete = await s().runs.complete(parent.owner, "early");
+			if (parentComplete.kind !== "completed") throw new Error("expected completed");
+			const parentRun = await s().runs.get(parent.owner.runId);
+			expect(parentComplete).toEqual({
 				kind: "completed",
+				updatedAt: parentRun?.updatedAt,
 				parent: null,
 				expireJobsToRemove: [],
 			});
 			expect((await s().waitpoints.getToken(waitpointId))?.status).toBe("timed_out");
 			const childOwner = await acquire(childIds[0] ?? "");
-			expect(await s().runs.complete(childOwner, 1)).toEqual({
+			const childComplete = await s().runs.complete(childOwner, 1);
+			if (childComplete.kind !== "completed") throw new Error("expected completed");
+			const childRun = await s().runs.get(childOwner.runId);
+			expect(childComplete).toEqual({
 				kind: "completed",
+				updatedAt: childRun?.updatedAt,
 				parent: null,
 				expireJobsToRemove: [],
 			});
@@ -1212,8 +1317,12 @@ export function defineStoreContractSuite(get: () => StoreHarness): void {
 			const parent = await running({ taskId: "parent" });
 			const { waitpointId, childIds } = await spawn(parent.owner, "wait", 1);
 			const childOwner = await acquire(childIds[0] ?? "");
-			expect(await s().runs.complete(childOwner, 1)).toEqual({
+			const res = await s().runs.complete(childOwner, 1);
+			if (res.kind !== "completed") throw new Error("expected completed");
+			const childRun = await s().runs.get(childOwner.runId);
+			expect(res).toEqual({
 				kind: "completed",
+				updatedAt: childRun?.updatedAt,
 				parent: { waitpointId, hasExpireJob: false, resume: null },
 				expireJobsToRemove: [],
 			});

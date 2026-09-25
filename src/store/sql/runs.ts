@@ -107,6 +107,8 @@ export function createRunStore(exec: SqlExecutor, ctx: SqlContext): RunStore {
 				queue: row.queue,
 				seq: row.enqueue_seq,
 				delayMs: row.delay_ms,
+				status: row.status,
+				updatedAt: row.updated_at,
 			},
 		};
 	}
@@ -127,17 +129,25 @@ export function createRunStore(exec: SqlExecutor, ctx: SqlContext): RunStore {
 		error: SerializedError | null
 	): Promise<
 		| { lost: true }
-		| { lost: false; parent: WaitpointResolution | null; expireJobsToRemove: string[] }
+		| {
+				lost: false;
+				updatedAt: Date;
+				parent: WaitpointResolution | null;
+				expireJobsToRemove: string[];
+		  }
 	> {
 		return atomic(exec, async db => {
 			const parent = await lockParentOf(db, ctx, owner.runId);
 			if (!parent) return { lost: true };
-			const { rows } = await db.query<{ parent_waitpoint_id: string | null }>(
+			const { rows } = await db.query<{
+				parent_waitpoint_id: string | null;
+				updated_at: Date;
+			}>(
 				`UPDATE ${runs}
 				 SET status = $3, output = $4::jsonb, error = $5::jsonb, finished_at = now(),
 				     run_after = NULL, execution_id = NULL, updated_at = now()
 				 WHERE ${OWNED}
-				 RETURNING parent_waitpoint_id`,
+				 RETURNING parent_waitpoint_id, updated_at`,
 				[
 					owner.runId,
 					owner.executionId,
@@ -154,6 +164,7 @@ export function createRunStore(exec: SqlExecutor, ctx: SqlContext): RunStore {
 			const wp = row.parent_waitpoint_id;
 			return {
 				lost: false,
+				updatedAt: row.updated_at,
 				parent: wp ? await resolveChildWaitpoint(db, ctx, wp) : null,
 				expireJobsToRemove,
 			};
@@ -193,8 +204,9 @@ export function createRunStore(exec: SqlExecutor, ctx: SqlContext): RunStore {
 						 VALUES ($1, $2, $3, $4, 'pending', $5,
 						   CASE WHEN $6::float8 IS NULL THEN NULL ELSE ${nowPlusMs("$6")} END)
 						 RETURNING expires_at,
-						   greatest(0, round(extract(epoch from (expires_at - now())) * 1000))::float8
-						     AS delay_ms`,
+						   CASE WHEN expires_at IS NULL THEN NULL
+						     ELSE greatest(0, round(extract(epoch from (expires_at - now())) * 1000))
+						   END::float8 AS delay_ms`,
 						[
 							input.waitpointId,
 							input.parent.runId,
@@ -305,14 +317,24 @@ export function createRunStore(exec: SqlExecutor, ctx: SqlContext): RunStore {
 			const r = await finish(owner, "completed", output, null);
 			return r.lost
 				? { kind: "lost" }
-				: { kind: "completed", parent: r.parent, expireJobsToRemove: r.expireJobsToRemove };
+				: {
+						kind: "completed",
+						updatedAt: r.updatedAt,
+						parent: r.parent,
+						expireJobsToRemove: r.expireJobsToRemove,
+					};
 		},
 
 		async fail(owner, error) {
 			const r = await finish(owner, "failed", null, error);
 			return r.lost
 				? { kind: "lost" }
-				: { kind: "failed", parent: r.parent, expireJobsToRemove: r.expireJobsToRemove };
+				: {
+						kind: "failed",
+						updatedAt: r.updatedAt,
+						parent: r.parent,
+						expireJobsToRemove: r.expireJobsToRemove,
+					};
 		},
 
 		async retry(owner, error, backoffMs) {
@@ -362,12 +384,15 @@ export function createRunStore(exec: SqlExecutor, ctx: SqlContext): RunStore {
 					// No enqueue, but still bump enqueue_seq so a stale redelivery of the job that
 					// started this execution (`${id}-${oldSeq}`) cannot re-acquire the waiting run
 					// (decision 5). The resolver's resume rule bumps it again before enqueuing.
-					await db.query(
+					const { rows: upd } = await db.query<{ updated_at: Date }>(
 						`UPDATE ${runs} SET status = 'waiting', run_after = NULL, execution_id = NULL,
-						   enqueue_seq = enqueue_seq + 1, updated_at = now() WHERE id = $1`,
+						   enqueue_seq = enqueue_seq + 1, updated_at = now() WHERE id = $1
+						 RETURNING updated_at`,
 						[owner.runId]
 					);
-					return { kind: "waiting_on_waitpoints" };
+					const updatedAt = upd[0]?.updated_at;
+					if (!updatedAt) throw new Error("suspend: locked run disappeared");
+					return { kind: "waiting_on_waitpoints", status: "waiting", updatedAt };
 				}
 				const sleeping = s?.sleeping === true;
 				const { rows } = await db.query<EnqueueRow>(
@@ -408,13 +433,16 @@ export function createRunStore(exec: SqlExecutor, ctx: SqlContext): RunStore {
 				if (isTerminal(root.status)) {
 					return { kind: "already_finished", status: root.status as TerminalRunStatus };
 				}
-				await markCanceled(db, ctx, [runId], reason);
+				const rootUpdatedAt = await markCanceled(db, ctx, [runId], reason);
+				const rootAt = rootUpdatedAt.get(runId);
+				if (!rootAt) throw new Error(`cancel: run ${runId} was not updated`);
 				const canceled: CanceledRun[] = [
 					{
 						runId,
 						queue: root.queue,
 						enqueueSeq: root.enqueue_seq,
 						previousStatus: root.status as CanceledRun["previousStatus"],
+						updatedAt: rootAt,
 					},
 				];
 				canceled.push(...(await cancelDescendants(db, ctx, { parentRunIds: [runId] }, reason)));
@@ -495,7 +523,8 @@ export function createRunStore(exec: SqlExecutor, ctx: SqlContext): RunStore {
 
 		async listStaleQueued(graceMs, limit) {
 			const { rows } = await direct(exec).query<EnqueueRow>(
-				`SELECT id, task_id, queue, enqueue_seq, 0::float8 AS delay_ms FROM ${runs}
+				`SELECT id, task_id, queue, enqueue_seq, status, updated_at, 0::float8 AS delay_ms
+				 FROM ${runs}
 				 WHERE status = 'queued' AND run_after < now() - $1::float8 * interval '1 millisecond'
 				 ORDER BY run_after LIMIT $2`,
 				[graceMs, limit]
@@ -505,7 +534,9 @@ export function createRunStore(exec: SqlExecutor, ctx: SqlContext): RunStore {
 
 		async listStaleWaiting(graceMs, limit) {
 			const { rows } = await direct(exec).query<EnqueueRow>(
-				`SELECT r.id, r.task_id, r.queue, r.enqueue_seq, 0::float8 AS delay_ms FROM ${runs} r
+				`SELECT r.id, r.task_id, r.queue, r.enqueue_seq, r.status, r.updated_at,
+				   0::float8 AS delay_ms
+				 FROM ${runs} r
 				 WHERE r.status = 'waiting'
 				   AND r.run_after < now() - $1::float8 * interval '1 millisecond'
 				   AND NOT ${blockingWaitpointExistsSql(ctx, "r.id")}
@@ -576,17 +607,21 @@ export function createRunStore(exec: SqlExecutor, ctx: SqlContext): RunStore {
 					if (!row) throw new Error("recoverStalled: locked run disappeared");
 					return { kind: "requeued", attempt: row.attempt, enqueue: mapEnqueue(row) };
 				}
-				await db.query(
+				const { rows: upd } = await db.query<{ updated_at: Date }>(
 					`UPDATE ${runs}
 					 SET status = 'failed', error = $2::jsonb, execution_id = NULL, run_after = NULL,
 					     finished_at = now(), updated_at = now()
-					 WHERE id = $1`,
+					 WHERE id = $1
+					 RETURNING updated_at`,
 					[runId, jsonParam(error)]
 				);
+				const updatedAt = upd[0]?.updated_at;
+				if (!updatedAt) throw new Error("recoverStalled: locked run disappeared");
 				const expireJobsToRemove = await timeOutWaitpointsOf(db, ctx, [runId]);
 				const wp = run.parent_waitpoint_id;
 				return {
 					kind: "failed",
+					updatedAt,
 					parent: wp ? await resolveChildWaitpoint(db, ctx, wp) : null,
 					expireJobsToRemove,
 				};
