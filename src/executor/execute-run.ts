@@ -1,6 +1,12 @@
 import { randomUUID } from "node:crypto";
 import type { ResolvedConfig } from "../config.js";
-import { AbortTaskRunError, ExecutionLostError, TaskNotRegisteredError } from "../errors.js";
+import {
+	AbortTaskRunError,
+	ConfigError,
+	ExecutionLostError,
+	MinitriggerError,
+	TaskNotRegisteredError,
+} from "../errors.js";
 import { waitpointExpireJobId } from "../queue/ids.js";
 import type { Transport } from "../queue/transport.js";
 import { getTask, type Registry } from "../registry.js";
@@ -12,6 +18,7 @@ import type {
 	Store,
 	WaitpointResolution,
 } from "../store/types.js";
+import type { Streams } from "../streams.js";
 import type { AnyTask, TaskContext } from "../task.js";
 import { computeBackoffMs, DEFAULT_RETRY } from "../utils/backoff.js";
 import { formatError } from "../utils/error-format.js";
@@ -36,6 +43,8 @@ export interface ExecutorDeps {
 	isShuttingDown?: () => boolean;
 	/** Status/cancel publishing (best-effort, Phase 6/7). Default: nothing is published. */
 	notify?: RunNotifier;
+	/** Redis Streams transport behind `ctx.stream` (Phase 7). Absent => `ctx.stream` rejects. */
+	streams?: Pick<Streams, "pipe">;
 }
 
 /** What the after-commit helpers need: enqueue a run, remove a `-system` job, log. */
@@ -100,7 +109,7 @@ export async function executeRun(deps: ExecutorDeps, job: RunJob): Promise<void>
 
 	const state = new ExecutionState(run, executionId);
 	deps.active.add(state);
-	deps.notify?.status(run.id, run);
+	deps.notify?.status(run.id, run, "started");
 	try {
 		await runAcquired(deps, state);
 	} catch (error) {
@@ -123,7 +132,7 @@ async function handBackLateAcquire(
 	try {
 		const result = await deps.store.runs.release({ runId: run.id, executionId });
 		if (result.kind === "released") {
-			deps.notify?.status(run.id);
+			deps.notify?.status(run.id, undefined, "queued");
 			await enqueue(deps, result.enqueue);
 			deps.config.logger.info(fields, "run acquired during shutdown handed back to the queue");
 		}
@@ -138,11 +147,15 @@ async function handBackLateAcquire(
 async function runAcquired(deps: ExecutorDeps, state: ExecutionState): Promise<void> {
 	const { run } = state;
 	const task = deps.registry.tasks.get(run.taskId);
-	const logger = createRunLogger(deps.config.logger, {
-		runId: run.id,
-		taskId: run.taskId,
-		attempt: run.attempt,
-	});
+	const logger = createRunLogger(
+		{ logs: deps.store.logs, config: deps.config },
+		{
+			runId: run.id,
+			taskId: run.taskId,
+			attempt: run.attempt,
+			ownershipGone: () => ownershipGone(state),
+		}
+	);
 
 	const heartbeat = startHeartbeat(deps, state);
 	const maxDurationMs = task?.options.maxDurationMs;
@@ -162,11 +175,13 @@ async function runAcquired(deps: ExecutorDeps, state: ExecutionState): Promise<v
 		if (outcome.kind === "suspended") outcome = await settleInFlight(state);
 		clearTimeout(timer);
 		heartbeat.stop();
+		// Pending logs land BEFORE the terminal/suspension write (dropped if ownership is gone).
+		await logger.close();
 		await settle(deps, state, task, outcome, maxDurationMs);
 	} finally {
 		clearTimeout(timer);
 		heartbeat.stop();
-		await logger.flush();
+		await logger.close();
 	}
 }
 
@@ -209,7 +224,11 @@ async function execute(
 				waitpoints: deps.store.waitpoints,
 				maxPayloadBytes: limits.maxPayloadBytes,
 				resolveTask: child => childTaskSpec(getTask(deps.registry, child)),
-				enqueueRun: request => enqueue(deps, request),
+				// Only used for the children `triggerChildren` just created (all `queued`).
+				enqueueRun: request => {
+					deps.notify?.status(request.runId, undefined, "queued");
+					return enqueue(deps, request);
+				},
 				scheduleExpire: (waitpointId, delayMs) => scheduleExpire(deps, waitpointId, delayMs),
 			},
 		},
@@ -221,7 +240,7 @@ async function execute(
 		logger,
 		signal: state.signal,
 		run: { id: run.id, taskId: run.taskId, attempt: run.attempt, createdAt: run.createdAt },
-		stream: () => Promise.reject(new Error("ctx.stream is implemented in Phase 7")),
+		stream: (name, source) => streamTo(deps, state, name, source),
 	};
 	return invoke(deps, task, state, ctx);
 }
@@ -397,7 +416,7 @@ async function settle(
 			}
 			const result = await deps.store.runs.complete(state.owner, output);
 			if (result.kind === "lost") return onLost(deps, state);
-			deps.notify?.status(state.runId);
+			deps.notify?.status(state.runId, undefined, "completed");
 			return afterResolution(deps, result.parent, result.expireJobsToRemove);
 		}
 	}
@@ -410,7 +429,9 @@ async function settle(
 async function suspendRun(deps: ExecutorDeps, state: ExecutionState): Promise<void> {
 	const fields = { runId: state.runId, taskId: state.taskId, attempt: state.run.attempt };
 	const result = await deps.store.runs.suspend(state.owner);
-	if (result.kind !== "lost") deps.notify?.status(state.runId);
+	if (result.kind !== "lost") {
+		deps.notify?.status(state.runId, undefined, result.kind === "requeued" ? "queued" : "waiting");
+	}
 	switch (result.kind) {
 		case "lost":
 			return onLost(deps, state);
@@ -454,7 +475,7 @@ async function failAttempt(
 	if (!retryable || run.attempt >= run.maxAttempts) {
 		const result = await deps.store.runs.fail(state.owner, serialized);
 		if (result.kind === "lost") return onLost(deps, state);
-		deps.notify?.status(run.id);
+		deps.notify?.status(run.id, undefined, "failed");
 		log.warn({ ...fields, error: serialized }, "run failed");
 		return afterResolution(deps, result.parent, result.expireJobsToRemove);
 	}
@@ -463,9 +484,37 @@ async function failAttempt(
 	const backoffMs = backoff ? computeBackoffMs(backoff, run.attempt) : 0;
 	const result = await deps.store.runs.retry(state.owner, serialized, backoffMs);
 	if (result.kind === "lost") return onLost(deps, state);
-	deps.notify?.status(run.id);
+	deps.notify?.status(run.id, undefined, "retrying");
 	log.info({ ...fields, error: serialized, delayMs: result.enqueue.delayMs }, "run will retry");
 	await enqueue(deps, result.enqueue);
+}
+
+/** The execution no longer owns the run: nothing more may be written for it (decision 5). */
+function ownershipGone(state: ExecutionState): boolean {
+	return (
+		state.handedBack ||
+		state.abortKind === "lost" ||
+		state.abortKind === "canceled" ||
+		state.abortKind === "shutdown"
+	);
+}
+
+/**
+ * `ctx.stream(name, source)` (Phase 7): appends every item of `source` to the Redis Stream
+ * `${prefix}:stream:${runId}:${name}` (`XADD MAXLEN ~`), then writes the end marker and sets the
+ * key's TTL. Not a step: it is not memoized, so a replay streams again.
+ */
+async function streamTo(
+	deps: ExecutorDeps,
+	state: ExecutionState,
+	name: string,
+	source: AsyncIterable<Json | string>
+): Promise<void> {
+	if (typeof name !== "string" || name.length === 0) {
+		throw new ConfigError("ctx.stream: name must be a non-empty string");
+	}
+	if (!deps.streams) throw new MinitriggerError("ctx.stream is not available in this engine");
+	await deps.streams.pipe(state.runId, name, source);
 }
 
 function onLost(deps: ExecutorDeps, state: ExecutionState): void {

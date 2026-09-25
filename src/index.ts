@@ -4,12 +4,23 @@ export {
 	type CompleteTokenOutcome,
 	createEngine,
 	type Engine,
+	type EngineEvents,
 	type EngineRuns,
 	type EngineTokens,
 	type ListRunsOptions,
+	type ReadStreamOptions,
 	type Run,
+	type RunEvent,
+	type RunEventHandler,
+	type RunEventName,
 	type RunList,
+	type RunLogEntry,
+	type RunLogPage,
+	type RunLogsOptions,
+	type RunStatusUpdate,
+	type RunStep,
 	type StartOptions,
+	type SubscribeOptions,
 	type TriggerOptions,
 } from "./engine.js";
 export {
@@ -24,7 +35,7 @@ export {
 	TaskNotRegisteredError,
 } from "./errors.js";
 export type { MigrateResult } from "./migrations/migrate.js";
-export type { RunCursor, RunStatus } from "./store/types.js";
+export type { LogLevel, RunCursor, RunStatus, StepKind, StepStatus } from "./store/types.js";
 export type {
 	AnyTask,
 	RunHandle,

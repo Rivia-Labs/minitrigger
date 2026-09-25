@@ -284,9 +284,16 @@ interface Engine {
 		list(options?: ListRunsOptions): Promise<RunList>;
 		cancel(run: string | RunHandle<unknown>): Promise<"canceled" | "already_finished" | "not_found">;
 		replay<O>(run: string | RunHandle<O>): Promise<RunHandle<O>>; // new run, same payload, no idempotency key
+		logs(run, options?: { afterId?: string | null; limit?: number }): Promise<RunLogPage>;
+		steps(run): Promise<RunStep[]>;
+		subscribe(run, options?: { signal?: AbortSignal }): AsyncIterable<RunStatusUpdate>;
+		readStream<T = Json | string>(run, name: string, options?: { signal?: AbortSignal }): AsyncIterable<T>;
 	};
 	tokens: {
 		complete(tokenId: string, output?: unknown): Promise<CompleteTokenOutcome>;
+	};
+	events: {
+		on(event: RunEventName, handler: (event: RunEvent) => void | Promise<void>): () => void;
 	};
 }
 ```
@@ -296,20 +303,48 @@ interface Engine {
 An engine that never calls `start()` can still `trigger()` and query — no workers, no queue
 consumption (decision 19 in `docs/SPEC.md`).
 
-<!-- TODO(phase 7): verify against implementation -->
-The SPEC's target surface for run introspection also includes `engine.runs.logs(runId)`,
-`engine.runs.steps(runId)`, `engine.runs.subscribe(runId)` (an `AsyncIterable` of run updates via
-Postgres + Redis pub/sub), and `engine.events.on(...)` (local event emitter). These are part of
-the still-pending logs/events phase and aren't on `Engine` yet — re-check this section once that
-lands.
+### Run introspection, events and streams
 
 ```ts
-// Target shape (not yet implemented):
-await engine.runs.logs(runId);
+// Logs written with ctx.logger, oldest first; page with afterId (null = from the start).
+const page = await engine.runs.logs(runId, { limit: 100 });          // { items, nextAfterId }
+await engine.runs.logs(runId, { afterId: page.nextAfterId });
+
+// Steps in call order: { name, seq, kind, status, output, wakeAt, createdAt }.
+// For waits (`wait`, `trigger_wait`, `batch_wait`) `output` is only `{ waitpointId }`;
+// `trigger` and `token` steps hold `{ id }`.
 await engine.runs.steps(runId);
-for await (const update of engine.runs.subscribe(runId)) { /* ... */ }
-engine.events.on("run:completed", handler);
+
+// Filters: taskId, status (one or an array), createdFrom (inclusive) / createdTo (exclusive),
+// cursor (`nextCursor` of the previous page), limit (default 20, max 100). Newest first.
+await engine.runs.list({ status: ["failed", "canceled"], createdFrom: yesterday, limit: 50 });
+
+// Status updates of one run, across processes (Postgres + Redis pub/sub).
+for await (const update of engine.runs.subscribe(runId, { signal })) {
+	console.log(update.status, update.updatedAt); // ends after completed/failed/canceled
+}
+
+// Local events of THIS process; returns an unsubscribe function.
+const off = engine.events.on("run:completed", event => { /* { name, runId, taskId, status, attempt, error, updatedAt } */ });
+
+// Chunks written by ctx.stream("answer", ...) in the run, live.
+for await (const token of engine.runs.readStream<string>(runId, "answer")) process.stdout.write(token);
 ```
+
+- `runs.subscribe` works on an engine that never called `start()` (it opens its own subscriber
+  connection, closed by `stop()`). Order: it subscribes to pub/sub first, then reads the run from
+  Postgres and emits that status, then emits only changes newer than the last one emitted, and
+  ends right after a terminal status (at once if the run is already finished; without emitting
+  anything if the run does not exist). `break`, `options.signal` and `engine.stop()` end it too.
+  Pub/sub is at-most-once, so after 15 s without messages it re-reads the run from Postgres.
+- `engine.events.on(name, handler)` — names: `run:queued`, `run:started`, `run:waiting`,
+  `run:completed`, `run:failed`, `run:canceled`, `run:retrying`. Only transitions made by this
+  process are emitted (the process that triggered, acquired, suspended, finished, retried or
+  canceled the run; stall recoveries on the leader). Handlers run after the commit, off the run's
+  critical path; a throwing or rejecting handler is logged with `logger.error`.
+- `runs.readStream` reads from the start of the stream (so a late reader gets every chunk still
+  kept) and ends at the writer's end marker. Each reader uses its own Redis connection, closed when
+  the iteration ends (or on `stop()`).
 
 <!-- TODO(phase 8): verify against implementation -->
 Declarative and imperative cron schedules are also part of the target API but not yet exposed on
@@ -345,11 +380,18 @@ type TaskContext = {
 };
 ```
 
-<!-- TODO(phase 7): verify against implementation -->
-`ctx.logger` currently exists as a type surface only; batched, size-limited writes to a `run_logs`
-table (flushed every 500 ms / 50 entries, or at run end) are part of the pending logs phase.
-`ctx.stream` (publish an async sequence via Redis Streams, readable with
-`engine.runs.readStream(runId, name)`) is likewise a type surface only until that phase lands.
+`ctx.logger` entries at or above `logging.minLevel` (default `"info"`) are stored in `run_logs` in
+batches — one `INSERT ... unnest` statement per batch, flushed every 500 ms, every 50 entries and
+always before the run's completion/failure/suspension is written — and mirrored to the engine
+`logger` with `runId`, `taskId` and `attempt` (`logging.mirror`, default `true`). `data` larger
+than `limits.maxLogEntryBytes` is truncated with a marker (the mirror gets the original). Entries
+still buffered when the execution lost the run (canceled, stalled, handed back on shutdown) are
+dropped with a `warn`. A failed batch is retried once, then dropped with a `warn`: logs never fail
+a run.
+
+`ctx.stream(name, source)` appends every item of `source` (strings or JSON values) to a Redis
+Stream of this run (`XADD MAXLEN ~ 10000`), then writes an end marker; the stream expires 1 day
+later. It is not a step: it is not memoized, so a replay streams again.
 
 ### `StepApi`
 
@@ -389,6 +431,8 @@ interface StepApi {
 | `limits.maxPayloadBytes` | `1 MB` | Trigger payloads, token outputs, task outputs. |
 | `limits.maxStepOutputBytes` | `256 KB` | `step.run` outputs. |
 | `limits.maxLogEntryBytes` | `16 KB` | One `ctx.logger` entry's `data`. |
+| `logging.minLevel` | `"info"` | `ctx.logger` entries below this level are neither stored nor mirrored. |
+| `logging.mirror` | `true` | Also send `ctx.logger` entries to `logger` (with `runId`, `taskId`, `attempt`). |
 | `limits.maxInlineStepOutputBytes` | `16 MB` | Threshold above which a run's step outputs are loaded lazily in batches instead of in the single startup query. |
 | `systemConcurrency` | `5` | Concurrency of the internal `${prefix}-system` worker (ticks, expirations, retention). |
 | `logger` | console, warn/error only | `{ debug, info, warn, error }`, each `(fields, message) => void` (pino- and console-call-compatible). |

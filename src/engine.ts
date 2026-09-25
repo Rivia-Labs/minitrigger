@@ -7,6 +7,7 @@
  */
 
 import { randomUUID } from "node:crypto";
+import type { Redis } from "ioredis";
 import { Client, Pool } from "pg";
 import {
 	assertTimerMs,
@@ -26,11 +27,18 @@ import {
 	enqueue,
 	executeRun,
 	type RunNotifier,
+	type RunTransition,
 	taskQueueName,
+	transitionOfStatus,
 } from "./executor/index.js";
 import { createLeaderElector, type LeaderElector } from "./leader.js";
 import { type MigrateResult, migrate } from "./migrations/migrate.js";
-import { createPubSub, createPubSubPublisher, type PubSub } from "./pubsub.js";
+import {
+	createPubSub,
+	createPubSubPublisher,
+	type PubSub,
+	type RunStatusMessage,
+} from "./pubsub.js";
 import { createRedisConnections } from "./queue/connections.js";
 import { systemQueueName } from "./queue/ids.js";
 import { createTransport, type Transport } from "./queue/transport.js";
@@ -38,15 +46,20 @@ import { createReconciler } from "./reconciler.js";
 import { buildRegistry, getTask, type Registry } from "./registry.js";
 import { createRetention } from "./retention.js";
 import { createSqlStore } from "./store/sql/index.js";
-import type {
-	Json,
-	RunCursor,
-	RunRecord,
-	RunStatus,
-	SerializedError,
-	Store,
-	WaitpointStatus,
+import {
+	type Json,
+	type LogLevel,
+	type RunCursor,
+	type RunRecord,
+	type RunStatus,
+	type SerializedError,
+	type StepKind,
+	type StepStatus,
+	type Store,
+	TERMINAL_RUN_STATUSES,
+	type WaitpointStatus,
 } from "./store/types.js";
+import { createStreams } from "./streams.js";
 import type { AnyTask, PayloadArgs, RunHandle, TaskOutput, TaskPayload } from "./task.js";
 import { computeBackoffMs } from "./utils/backoff.js";
 import { type Duration, parseDuration } from "./utils/duration.js";
@@ -63,6 +76,14 @@ const DEFAULT_LIST_LIMIT = 20;
 const IN_FLIGHT_DRAIN_MS = 5_000;
 /** How long `stop()` waits for pending best-effort status/cancel publishes before closing Redis. */
 const NOTIFY_DRAIN_MS = 2_000;
+const DEFAULT_LOGS_LIMIT = 100;
+const MAX_LOGS_LIMIT = 1_000;
+/**
+ * `runs.subscribe` safety net: after this long without a pub/sub message, the subscription
+ * re-reads the run from Postgres (pub/sub is at-most-once; a message lost on a reconnect must not
+ * leave a subscriber waiting forever for a terminal status).
+ */
+const SUBSCRIBE_POLL_MS = 15_000;
 
 export interface TriggerOptions {
 	/** Decision 9: same `(task, key)` while the key is alive returns the existing run. Must not start with `__`. */
@@ -119,6 +140,100 @@ export interface RunList {
 
 export type CancelRunOutcome = "canceled" | "already_finished" | "not_found";
 
+/** One `ctx.logger` entry of a run (`run_logs`). */
+export interface RunLogEntry {
+	/** Monotonic per insert order (bigserial, as a string); use it as `afterId` to page/tail. */
+	id: string;
+	level: LogLevel;
+	message: string;
+	/** Truncated to `maxLogEntryBytes` (with a marker) when it was larger. */
+	data: Json | null;
+	/** When the entry was logged. */
+	ts: Date;
+}
+
+export interface RunLogsOptions {
+	/** Exclusive: only entries with a larger id (pass the previous page's `nextAfterId`; null = from the start). */
+	afterId?: string | null | undefined;
+	/** Default 100, max 1 000. */
+	limit?: number;
+}
+
+export interface RunLogPage {
+	items: RunLogEntry[];
+	/** `id` of the last item when the page is full (more may follow), else null. */
+	nextAfterId: string | null;
+}
+
+/** One step of a run, in `seq` order. */
+export interface RunStep {
+	name: string;
+	/** Call order within the run (decision 3). */
+	seq: number;
+	/** Which `ctx.step` method recorded it (`run`, `sleep`, `token`, `wait`, `trigger`, `trigger_wait`, `batch_wait`). */
+	kind: StepKind;
+	status: StepStatus;
+	/**
+	 * `run`: the memoized output. `token`: `{ id }`. `trigger`: `{ id }` of the child run. Waits
+	 * (`wait`, `trigger_wait`, `batch_wait`): only the reference `{ waitpointId }`; results live in
+	 * the waitpoint / child runs (decision 10). `sleep`: null.
+	 */
+	output: Json | null;
+	/** Only for `sleep` steps. */
+	wakeAt: Date | null;
+	createdAt: Date;
+}
+
+/** One status change delivered by `runs.subscribe`. */
+export interface RunStatusUpdate {
+	runId: string;
+	status: RunStatus;
+	/** `runs.updated_at` of that change (database clock, decision 17). */
+	updatedAt: Date;
+}
+
+export interface SubscribeOptions {
+	/** Ends the iteration (without an error) when it fires. */
+	signal?: AbortSignal;
+}
+
+export interface ReadStreamOptions {
+	/** Ends the iteration (without an error) when it fires. */
+	signal?: AbortSignal;
+}
+
+/** Local run event names (`engine.events.on`). */
+export type RunEventName = `run:${RunTransition}`;
+
+/**
+ * A transition made by THIS process (trigger, acquire, suspend, complete, fail, retry, cancel,
+ * stall recovery when it is the leader). Other processes' transitions are not delivered here; use
+ * `runs.subscribe` for a cross-process view of one run.
+ */
+export interface RunEvent {
+	name: RunEventName;
+	runId: string;
+	taskId: string;
+	/** The status the transition moved the run to. */
+	status: RunStatus;
+	attempt: number;
+	/** Last error (e.g. of the failed attempt for `run:retrying`/`run:failed`). */
+	error: SerializedError | null;
+	/** `runs.updated_at` read right after the transition. */
+	updatedAt: Date;
+}
+
+export type RunEventHandler = (event: RunEvent) => void | Promise<void>;
+
+export interface EngineEvents {
+	/**
+	 * Registers a handler for a local run event; returns the unsubscribe function. Handlers run
+	 * after the transition was committed, off the run's critical path; a throwing/rejecting
+	 * handler is logged (`logger.error`) and never affects the run.
+	 */
+	on(event: RunEventName, handler: RunEventHandler): () => void;
+}
+
 export interface EngineRuns {
 	get<O = unknown>(run: string | RunHandle<O>): Promise<Run<O> | null>;
 	list(options?: ListRunsOptions): Promise<RunList>;
@@ -126,6 +241,31 @@ export interface EngineRuns {
 	cancel(run: string | RunHandle<unknown>): Promise<CancelRunOutcome>;
 	/** New run of the same task with the same payload (no idempotency key). */
 	replay<O = unknown>(run: string | RunHandle<O>): Promise<RunHandle<O>>;
+	/** The run's `ctx.logger` entries, oldest first (page with `afterId`). */
+	logs(run: string | RunHandle<unknown>, options?: RunLogsOptions): Promise<RunLogPage>;
+	/** The run's recorded steps, in `seq` order. */
+	steps(run: string | RunHandle<unknown>): Promise<RunStep[]>;
+	/**
+	 * Status updates of one run (works without `start()`). Emits the current status read from
+	 * Postgres first, then every later change received via Redis pub/sub (only if newer than the
+	 * last one emitted), and ends right after a terminal status (immediately if the run is already
+	 * finished). Ends without emitting anything if the run does not exist. `break`, `return()`,
+	 * `options.signal` and `engine.stop()` end it too.
+	 */
+	subscribe(
+		run: string | RunHandle<unknown>,
+		options?: SubscribeOptions
+	): AsyncIterable<RunStatusUpdate>;
+	/**
+	 * Reads the Redis Stream written by `ctx.stream(name, ...)` from its start: chunks already
+	 * written come at once, then live ones, until the writer ends it. Each reader uses its own
+	 * Redis connection, closed when the iteration ends. A stream expires 1 day after its end.
+	 */
+	readStream<T = Json | string>(
+		run: string | RunHandle<unknown>,
+		name: string,
+		options?: ReadStreamOptions
+	): AsyncIterable<T>;
 }
 
 /**
@@ -169,6 +309,8 @@ export interface Engine {
 	): Promise<RunHandle<TaskOutput<T>>>;
 	runs: EngineRuns;
 	tokens: EngineTokens;
+	/** Local run events of this process. */
+	events: EngineEvents;
 }
 
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -219,20 +361,86 @@ export function createEngine(config: EngineConfig): Engine {
 		pendingNotifications.add(tracked);
 		void tracked.finally(() => pendingNotifications.delete(tracked));
 	}
+	// --- Local events (Phase 7): emitted where this process made the transition. ---
+	const eventHandlers = new Map<RunEventName, Set<RunEventHandler>>();
+	function emitEvent(transition: RunTransition, row: RunRecord): void {
+		const name: RunEventName = `run:${transition}`;
+		const handlers = eventHandlers.get(name);
+		if (!handlers || handlers.size === 0) return;
+		const event: RunEvent = {
+			name,
+			runId: row.id,
+			taskId: row.taskId,
+			status: statusOfTransition(transition),
+			attempt: row.attempt,
+			error: row.error,
+			updatedAt: row.updatedAt,
+		};
+		const onError = (error: unknown) =>
+			logger.error({ err: error, event: name, runId: row.id }, "engine.events handler failed");
+		for (const handler of Array.from(handlers)) {
+			try {
+				const result = handler(event);
+				if (result instanceof Promise) result.catch(onError);
+			} catch (error) {
+				onError(error);
+			}
+		}
+	}
+	const events: EngineEvents = {
+		on(event, handler) {
+			if (!RUN_EVENT_NAMES.has(event)) {
+				throw new ConfigError(
+					`unknown event "${String(event)}"; expected one of ${[...RUN_EVENT_NAMES].join(", ")}`
+				);
+			}
+			let handlers = eventHandlers.get(event);
+			if (!handlers) {
+				handlers = new Set();
+				eventHandlers.set(event, handlers);
+			}
+			// A wrapper per registration: the same function registered twice gets two calls and
+			// two independent unsubscribes.
+			const registered: RunEventHandler = e => handler(e);
+			handlers.add(registered);
+			return () => {
+				handlers.delete(registered);
+			};
+		},
+	};
+
+	/**
+	 * Publishes the status for `runs.subscribe` (other processes included) and emits the local
+	 * event. `updatedAt` comes from the row (decision 17); without `known` it costs a
+	 * `runs.get` per transition (open item: have the store return `updatedAt`).
+	 */
+	function notifyStatus(
+		runId: string,
+		known: RunRecord | undefined,
+		transition: RunTransition | ((row: RunRecord) => RunTransition) | undefined
+	): void {
+		trackNotification(
+			(async () => {
+				const row = known ?? (await store.runs.get(runId));
+				if (!row) return;
+				emitEvent(
+					typeof transition === "function"
+						? transition(row)
+						: (transition ?? transitionOfStatus(row.status)),
+					row
+				);
+				await publisher.publishStatus({
+					runId,
+					status: row.status,
+					updatedAt: row.updatedAt.toISOString(),
+				});
+			})(),
+			"run status"
+		);
+	}
 	const notifier: RunNotifier = {
-		status(runId, known) {
-			trackNotification(
-				(async () => {
-					const row = known ?? (await store.runs.get(runId));
-					if (!row) return;
-					await publisher.publishStatus({
-						runId,
-						status: row.status,
-						updatedAt: row.updatedAt.toISOString(),
-					});
-				})(),
-				"run status"
-			);
+		status(runId, known, transition) {
+			notifyStatus(runId, known, transition);
 		},
 		canceled(runIds) {
 			if (runIds.length === 0) return;
@@ -244,6 +452,8 @@ export function createEngine(config: EngineConfig): Engine {
 		for (const runId of runIds) active.get(runId)?.abort("canceled");
 	}
 
+	const streams = createStreams({ redis: connections.shared(), prefix: resolved.prefix });
+
 	const deps: ExecutorDeps = {
 		store,
 		transport,
@@ -252,7 +462,33 @@ export function createEngine(config: EngineConfig): Engine {
 		active,
 		isShuttingDown: () => shuttingDown,
 		notify: notifier,
+		streams,
 	};
+
+	/**
+	 * The status/cancel subscriber (dedicated connection, decision 14), created by `start()` or by
+	 * the first `runs.subscribe` (a trigger-only engine can subscribe too). Closed by `stop()`.
+	 */
+	function getPubSub(): PubSub {
+		if (pubsub) return pubsub;
+		const subscriber = connections.dedicated("subscriber");
+		// ioredis reconnects (and re-subscribes) on its own; without a listener it prints every
+		// connection error to the console.
+		subscriber.on("error", (error: unknown) =>
+			logger.debug({ err: error }, "pub/sub subscriber connection error")
+		);
+		pubsub = createPubSub({
+			publisher: connections.shared(),
+			subscriber,
+			prefix: resolved.prefix,
+			logger,
+		});
+		return pubsub;
+	}
+	/** Ends every open `runs.subscribe` iteration (on `stop()`). */
+	const openSubscriptions = new Set<() => void>();
+	/** Dedicated connections of the open `runs.readStream` iterations (disconnected on `stop()`). */
+	const streamReaders = new Set<Redis>();
 
 	// --- Leader loop (Phase 6, decision 16): reconciler + retention scheduling, leader only. ---
 	const reconciler = createReconciler({
@@ -264,10 +500,14 @@ export function createEngine(config: EngineConfig): Engine {
 		batchSize: resolved.reconciler.batchSize,
 		onCanceled: runIds => {
 			abortLocal(runIds);
-			for (const runId of runIds) notifier.status(runId);
+			for (const runId of runIds) notifier.status(runId, undefined, "canceled");
 			notifier.canceled(runIds);
 		},
-		onStatusChange: runId => notifier.status(runId),
+		// Stall recovery: back to `queued` means a retry (attempt + 1), otherwise it failed.
+		onStatusChange: runId =>
+			notifyStatus(runId, undefined, row =>
+				row.status === "queued" ? "retrying" : transitionOfStatus(row.status)
+			),
 	});
 	const retention = createRetention({
 		store,
@@ -388,20 +628,9 @@ export function createEngine(config: EngineConfig): Engine {
 				}),
 			});
 
-			const subscriber = connections.dedicated("subscriber");
-			// ioredis reconnects (and re-subscribes) on its own; without a listener it prints every
-			// connection error to the console.
-			subscriber.on("error", (error: unknown) =>
-				logger.debug({ err: error }, "pub/sub subscriber connection error")
-			);
-			pubsub = createPubSub({
-				publisher: connections.shared(),
-				subscriber,
-				prefix: resolved.prefix,
-				logger,
-			});
-			pubsub.onCancel(abortLocal);
-			await pubsub.ready;
+			const ps = getPubSub();
+			ps.onCancel(abortLocal);
+			await ps.ready;
 
 			startLeaderLoop();
 		})();
@@ -551,7 +780,7 @@ export function createEngine(config: EngineConfig): Engine {
 				try {
 					const result = await store.runs.release(execution.owner);
 					if (result.kind === "released") {
-						notifier.status(execution.runId);
+						notifier.status(execution.runId, undefined, "queued");
 						await enqueue(deps, result.enqueue);
 						logger.info(
 							{ runId: execution.runId, taskId: execution.taskId },
@@ -589,6 +818,8 @@ export function createEngine(config: EngineConfig): Engine {
 					beforeClose: async () => {
 						await handBackActiveRuns();
 						await drainInFlight(IN_FLIGHT_DRAIN_MS);
+						for (const end of Array.from(openSubscriptions)) end();
+						for (const reader of Array.from(streamReaders)) reader.disconnect();
 						await pubsub?.close();
 						await drainNotifications(NOTIFY_DRAIN_MS);
 					},
@@ -641,7 +872,163 @@ export function createEngine(config: EngineConfig): Engine {
 			const task = getTask(registry, record.taskId);
 			return createRun(task, record.payload, 0, undefined);
 		},
+
+		async logs(run, options = {}): Promise<RunLogPage> {
+			const limit = clampLimit(options.limit ?? DEFAULT_LOGS_LIMIT, MAX_LOGS_LIMIT);
+			const runId = runIdOf(run);
+			if (!UUID_PATTERN.test(runId)) return { items: [], nextAfterId: null };
+			const entries = await store.logs.list(runId, {
+				limit,
+				...(options.afterId != null ? { afterId: options.afterId } : {}),
+			});
+			const items = entries.map(
+				(e): RunLogEntry => ({
+					id: e.id,
+					level: e.level,
+					message: e.message,
+					data: e.data,
+					ts: e.ts,
+				})
+			);
+			const last = items[items.length - 1];
+			return { items, nextAfterId: items.length === limit && last ? last.id : null };
+		},
+
+		async steps(run): Promise<RunStep[]> {
+			const runId = runIdOf(run);
+			if (!UUID_PATTERN.test(runId)) return [];
+			const records = await store.steps.list(runId);
+			return records.map(r => ({
+				name: r.name,
+				seq: r.seqIndex,
+				kind: r.kind,
+				status: r.status,
+				output: r.output,
+				wakeAt: r.wakeAt,
+				createdAt: r.createdAt,
+			}));
+		},
+
+		subscribe(run, options = {}): AsyncIterable<RunStatusUpdate> {
+			assertNotStopped();
+			return subscribeRun(runIdOf(run), options.signal);
+		},
+
+		readStream<T>(
+			run: string | RunHandle<unknown>,
+			name: string,
+			options: ReadStreamOptions = {}
+		): AsyncIterable<T> {
+			assertNotStopped();
+			return readRunStream(runIdOf(run), name, options.signal) as AsyncIterable<T>;
+		},
 	};
+
+	/**
+	 * `runs.subscribe` (Phase 7), in the mandatory order: (1) register on the pub/sub channel and
+	 * buffer messages, (2) read the status from Postgres and emit it, (3) emit buffered/live
+	 * messages only when newer than the last emitted `updatedAt`, (4) end after a terminal status.
+	 */
+	async function* subscribeRun(
+		runId: string,
+		signal: AbortSignal | undefined
+	): AsyncGenerator<RunStatusUpdate, void, undefined> {
+		if (!UUID_PATTERN.test(runId) || signal?.aborted) return;
+		const pending: RunStatusMessage[] = [];
+		let wake: (() => void) | undefined;
+		let ended = false;
+		const notify = () => {
+			const resolve = wake;
+			wake = undefined;
+			resolve?.();
+		};
+		const end = () => {
+			ended = true;
+			notify();
+		};
+		const ps = getPubSub();
+		// (1) Before the read, so nothing published after it can be missed.
+		const unsubscribe = ps.subscribeStatus(runId, message => {
+			pending.push(message);
+			notify();
+		});
+		signal?.addEventListener("abort", end, { once: true });
+		openSubscriptions.add(end);
+		try {
+			await ps.ready;
+			if (ended) return;
+			// (2) Postgres is the source of truth for the starting point.
+			const row = await store.runs.get(runId);
+			if (!row || ended) return;
+			let last: RunStatusUpdate = { runId, status: row.status, updatedAt: row.updatedAt };
+			yield last;
+			if (isTerminal(last.status)) return;
+
+			// (3) Only strictly newer changes (a same-millisecond change counts when its status
+			// differs: JS dates drop Postgres' microseconds).
+			const isNewer = (status: RunStatus, updatedAt: Date) => {
+				const delta = updatedAt.getTime() - last.updatedAt.getTime();
+				return delta > 0 || (delta === 0 && status !== last.status);
+			};
+			while (!ended) {
+				const message = pending.shift();
+				if (message) {
+					const updatedAt = new Date(message.updatedAt);
+					if (Number.isNaN(updatedAt.getTime()) || !isNewer(message.status, updatedAt)) continue;
+					last = { runId, status: message.status, updatedAt };
+					yield last;
+					// (4)
+					if (isTerminal(last.status)) return;
+					continue;
+				}
+				const timedOut = await new Promise<boolean>(resolve => {
+					const timer = setTimeout(() => resolve(true), SUBSCRIBE_POLL_MS);
+					wake = () => {
+						clearTimeout(timer);
+						resolve(false);
+					};
+				});
+				if (!timedOut || ended) continue;
+				wake = undefined;
+				// Safety net: pub/sub may drop messages (e.g. on a reconnect).
+				const current = await store.runs.get(runId);
+				if (!current) return;
+				if (isNewer(current.status, current.updatedAt)) {
+					pending.push({
+						runId,
+						status: current.status,
+						updatedAt: current.updatedAt.toISOString(),
+					});
+				}
+			}
+		} finally {
+			unsubscribe();
+			signal?.removeEventListener("abort", end);
+			openSubscriptions.delete(end);
+		}
+	}
+
+	/** `runs.readStream`: one dedicated connection per reader (decision 14), closed at the end. */
+	async function* readRunStream(
+		runId: string,
+		name: string,
+		signal: AbortSignal | undefined
+	): AsyncGenerator<string | Json, void, undefined> {
+		if (signal?.aborted) return;
+		// A duplicate (not `connections.dedicated`, which keeps every connection until stop()):
+		// readers come and go, so each one is closed as soon as its iteration ends.
+		const reader = connections.shared().duplicate({ maxRetriesPerRequest: null });
+		reader.on("error", (error: unknown) =>
+			logger.debug({ err: error, runId, name }, "stream reader connection error")
+		);
+		streamReaders.add(reader);
+		try {
+			yield* streams.read(runId, name, { redis: reader, ...(signal ? { signal } : {}) });
+		} finally {
+			streamReaders.delete(reader);
+			reader.disconnect();
+		}
+	}
 
 	const tokens: EngineTokens = {
 		async complete(tokenId: string, output?: unknown): Promise<CompleteTokenOutcome> {
@@ -678,7 +1065,38 @@ export function createEngine(config: EngineConfig): Engine {
 		trigger,
 		runs,
 		tokens,
+		events,
 	};
+}
+
+const RUN_EVENT_NAMES: ReadonlySet<string> = new Set<RunEventName>([
+	"run:queued",
+	"run:started",
+	"run:waiting",
+	"run:completed",
+	"run:failed",
+	"run:canceled",
+	"run:retrying",
+]);
+
+function statusOfTransition(transition: RunTransition): RunStatus {
+	switch (transition) {
+		case "started":
+			return "running";
+		case "retrying":
+			return "queued";
+		default:
+			return transition;
+	}
+}
+
+function isTerminal(status: RunStatus): boolean {
+	return (TERMINAL_RUN_STATUSES as readonly RunStatus[]).includes(status);
+}
+
+function clampLimit(limit: number, max: number): number {
+	if (!Number.isFinite(limit)) return max;
+	return Math.min(max, Math.max(1, Math.floor(limit)));
 }
 
 function runIdOf(run: string | RunHandle<unknown>): string {

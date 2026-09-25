@@ -30,7 +30,24 @@ describe("resolveConfig", () => {
 			maxLogEntryBytes: 16 * 1024,
 			maxInlineStepOutputBytes: 16 * 1024 * 1024,
 		});
+		expect(r.logging).toEqual({ minLevel: "info", mirror: true });
 		expect(typeof r.logger.warn).toBe("function");
+	});
+
+	it("accepts logging options and rejects invalid ones", () => {
+		expect(
+			resolveConfig({ ...base, logging: { minLevel: "debug", mirror: false } }).logging
+		).toEqual({ minLevel: "debug", mirror: false });
+		expect(resolveConfig({ ...base, logging: { minLevel: "warn" } }).logging).toEqual({
+			minLevel: "warn",
+			mirror: true,
+		});
+		expect(() => resolveConfig({ ...base, logging: { minLevel: "verbose" as never } })).toThrow(
+			ConfigError
+		);
+		expect(() => resolveConfig({ ...base, logging: { mirror: "yes" as never } })).toThrow(
+			ConfigError
+		);
 	});
 
 	it("keeps explicit values and parses idempotencyKeyTtl durations", () => {

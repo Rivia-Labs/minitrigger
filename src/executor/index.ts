@@ -10,7 +10,12 @@ export {
 	taskQueueName,
 } from "./execute-run.js";
 export { type AbortKind, ActiveExecutions, ExecutionState } from "./execution.js";
-export { noopNotifier, type RunNotifier } from "./notify.js";
+export {
+	noopNotifier,
+	type RunNotifier,
+	type RunTransition,
+	transitionOfStatus,
+} from "./notify.js";
 export { TIMEOUT_ERROR_NAME } from "./step-context.js";
 export {
 	cancelLocally,

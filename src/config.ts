@@ -7,6 +7,7 @@
 import type { Redis } from "ioredis";
 import type { Pool } from "pg";
 import { ConfigError } from "./errors.js";
+import type { LogLevel } from "./store/types.js";
 import type { AnyTask } from "./task.js";
 import { type Duration, parseDuration } from "./utils/duration.js";
 import { validateSqlIdentifier } from "./utils/identifiers.js";
@@ -90,6 +91,13 @@ export interface EngineConfig {
 		batchSize?: number;
 	};
 	limits?: EngineLimits;
+	/** `ctx.logger` (Phase 7): persisted to `run_logs` in batches and mirrored to `logger`. */
+	logging?: {
+		/** Entries below this level are neither stored nor mirrored. Default `"info"`. */
+		minLevel?: LogLevel;
+		/** Also send every stored entry to `logger` (with `runId`, `taskId`, `attempt`). Default `true`. */
+		mirror?: boolean;
+	};
 	/** Concurrency of the internal `${prefix}-system` worker (decision 8). Default 5. */
 	systemConcurrency?: number;
 	/** Engine-level logger (pino/console-compatible). Default: warn/error to `console`. */
@@ -113,6 +121,7 @@ export interface ResolvedConfig {
 	retentionBatchSize: number;
 	reconciler: { intervalMs: number; graceMs: number; batchSize: number };
 	limits: Required<EngineLimits>;
+	logging: { minLevel: LogLevel; mirror: boolean };
 	systemConcurrency: number;
 	logger: EngineLogger;
 }
@@ -140,6 +149,7 @@ export const DEFAULTS = {
 	retentionBatchSize: 1_000,
 	reconciler: { intervalMs: 15_000, graceMs: 30_000, batchSize: 100 },
 	systemConcurrency: 5,
+	logging: { minLevel: "info", mirror: true },
 	limits: {
 		maxPayloadBytes: 1024 * 1024,
 		maxStepOutputBytes: 256 * 1024,
@@ -147,6 +157,8 @@ export const DEFAULTS = {
 		maxInlineStepOutputBytes: 16 * 1024 * 1024,
 	},
 } as const;
+
+const LOG_LEVELS: readonly LogLevel[] = ["debug", "info", "warn", "error"];
 
 const noop: EngineLogFn = () => {};
 
@@ -250,6 +262,18 @@ export function resolveConfig(config: EngineConfig): ResolvedConfig {
 		),
 	};
 
+	const minLevel = config.logging?.minLevel ?? DEFAULTS.logging.minLevel;
+	if (!LOG_LEVELS.includes(minLevel)) {
+		throw new ConfigError(
+			`logging.minLevel must be one of ${LOG_LEVELS.join(", ")}, got ${String(minLevel)}`
+		);
+	}
+	const mirror = config.logging?.mirror ?? DEFAULTS.logging.mirror;
+	if (typeof mirror !== "boolean") {
+		throw new ConfigError(`logging.mirror must be a boolean, got ${String(mirror)}`);
+	}
+	const logging = { minLevel, mirror };
+
 	const systemConcurrency = positiveInt(
 		"systemConcurrency",
 		config.systemConcurrency ?? DEFAULTS.systemConcurrency
@@ -279,6 +303,7 @@ export function resolveConfig(config: EngineConfig): ResolvedConfig {
 		retentionBatchSize,
 		reconciler,
 		limits,
+		logging,
 		systemConcurrency,
 		logger,
 	};

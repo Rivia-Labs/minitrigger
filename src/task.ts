@@ -136,6 +136,11 @@ export type TaskOutput<T extends AnyTask> = T extends Task<any, any, infer O> ? 
 // TaskContext / TaskLogger
 // ---------------------------------------------------------------------------
 
+/**
+ * `ctx.logger`: entries at or above `logging.minLevel` are stored in `run_logs` in batches (see
+ * `engine.runs.logs`) and mirrored to the engine logger. `data` larger than `maxLogEntryBytes`
+ * is truncated with a marker.
+ */
 export type TaskLogger = {
 	debug(message: string, data?: Json): void;
 	info(message: string, data?: Json): void;
@@ -150,7 +155,12 @@ export type TaskContext = {
 	/** Fires on cancellation, `maxDurationMs` expiry, loss of run ownership, or graceful shutdown. */
 	signal: AbortSignal;
 	run: { id: string; taskId: string; attempt: number; createdAt: Date };
-	/** Publishes an async sequence via Redis Streams (Phase 7). Type surface only for now. */
+	/**
+	 * Publishes an async sequence (e.g. LLM tokens) to the Redis Stream `name` of this run
+	 * (`XADD MAXLEN ~`), readable live with `engine.runs.readStream(runId, name)`. Resolves once
+	 * `source` is exhausted and the end marker is written (the stream then expires after 1 day).
+	 * Not a step: not memoized, so a replay streams again.
+	 */
 	stream(name: string, source: AsyncIterable<Json | string>): Promise<void>;
 };
 

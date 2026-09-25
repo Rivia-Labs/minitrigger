@@ -121,7 +121,7 @@ export async function cancelLocally(
 	if (canceled.length === 0) return;
 	for (const run of canceled) {
 		deps.active.get(run.runId)?.abort("canceled");
-		deps.notify?.status(run.runId);
+		deps.notify?.status(run.runId, undefined, "canceled");
 	}
 	deps.notify?.canceled(canceled.map(run => run.runId));
 	for (const run of canceled) {

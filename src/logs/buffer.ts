@@ -3,7 +3,7 @@
  * com buffer e flush em lote via `unnest` (500 ms ou 50 entradas, e ao final)"). Standalone
  * building block: it only knows a `runId` and an `insertBatch` callback (typically
  * `store.logs.insertBatch`, itself a single `unnest`-based statement -- see
- * `src/store/sql/logs.ts`); wiring it into the executor/engine is another agent's job.
+ * `src/store/sql/logs.ts`); `src/executor/logger.ts` builds one per execution as `ctx.logger`.
  *
  * Produces a `TaskLogger`-compatible object (`debug`/`info`/`warn`/`error(message, data?)`) that:
  *
@@ -15,7 +15,7 @@
  *   `data` each get their own `maxLogEntryBytes` budget, not a shared one) -- simpler, and a
  *   pathological one doesn't starve the other's budget;
  * - batches: flushes every `flushIntervalMs` (default 500) OR as soon as `maxBuffered` (default
- *   50) entries have accumulated, always in a single `insertBatch` call per flush -- never one
+ *   50) entries have accumulated, one `insertBatch` call per `maxBatchSize` (default 500) entries -- never one
  *   query per log line (the Phase 7 acceptance criterion "10k logs sem uma query por linha");
  * - serializes flushes on a promise chain: a flush already running (or already queued) is always
  *   finished before the next one starts, so `insertBatch` never sees two concurrent calls for the
@@ -60,13 +60,19 @@ export interface LogBufferOptions {
 	flushIntervalMs?: number;
 	/** Default 50. */
 	maxBuffered?: number;
+	/**
+	 * Most entries handed to one `insertBatch` call (default 500). A synchronous burst logged
+	 * before any flush runs is split into several statements of at most this size, so a single
+	 * `INSERT ... unnest` never carries an unbounded payload.
+	 */
+	maxBatchSize?: number;
 	/** Called at most once per dropped batch, after one retry already failed. Never let it throw. */
 	onFlushError?: (error: unknown, entries: readonly NewLogEntry[]) => void;
 }
 
 /** `ctx.logger` implementation: `TaskLogger` plus explicit `flush`/`close`. */
 export interface LogBuffer extends TaskLogger {
-	/** Flushes the current buffer (single `insertBatch` call, or none if empty). Never throws. */
+	/** Flushes the current buffer (one `insertBatch` per `maxBatchSize` entries, none if empty). Never throws. */
 	flush(): Promise<void>;
 	/** Flushes remaining entries, stops the timer, and disables further logging. Idempotent. */
 	close(): Promise<void>;
@@ -83,12 +89,13 @@ export function createLogBuffer(options: LogBufferOptions): LogBuffer {
 		mirror,
 		flushIntervalMs = 500,
 		maxBuffered = 50,
+		maxBatchSize = 500,
 		onFlushError,
 	} = options;
 
 	const minRank = LEVEL_RANK[minLevel];
 
-	let buffer: NewLogEntry[] = [];
+	const buffer: NewLogEntry[] = [];
 	// Every scheduled flush chains onto this promise, so at most one `doFlush` body runs at a
 	// time and they run in the order they were scheduled. `doFlush` never rejects (it catches its
 	// own errors), so this chain is never "poisoned" by a failed flush.
@@ -106,10 +113,12 @@ export function createLogBuffer(options: LogBufferOptions): LogBuffer {
 	}
 
 	async function doFlush(): Promise<void> {
-		if (buffer.length === 0) return;
-		const batch = buffer;
-		buffer = [];
+		while (buffer.length > 0) {
+			await flushBatch(buffer.splice(0, maxBatchSize));
+		}
+	}
 
+	async function flushBatch(batch: NewLogEntry[]): Promise<void> {
 		try {
 			await insertBatch(batch);
 			return;
