@@ -65,7 +65,30 @@ export interface EngineConfig {
 	shutdownTimeoutMs?: number;
 	/** Default TTL of user idempotency keys (decision 9). Default `"7d"`; must not exceed `retention.days`. */
 	idempotencyKeyTtl?: Duration;
-	retention?: { days?: number };
+	/**
+	 * Finished runs older than `days` are deleted (decision 10 parent rule) by a `-system` job the
+	 * leader schedules once per `intervalMs` window, `batchSize` rows per statement.
+	 */
+	retention?: {
+		/** Default 30. */
+		days?: number;
+		/** Default 1 h. */
+		intervalMs?: number;
+		/** Default 1 000. */
+		batchSize?: number;
+	};
+	/** Reconciler (Phase 6), run by the leader only (decision 16). */
+	reconciler?: {
+		/** How often every started engine tries to become leader and, if leader, reconciles. Default 15 000 ms. */
+		intervalMs?: number;
+		/**
+		 * How long a `queued`/`waiting` run may sit past its `run_after` before it is re-enqueued.
+		 * Default 30 000 ms.
+		 */
+		graceMs?: number;
+		/** Rows handled per reconciler case per tick. Default 100. */
+		batchSize?: number;
+	};
 	limits?: EngineLimits;
 	/** Concurrency of the internal `${prefix}-system` worker (decision 8). Default 5. */
 	systemConcurrency?: number;
@@ -86,6 +109,9 @@ export interface ResolvedConfig {
 	shutdownTimeoutMs: number;
 	idempotencyKeyTtlMs: number;
 	retentionDays: number;
+	retentionIntervalMs: number;
+	retentionBatchSize: number;
+	reconciler: { intervalMs: number; graceMs: number; batchSize: number };
 	limits: Required<EngineLimits>;
 	systemConcurrency: number;
 	logger: EngineLogger;
@@ -110,6 +136,9 @@ export const DEFAULTS = {
 	shutdownTimeoutMs: 30_000,
 	idempotencyKeyTtlMs: 7 * DAY_MS,
 	retentionDays: 30,
+	retentionIntervalMs: 3_600_000,
+	retentionBatchSize: 1_000,
+	reconciler: { intervalMs: 15_000, graceMs: 30_000, batchSize: 100 },
 	systemConcurrency: 5,
 	limits: {
 		maxPayloadBytes: 1024 * 1024,
@@ -171,6 +200,28 @@ export function resolveConfig(config: EngineConfig): ResolvedConfig {
 		"retention.days",
 		config.retention?.days ?? DEFAULTS.retentionDays
 	);
+	const retentionIntervalMs = timerMs(
+		"retention.intervalMs",
+		config.retention?.intervalMs ?? DEFAULTS.retentionIntervalMs
+	);
+	const retentionBatchSize = positiveInt(
+		"retention.batchSize",
+		config.retention?.batchSize ?? DEFAULTS.retentionBatchSize
+	);
+	const reconciler = {
+		intervalMs: timerMs(
+			"reconciler.intervalMs",
+			config.reconciler?.intervalMs ?? DEFAULTS.reconciler.intervalMs
+		),
+		graceMs: nonNegativeInt(
+			"reconciler.graceMs",
+			config.reconciler?.graceMs ?? DEFAULTS.reconciler.graceMs
+		),
+		batchSize: positiveInt(
+			"reconciler.batchSize",
+			config.reconciler?.batchSize ?? DEFAULTS.reconciler.batchSize
+		),
+	};
 	const idempotencyKeyTtlMs =
 		config.idempotencyKeyTtl === undefined
 			? DEFAULTS.idempotencyKeyTtlMs
@@ -224,6 +275,9 @@ export function resolveConfig(config: EngineConfig): ResolvedConfig {
 		shutdownTimeoutMs,
 		idempotencyKeyTtlMs,
 		retentionDays,
+		retentionIntervalMs,
+		retentionBatchSize,
+		reconciler,
 		limits,
 		systemConcurrency,
 		logger,

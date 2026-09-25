@@ -7,7 +7,7 @@
  */
 
 import { randomUUID } from "node:crypto";
-import { Pool } from "pg";
+import { Client, Pool } from "pg";
 import {
 	assertTimerMs,
 	assertTtlWithinRetention,
@@ -25,13 +25,18 @@ import {
 	type ExecutorDeps,
 	enqueue,
 	executeRun,
+	type RunNotifier,
 	taskQueueName,
 } from "./executor/index.js";
+import { createLeaderElector, type LeaderElector } from "./leader.js";
 import { type MigrateResult, migrate } from "./migrations/migrate.js";
+import { createPubSub, createPubSubPublisher, type PubSub } from "./pubsub.js";
 import { createRedisConnections } from "./queue/connections.js";
 import { systemQueueName } from "./queue/ids.js";
 import { createTransport, type Transport } from "./queue/transport.js";
+import { createReconciler } from "./reconciler.js";
 import { buildRegistry, getTask, type Registry } from "./registry.js";
+import { createRetention } from "./retention.js";
 import { createSqlStore } from "./store/sql/index.js";
 import type {
 	Json,
@@ -56,6 +61,8 @@ const DEFAULT_LIST_LIMIT = 20;
  * for the task function right away.
  */
 const IN_FLIGHT_DRAIN_MS = 5_000;
+/** How long `stop()` waits for pending best-effort status/cancel publishes before closing Redis. */
+const NOTIFY_DRAIN_MS = 2_000;
 
 export interface TriggerOptions {
 	/** Decision 9: same `(task, key)` while the key is alive returns the existing run. Must not start with `__`. */
@@ -194,6 +201,49 @@ export function createEngine(config: EngineConfig): Engine {
 	const active = new ActiveExecutions();
 	/** Set synchronously by `stop()`; `executeRun` hands back any run it acquires after that. */
 	let shuttingDown = false;
+
+	// --- Pub/sub (Phase 6 cancel broadcast, Phase 7 status seam). Publishing uses the shared
+	// connection, so a trigger-only engine (decision 19) still publishes what it causes; only a
+	// started engine subscribes (dedicated connection, decision 14). ---
+	const publisher = createPubSubPublisher({
+		publisher: connections.shared(),
+		prefix: resolved.prefix,
+	});
+	let pubsub: PubSub | undefined;
+	const pendingNotifications = new Set<Promise<void>>();
+	function trackNotification(promise: Promise<void>, what: string): void {
+		const tracked = promise.then(
+			() => undefined,
+			(error: unknown) => logger.debug({ err: error }, `best-effort ${what} publish failed`)
+		);
+		pendingNotifications.add(tracked);
+		void tracked.finally(() => pendingNotifications.delete(tracked));
+	}
+	const notifier: RunNotifier = {
+		status(runId, known) {
+			trackNotification(
+				(async () => {
+					const row = known ?? (await store.runs.get(runId));
+					if (!row) return;
+					await publisher.publishStatus({
+						runId,
+						status: row.status,
+						updatedAt: row.updatedAt.toISOString(),
+					});
+				})(),
+				"run status"
+			);
+		},
+		canceled(runIds) {
+			if (runIds.length === 0) return;
+			trackNotification(publisher.publishCancel(runIds), "cancel");
+		},
+	};
+	/** Aborts local executions of runs canceled elsewhere (pub/sub) or by the reconciler. */
+	function abortLocal(runIds: readonly string[]): void {
+		for (const runId of runIds) active.get(runId)?.abort("canceled");
+	}
+
 	const deps: ExecutorDeps = {
 		store,
 		transport,
@@ -201,7 +251,38 @@ export function createEngine(config: EngineConfig): Engine {
 		config: resolved,
 		active,
 		isShuttingDown: () => shuttingDown,
+		notify: notifier,
 	};
+
+	// --- Leader loop (Phase 6, decision 16): reconciler + retention scheduling, leader only. ---
+	const reconciler = createReconciler({
+		store,
+		transport,
+		logger,
+		graceMs: resolved.reconciler.graceMs,
+		stallTimeoutMs: resolved.stallTimeoutMs,
+		batchSize: resolved.reconciler.batchSize,
+		onCanceled: runIds => {
+			abortLocal(runIds);
+			for (const runId of runIds) notifier.status(runId);
+			notifier.canceled(runIds);
+		},
+		onStatusChange: runId => notifier.status(runId),
+	});
+	const retention = createRetention({
+		store,
+		logger,
+		days: resolved.retentionDays,
+		batchSize: resolved.retentionBatchSize,
+	});
+	let leader: LeaderElector | undefined;
+	let leaderTimer: ReturnType<typeof setInterval> | undefined;
+	let leaderTick: Promise<void> | undefined;
+	let leaderLoopStopped = false;
+	/** Set when leadership is lost: the next tick doesn't contend, giving healthier processes a turn. */
+	let skipNextAcquire = false;
+	/** Last retention window this process enqueued (the jobs are removed on completion). */
+	let lastRetentionWindow: number | undefined;
 	/** Every `executeRun` call still in progress (from the acquire to its last enqueue). */
 	const inFlight = new Set<Promise<void>>();
 
@@ -235,7 +316,10 @@ export function createEngine(config: EngineConfig): Engine {
 			...(idempotency ? { idempotency } : {}),
 		});
 		// Decision 9: only a newly created run is enqueued; an existing one is returned as-is.
-		if (result.kind === "created") await enqueue(deps, result.enqueue);
+		if (result.kind === "created") {
+			notifier.status(result.run.id, result.run);
+			await enqueue(deps, result.enqueue);
+		}
 		return { id: result.run.id, taskId: result.run.taskId };
 	}
 
@@ -294,8 +378,32 @@ export function createEngine(config: EngineConfig): Engine {
 						inFlight.delete(execution);
 					}
 				},
-				processSystem: createSystemDispatcher({ config: resolved, store, transport, active }),
+				processSystem: createSystemDispatcher({
+					config: resolved,
+					store,
+					transport,
+					active,
+					notify: notifier,
+					runRetention: () => retention.runOnce(),
+				}),
 			});
+
+			const subscriber = connections.dedicated("subscriber");
+			// ioredis reconnects (and re-subscribes) on its own; without a listener it prints every
+			// connection error to the console.
+			subscriber.on("error", (error: unknown) =>
+				logger.debug({ err: error }, "pub/sub subscriber connection error")
+			);
+			pubsub = createPubSub({
+				publisher: connections.shared(),
+				subscriber,
+				prefix: resolved.prefix,
+				logger,
+			});
+			pubsub.onCancel(abortLocal);
+			await pubsub.ready;
+
+			startLeaderLoop();
 		})();
 		startPromise = attempt.then(
 			() => {
@@ -308,6 +416,106 @@ export function createEngine(config: EngineConfig): Engine {
 			}
 		);
 		return startPromise;
+	}
+
+	function startLeaderLoop(): void {
+		leader = createLeaderElector({
+			...(typeof resolved.postgres === "string"
+				? { connectionString: resolved.postgres }
+				: { clientFactory: () => new Client(pool.options) }),
+			schema: resolved.schema,
+			logger,
+			onAcquire: () =>
+				logger.info(
+					{ schema: resolved.schema },
+					"this engine is now the leader (reconciler, retention)"
+				),
+			onLose: () => {
+				skipNextAcquire = true;
+				logger.warn(
+					{ schema: resolved.schema },
+					"leadership lost (dedicated client died); will try to reacquire on a later tick"
+				);
+			},
+		});
+		const tick = () => {
+			// Never overlap: a slow tick (big backlog, slow DB) makes the next ones skip.
+			if (leaderLoopStopped || leaderTick) return;
+			leaderTick = runLeaderTick()
+				.catch((error: unknown) => logger.error({ err: error }, "leader tick failed"))
+				.finally(() => {
+					leaderTick = undefined;
+				});
+		};
+		leaderTimer = setInterval(tick, resolved.reconciler.intervalMs);
+		leaderTimer.unref();
+		tick();
+	}
+
+	/**
+	 * One leader tick: contend for leadership (decision 16) and, only as leader, run the reconciler
+	 * (decisions 1, 3, 6) and make sure this retention window's `-system` job exists (decision 8).
+	 * If leadership is lost mid-tick the tick still finishes: every reconciler action is safe to run
+	 * concurrently with a new leader's (idempotent enqueues, re-checks under row locks).
+	 */
+	async function runLeaderTick(): Promise<void> {
+		if (!leader) return;
+		if (skipNextAcquire) {
+			skipNextAcquire = false;
+			return;
+		}
+		if (!(await leader.tryAcquire()) || leaderLoopStopped) return;
+		const report = await reconciler.runOnce();
+		const acted =
+			report.staleQueued +
+			report.staleWaiting +
+			report.orphanWaiting +
+			report.stalled.requeued +
+			report.stalled.failed +
+			report.expiredWaitpoints;
+		if (acted > 0 || report.errors > 0) logger.info({ ...report }, "reconciler tick");
+		if (leaderLoopStopped) return;
+		await scheduleRetention();
+	}
+
+	/**
+	 * Enqueues `retention` once per `retention.intervalMs` window, with jobId
+	 * `retention-${window}` where the window is derived from the DB clock (decision 17). The jobId
+	 * dedupes it across processes while the job exists; because jobs are removed on completion, this
+	 * process also remembers the last window it enqueued. A leadership change inside a window can
+	 * still cause a second sweep in it: harmless, retention is idempotent.
+	 */
+	async function scheduleRetention(): Promise<void> {
+		const { rows } = await pool.query<{ now_ms: string }>(
+			"SELECT floor(extract(epoch FROM now()) * 1000)::bigint AS now_ms"
+		);
+		const nowMs = Number(rows[0]?.now_ms);
+		if (!Number.isFinite(nowMs)) return;
+		const window = Math.floor(nowMs / resolved.retentionIntervalMs);
+		if (window === lastRetentionWindow) return;
+		await transport.enqueueSystem("retention", {}, { jobId: `retention-${window}` });
+		lastRetentionWindow = window;
+	}
+
+	/** Stops the leader loop: no new tick, waits for the running one, releases leadership. */
+	async function stopLeaderLoop(): Promise<void> {
+		leaderLoopStopped = true;
+		clearInterval(leaderTimer);
+		await leaderTick;
+		await leader?.close();
+	}
+
+	/** Bounded wait for the best-effort publishes still in flight. */
+	async function drainNotifications(timeoutMs: number): Promise<void> {
+		if (pendingNotifications.size === 0) return;
+		let timer: ReturnType<typeof setTimeout> | undefined;
+		await Promise.race([
+			Promise.allSettled(Array.from(pendingNotifications)),
+			new Promise<void>(resolve => {
+				timer = setTimeout(resolve, timeoutMs);
+			}),
+		]);
+		clearTimeout(timer);
 	}
 
 	/** Waits (bounded) for every in-flight `executeRun`, including ones that start meanwhile. */
@@ -343,6 +551,7 @@ export function createEngine(config: EngineConfig): Engine {
 				try {
 					const result = await store.runs.release(execution.owner);
 					if (result.kind === "released") {
+						notifier.status(execution.runId);
 						await enqueue(deps, result.enqueue);
 						logger.info(
 							{ runId: execution.runId, taskId: execution.taskId },
@@ -360,10 +569,11 @@ export function createEngine(config: EngineConfig): Engine {
 	}
 
 	/**
-	 * Decision 20, in order: stop fetching -> wait for active runs up to `shutdownTimeoutMs` ->
-	 * abort + release the still-active ones -> wait (bounded) for every in-flight `executeRun`, so
-	 * a run acquired during shutdown is handed back and executor-side enqueues (retry, parent
-	 * resume) land -> close the queues -> close the connections and the pool.
+	 * Decision 20, in order: stop the leader loop (await its tick, release leadership) -> stop
+	 * fetching -> wait for active runs up to `shutdownTimeoutMs` -> abort + release the
+	 * still-active ones -> wait (bounded) for every in-flight `executeRun`, so a run acquired during
+	 * shutdown is handed back and executor-side enqueues (retry, parent resume) land -> detach
+	 * pub/sub and flush pending publishes -> close the queues -> close the connections and the pool.
 	 */
 	function stop(): Promise<void> {
 		if (stopPromise) return stopPromise;
@@ -373,11 +583,14 @@ export function createEngine(config: EngineConfig): Engine {
 			try {
 				// A concurrent start() must finish (or fail) first, or its workers would leak.
 				await startPromise?.catch(() => {});
+				await stopLeaderLoop();
 				await transport.closeWorkers({
 					timeoutMs: resolved.shutdownTimeoutMs,
 					beforeClose: async () => {
 						await handBackActiveRuns();
 						await drainInFlight(IN_FLIGHT_DRAIN_MS);
+						await pubsub?.close();
+						await drainNotifications(NOTIFY_DRAIN_MS);
 					},
 				});
 			} finally {
@@ -413,9 +626,9 @@ export function createEngine(config: EngineConfig): Engine {
 			const result = await store.runs.cancel(runIdOf(run), "canceled via engine.runs.cancel()");
 			if (result.kind !== "canceled") return result.kind;
 
-			// Local executions only; cross-process abort via pub/sub comes in Phase 6. Either way
-			// ownership is already gone, so a zombie can't write anything.
-			await cancelLocally({ transport, active }, result.canceled);
+			// Aborts local executions and publishes the cancel for the other processes' (pub/sub).
+			// Either way ownership is already gone, so a zombie can't write anything.
+			await cancelLocally({ transport, active, notify: notifier }, result.canceled);
 			await afterResolution(deps, result.parent, result.expireJobsToRemove);
 			return "canceled";
 		},

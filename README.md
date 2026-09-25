@@ -228,13 +228,12 @@ started via `step.trigger`/`triggerAndWait`/`batchTriggerAndWait` that haven't f
 canceled run's `ctx.signal` fires; code that ignores the signal and keeps running can no longer
 write anything (see [Operation](#operation) — ownership is checked on every step write).
 
-<!-- TODO(phase 6): verify against implementation -->
-Canceling a run currently aborts local executions of that process only; cross-process cancellation
-(so a run being executed by a *different* process also aborts promptly, via Redis pub/sub) is part
-of the still-in-progress resilience work and should be re-verified once wired up. Until then,
-canceling a run owned by another process still marks it `canceled` in Postgres and prevents any
-further writes (ownership check), but that other process's `ctx.signal` may not fire until it next
-touches the database.
+Cancellation works across processes: the canceled run ids are published on Redis pub/sub
+(`${prefix}:cancel`), and every started engine sharing the same `prefix` aborts its local
+execution of those runs (`ctx.signal` fires with an `AbortError`). An engine that only triggers
+(never called `start()`) can cancel too: it publishes, it just doesn't subscribe. Pub/sub is only
+the fast path — if a message is lost, the run is still `canceled` in Postgres and the ownership
+check rejects every further write of the old execution (its next heartbeat also aborts it).
 
 ### Serialization rules
 
@@ -382,6 +381,11 @@ interface StepApi {
 | `shutdownTimeoutMs` | `30 000` | How long `stop()` waits for active runs before handing them back. |
 | `idempotencyKeyTtl` | `"7d"` | Default TTL for a user idempotency key; must not exceed `retention.days`. |
 | `retention.days` | `30` | Finished runs older than this are deleted (only once unparented or their parent is finished). |
+| `retention.intervalMs` | `3 600 000` | How often (per window) the leader schedules a retention sweep. |
+| `retention.batchSize` | `1 000` | Runs deleted per statement during a sweep. |
+| `reconciler.intervalMs` | `15 000` | Leader-election + reconciler tick. Also the worst-case latency to recover a lost enqueue (plus `graceMs`). |
+| `reconciler.graceMs` | `30 000` | How long a `queued`/`waiting` run may sit past its `run_after` before the reconciler re-enqueues it. |
+| `reconciler.batchSize` | `100` | Rows handled per reconciler case per tick. |
 | `limits.maxPayloadBytes` | `1 MB` | Trigger payloads, token outputs, task outputs. |
 | `limits.maxStepOutputBytes` | `256 KB` | `step.run` outputs. |
 | `limits.maxLogEntryBytes` | `16 KB` | One `ctx.logger` entry's `data`. |
@@ -424,12 +428,22 @@ interface StepApi {
   are expected to coexist in the same process without interfering with each other (no global
   state).
 
-<!-- TODO(phase 6): verify against implementation -->
-`leader.ts`, `reconciler.ts`, and `retention.ts` exist in the codebase and implement the behavior
-described above, but as of this writing they are **not yet wired into `engine.start()`/`stop()`**
-— the reconciler loop, leader election, and retention sweeps described in this section are the
-target behavior for the in-progress resilience phase, not yet something `createEngine` runs for
-you automatically. Re-verify this section once that phase completes.
+- **Leader, reconciler and retention.** Every started engine runs a timer every
+  `reconciler.intervalMs` (15 s) that tries to take the leader lock; only the leader runs the
+  reconciler (lost enqueues, stale waiting runs, orphan waiting runs — logged as a `warn` with the
+  `runId` —, stalled runs, overdue waitpoints) and schedules retention. Ticks never overlap and
+  `stop()` waits for the current one and releases the lock. If the leader's dedicated connection
+  dies, another engine takes over within a few ticks. The leader holds one extra Postgres
+  connection, outside the pool, while it leads. Retention runs as a `retention` job on the
+  internal `-system` queue, at most once per `retention.intervalMs` window (the window comes from
+  the database clock), deleting `retention.batchSize` runs per statement; any engine's `-system`
+  worker may process it (a sweep is idempotent). `engine.migrate()` never waits for the leader
+  (different advisory lock).
+- **Run status events.** Every status change the engine makes is published (best-effort) on
+  `${prefix}:run-status` with the row's `updated_at` (the feed for `engine.runs.subscribe`, still
+  in progress).
+- **Redis can be wiped.** After a `FLUSHALL` (or any lost job), the reconciler re-enqueues every
+  run from Postgres within about `reconciler.graceMs + reconciler.intervalMs`.
 
 ## Known limitations
 

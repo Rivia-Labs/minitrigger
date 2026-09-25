@@ -4,6 +4,7 @@ import type { ProcessSystemFn, Transport } from "../queue/transport.js";
 import type { CanceledRun, Store } from "../store/types.js";
 import { afterResolution } from "./execute-run.js";
 import type { ActiveExecutions } from "./execution.js";
+import type { RunNotifier } from "./notify.js";
 
 /** Names of the jobs on the internal `${prefix}-system` queue (decision 8). */
 export type SystemJobName = "waitpoint-expire" | "reconcile" | "retention" | "schedule-tick";
@@ -14,12 +15,26 @@ export interface SystemDeps {
 	transport: Pick<Transport, "enqueueRun" | "removeRunJob" | "removeSystemJob">;
 	/** Local executions, aborted when the expiry cancels their run. */
 	active: ActiveExecutions;
+	/** Publishes cancels/status changes to the other processes (best-effort). */
+	notify?: RunNotifier;
+	/**
+	 * `retention` job (Phase 6): one retention sweep, returning the number of runs deleted. Absent
+	 * => the job is ignored.
+	 */
+	runRetention?: () => Promise<number>;
 }
 
 /**
- * Dispatcher for the `-system` worker. `waitpoint-expire` (Phase 5) is implemented here;
- * `reconcile` and `retention` (Phase 6) and `schedule-tick` (Phase 8) are acknowledged as no-ops
- * until then. Handlers never throw for expected conditions (BullMQ jobs use `attempts: 1`).
+ * Dispatcher for the `-system` worker: `waitpoint-expire` (Phase 5) and `retention` (Phase 6).
+ * `reconcile` is not a job (the leader runs the reconciler inline on its own timer, see
+ * `engine.ts`) and `schedule-tick` comes with Phase 8: both are acknowledged as no-ops. Handlers
+ * never throw for expected conditions (BullMQ jobs use `attempts: 1`).
+ *
+ * `retention` is enqueued only by the leader, once per `retention.intervalMs` window (deterministic
+ * jobId), but it may be processed by the `-system` worker of ANY started engine: it does not check
+ * leadership. That is safe because a sweep is idempotent (`deleteFinishedBatch` locks with
+ * `FOR UPDATE SKIP LOCKED` and only deletes what is still eligible), so a rare second sweep in the
+ * same window (e.g. right after a leadership change) only costs a few cheap queries.
  */
 export function createSystemDispatcher(deps: SystemDeps): ProcessSystemFn {
 	const { logger } = deps.config;
@@ -27,8 +42,9 @@ export function createSystemDispatcher(deps: SystemDeps): ProcessSystemFn {
 		switch (name as SystemJobName) {
 			case "waitpoint-expire":
 				return expireWaitpoint(deps, data, job);
-			case "reconcile":
 			case "retention":
+				return retention(deps);
+			case "reconcile":
 			case "schedule-tick":
 				logger.debug({ job: name, data }, "system job has no handler yet; ignored");
 				return;
@@ -83,14 +99,32 @@ async function expireWaitpoint(deps: SystemDeps, data: unknown, job: Job): Promi
 	}
 }
 
-/** Aborts local executions of canceled runs and removes their pending run jobs (best-effort). */
+async function retention(deps: SystemDeps): Promise<void> {
+	const { logger } = deps.config;
+	if (!deps.runRetention) {
+		logger.debug({}, "retention job ignored: retention is not configured in this engine");
+		return;
+	}
+	const deleted = await deps.runRetention();
+	logger.info({ deleted }, `retention: deleted ${deleted} finished run(s)`);
+}
+
+/**
+ * Aborts local executions of canceled runs, removes their pending run jobs (best-effort) and
+ * publishes the cancel so executions in other processes abort too (their ownership is already
+ * gone either way: a zombie cannot write anything, decision 5).
+ */
 export async function cancelLocally(
-	deps: Pick<SystemDeps, "transport" | "active">,
+	deps: Pick<SystemDeps, "transport" | "active" | "notify">,
 	canceled: readonly CanceledRun[]
 ): Promise<void> {
+	if (canceled.length === 0) return;
 	for (const run of canceled) {
-		// Cross-process abort via pub/sub comes in Phase 6; ownership is already gone anyway.
 		deps.active.get(run.runId)?.abort("canceled");
+		deps.notify?.status(run.runId);
+	}
+	deps.notify?.canceled(canceled.map(run => run.runId));
+	for (const run of canceled) {
 		await deps.transport.removeRunJob(run.queue, run.runId, run.enqueueSeq);
 	}
 }

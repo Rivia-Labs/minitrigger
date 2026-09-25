@@ -18,6 +18,7 @@ import { formatError } from "../utils/error-format.js";
 import { assertSerializable, type Json, normalizeOutput } from "../utils/serialization.js";
 import { type AbortKind, type ActiveExecutions, ExecutionState } from "./execution.js";
 import { createRunLogger } from "./logger.js";
+import type { RunNotifier } from "./notify.js";
 import { type ChildTaskSpec, createStepContext, SuspendSignal } from "./step-context.js";
 
 export interface ExecutorDeps {
@@ -33,6 +34,8 @@ export interface ExecutorDeps {
 	 * the active executions, so nobody else would hand it back (decision 20).
 	 */
 	isShuttingDown?: () => boolean;
+	/** Status/cancel publishing (best-effort, Phase 6/7). Default: nothing is published. */
+	notify?: RunNotifier;
 }
 
 /** What the after-commit helpers need: enqueue a run, remove a `-system` job, log. */
@@ -97,6 +100,7 @@ export async function executeRun(deps: ExecutorDeps, job: RunJob): Promise<void>
 
 	const state = new ExecutionState(run, executionId);
 	deps.active.add(state);
+	deps.notify?.status(run.id, run);
 	try {
 		await runAcquired(deps, state);
 	} catch (error) {
@@ -119,6 +123,7 @@ async function handBackLateAcquire(
 	try {
 		const result = await deps.store.runs.release({ runId: run.id, executionId });
 		if (result.kind === "released") {
+			deps.notify?.status(run.id);
 			await enqueue(deps, result.enqueue);
 			deps.config.logger.info(fields, "run acquired during shutdown handed back to the queue");
 		}
@@ -392,6 +397,7 @@ async function settle(
 			}
 			const result = await deps.store.runs.complete(state.owner, output);
 			if (result.kind === "lost") return onLost(deps, state);
+			deps.notify?.status(state.runId);
 			return afterResolution(deps, result.parent, result.expireJobsToRemove);
 		}
 	}
@@ -404,6 +410,7 @@ async function settle(
 async function suspendRun(deps: ExecutorDeps, state: ExecutionState): Promise<void> {
 	const fields = { runId: state.runId, taskId: state.taskId, attempt: state.run.attempt };
 	const result = await deps.store.runs.suspend(state.owner);
+	if (result.kind !== "lost") deps.notify?.status(state.runId);
 	switch (result.kind) {
 		case "lost":
 			return onLost(deps, state);
@@ -447,6 +454,7 @@ async function failAttempt(
 	if (!retryable || run.attempt >= run.maxAttempts) {
 		const result = await deps.store.runs.fail(state.owner, serialized);
 		if (result.kind === "lost") return onLost(deps, state);
+		deps.notify?.status(run.id);
 		log.warn({ ...fields, error: serialized }, "run failed");
 		return afterResolution(deps, result.parent, result.expireJobsToRemove);
 	}
@@ -455,6 +463,7 @@ async function failAttempt(
 	const backoffMs = backoff ? computeBackoffMs(backoff, run.attempt) : 0;
 	const result = await deps.store.runs.retry(state.owner, serialized, backoffMs);
 	if (result.kind === "lost") return onLost(deps, state);
+	deps.notify?.status(run.id);
 	log.info({ ...fields, error: serialized, delayMs: result.enqueue.delayMs }, "run will retry");
 	await enqueue(deps, result.enqueue);
 }

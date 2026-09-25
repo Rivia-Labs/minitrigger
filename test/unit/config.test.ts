@@ -20,6 +20,9 @@ describe("resolveConfig", () => {
 		expect(r.shutdownTimeoutMs).toBe(30_000);
 		expect(r.idempotencyKeyTtlMs).toBe(7 * DAY_MS);
 		expect(r.retentionDays).toBe(30);
+		expect(r.retentionIntervalMs).toBe(3_600_000);
+		expect(r.retentionBatchSize).toBe(1_000);
+		expect(r.reconciler).toEqual({ intervalMs: 15_000, graceMs: 30_000, batchSize: 100 });
 		expect(r.systemConcurrency).toBe(5);
 		expect(r.limits).toEqual({
 			maxPayloadBytes: 1024 * 1024,
@@ -53,6 +56,18 @@ describe("resolveConfig", () => {
 		expect(r.limits.maxPayloadBytes).toBe(10);
 		expect(r.limits.maxStepOutputBytes).toBe(256 * 1024);
 		expect(r.logger).toBe(logger);
+	});
+
+	it("keeps explicit reconciler and retention options (Phase 6)", () => {
+		const r = resolveConfig({
+			...base,
+			reconciler: { intervalMs: 500, graceMs: 0, batchSize: 7 },
+			retention: { days: 10, intervalMs: 60_000, batchSize: 50 },
+		});
+		expect(r.reconciler).toEqual({ intervalMs: 500, graceMs: 0, batchSize: 7 });
+		expect(r.retentionDays).toBe(10);
+		expect(r.retentionIntervalMs).toBe(60_000);
+		expect(r.retentionBatchSize).toBe(50);
 	});
 
 	it("accepts console as a logger", () => {
@@ -91,6 +106,11 @@ describe("resolveConfig", () => {
 		{ retention: { days: 0 } },
 		{ idempotencyKeyTtl: 0 },
 		{ limits: { maxStepOutputBytes: 0 } },
+		{ reconciler: { intervalMs: 0 } },
+		{ reconciler: { graceMs: -1 } },
+		{ reconciler: { batchSize: 1.5 } },
+		{ retention: { intervalMs: 0 } },
+		{ retention: { batchSize: 0 } },
 	] as Partial<EngineConfig>[])("rejects invalid numeric option %j", override => {
 		expect(() => resolveConfig({ ...base, ...override })).toThrow(ConfigError);
 	});
@@ -100,6 +120,8 @@ describe("resolveConfig", () => {
 		{ heartbeatTimeoutMs: 2_147_483_648 },
 		{ stallTimeoutMs: 2_147_483_648 },
 		{ shutdownTimeoutMs: 2_147_483_648 },
+		{ reconciler: { intervalMs: 2_147_483_648 } },
+		{ retention: { intervalMs: 2_147_483_648 } },
 	] as Partial<EngineConfig>[])(
 		"rejects a timer-fed value above 2^31-1 ms (setTimeout would overflow and fire at once) %j",
 		override => {

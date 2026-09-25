@@ -14,6 +14,7 @@ pnpm infra:up            # Postgres 16 (localhost:54329) + Redis 7 (localhost:63
 pnpm typecheck && pnpm lint && pnpm test
 pnpm test:unit           # só unitários, sem infra
 pnpm test:integration    # precisa de infra
+pnpm test:flushall       # FLUSHALL no Redis inteiro: projeto vitest isolado, só Redis local + NODE_ENV=test
 pnpm build               # tsup → dist (ESM + CJS + d.ts)
 ```
 
@@ -90,6 +91,14 @@ Env de teste: `TEST_DATABASE_URL`, `TEST_REDIS_URL` (padrões apontam para o doc
 - **Decisão do dono (decisão 3): só waitpoints aguardados bloqueiam a retomada.** Um `token` só conta como pendente para a retomada se existir o step `${step_name}#wait` (kind `wait`) da run; `child_run`/`batch` sempre contam (nascem com o step de espera). Fonte única: `blockingWaitpointExistsSql` (`store/sql/resolve.ts`), usada por `runs.suspend`, `applyResumeRule` e pelo reconciler (`listStaleWaiting`, `repairOrphanWaiting`). Assim `createToken("ok")` → `sleep("lembrete")` → `step.run` → `waitForToken("ok")` acorda depois do sleep sem o token. Completar um token ainda não aguardado enquanto a run dorme usa a regra de retomada normal (`run_after = max(wake_at)`), sem retomada adiantada.
 - **Steps não aguardados:** se a função retorna com steps em voo (ex.: `void ctx.step.trigger(...)`), o executor loga `warn` (`step "x" was not awaited`) e faz o mesmo `allSettled` com abort de antes da suspensão (`drainInFlight`) antes do `complete`: o trigger cria a filha, o `step.run` é gravado. Se um desses steps suspender (`waitForToken`/`sleep`/`triggerAndWait` não aguardado), a suspensão vence (decisão 2): a run suspende em vez de completar e o replay devolve o output quando nada mais estiver pendente. Só no caminho `success`; erro/abort seguem como antes (escritas tardias caem no ownership). `ExecutionState.inFlight` virou `Map<Promise, nomeDoStep>`.
 
+- **Fase 6 (resiliência ligada à engine):** `start()` sobe, depois dos workers, o subscriber de pub/sub (conexão dedicada `subscriber`) e o loop do líder (`setInterval` unref de `reconciler.intervalMs`, primeiro tick imediato, sem sobreposição: tick em andamento → o próximo é pulado). Tick: `leader.tryAcquire()`; só o líder roda `reconciler.runOnce()` e agenda a retenção. Depois de perder a liderança (`onLose`), o processo pula uma tentativa para dar a vez a outro. `stop()`: para o loop (espera o tick, `leader.close()`) antes de fechar os workers; `pubsub.close()` e flush das publicações pendentes no `beforeClose`.
+- Client do líder: `connectionString` com `postgres` string, `() => new Client(pool.options)` com pool injetado (decisão 16). O líder segura uma conexão extra fora do pool.
+- **Retenção:** job `retention` na `-system` com jobId `retention-${floor(now_do_banco_ms / retention.intervalMs)}` (decisão 17). Como os jobs são removidos ao completar, o jobId só deduplica entre processos enquanto o job existe; o processo guarda a última janela enfileirada. Qualquer worker `-system` executa o job, sem checar liderança: a varredura é idempotente (`SKIP LOCKED`), uma segunda na mesma janela (troca de líder) só custa queries.
+- **Cancelamento entre processos:** `cancelLocally` (engine `runs.cancel`, expiração na `-system`) aborta locais, publica status e `publishCancel`; o `onCanceled` do reconciler aborta locais e publica. Toda engine iniciada assina `onCancel` → `abort("canceled")`. Engine só de disparo publica pela conexão compartilhada (`createPubSubPublisher`), sem assinar. `PubSub.ready` (o `start()` espera o `SUBSCRIBE`).
+- **Status publicado (costura da fase 7):** `RunNotifier` (`executor/notify.ts`) nas transições: `queued` (trigger, filhas, retry, release/hand-back), `running` (acquire), `waiting`/`queued` (suspend), `completed`/`failed`/`canceled`, stall recuperado (`onStatusChange` do reconciler). `updatedAt` vem da linha do banco: do registro retornado (create/acquire) ou de um `store.runs.get` depois da transição (as outras operações da store não devolvem `updated_at`; se virar gargalo, fazer a store devolver `updatedAt`). Tudo best-effort, fora do caminho crítico, nunca falha a run.
+- Config nova: `reconciler: { intervalMs 15 s, graceMs 30 s, batchSize 100 }`, `retention: { days 30, intervalMs 1 h, batchSize 1000 }`.
+- Teste de FLUSHALL em `test/integration-flushall/` (projeto vitest `flushall`, roda depois de `unit`+`integration` no `pnpm test`); pula com aviso se o Redis não for local ou `NODE_ENV !== "test"` (o vitest define `test`).
+
 ## Status das fases
 
 | Fase | Status |
@@ -99,7 +108,7 @@ Env de teste: `TEST_DATABASE_URL`, `TEST_REDIS_URL` (padrões apontam para o doc
 | 3 — Trigger/fila/execução | ✅ concluída — `defineTask`/registry de filas, transporte BullMQ, executor (aquisição, heartbeat, retry, timeout), engine (`trigger`, `start`, `stop` graceful, `runs.*`); revisão opus aplicada |
 | 4 — Steps/replay/sleep | ✅ concluída — `StepContext` (`src/executor/step-context.ts`): snapshot numa query, `seq_index` na chamada, memoização, `sleep`, `SuspendSignal` autoritativo, `allSettled` pré-suspensão + `runs.suspend`; `steps.kind`, `NestedStepError`; 21 testes de integração + 18 unitários |
 | 5 — Tokens/subtasks | ✅ concluída — `createToken`/`waitForToken`, `engine.tokens.complete`, handler `waitpoint-expire` na `-system`, `step.trigger`/`triggerAndWait`/`batchTriggerAndWait`, timeout dos waitpoints próprios em toda saída terminal; revisão aplicada (steps não aguardados, `run_finished`, timeout de batch preciso, jobs das filhas no reconciler, só waitpoints aguardados bloqueiam) |
-| 6 — Resiliência | em andamento (`leader.ts`, `reconciler.ts`, `retention.ts` prontos; falta ligar à engine + cancelamento pub/sub) |
+| 6 — Resiliência | ✅ concluída — loop do líder na engine (reconciler + agendamento da retenção na `-system`), cancelamento entre processos por pub/sub, publicação de status, config `reconciler`/`retention`; testes de cada caso do reconciler via engine, stall, perda/retomada de liderança, `migrate()` com líder ativo, órfã com `warn`, cancelamento entre processos, retenção em lotes e FLUSHALL (projeto isolado) |
 | 7 — Logs/eventos/consulta | pendente |
 | 8 — Schedules | em andamento (migration 002 + `ScheduleStore` prontos; falta BullMQ/engine) |
 | 9 — Modo de teste/DX | pendente |

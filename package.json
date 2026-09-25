@@ -34,9 +34,10 @@
     "typecheck": "tsc --noEmit",
     "lint": "biome check .",
     "format": "biome check --write .",
-    "test": "vitest run",
+    "test": "vitest run --project unit --project integration && vitest run --project flushall",
     "test:unit": "vitest run --project unit",
     "test:integration": "vitest run --project integration",
+    "test:flushall": "vitest run --project flushall",
     "test:watch": "vitest",
     "infra:up": "docker compose up -d --wait",
     "infra:down": "docker compose down"

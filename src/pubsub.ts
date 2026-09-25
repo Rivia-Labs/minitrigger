@@ -49,9 +49,46 @@ export interface RunStatusMessage {
 	updatedAt: string;
 }
 
-export interface PubSub {
+/** The publishing half of {@link PubSub}; needs no subscriber connection. */
+export interface PubSubPublisher {
 	publishStatus(message: RunStatusMessage): Promise<void>;
 	publishCancel(runIds: readonly string[]): Promise<void>;
+}
+
+/** The two channels of `prefix` (decision 15's namespace isolation). */
+export function pubSubChannels(prefix: string): { runStatus: string; cancel: string } {
+	const valid = validateSqlIdentifier("prefix", prefix);
+	return { runStatus: `${valid}:run-status`, cancel: `${valid}:cancel` };
+}
+
+/**
+ * Publisher only, for an engine that never subscribes (decision 19: a trigger-only engine still
+ * publishes the cancels and status changes it causes). `publisher` is any non-subscribed
+ * connection (e.g. the shared one); it is never closed here.
+ */
+export function createPubSubPublisher(options: {
+	publisher: Redis;
+	prefix: string;
+}): PubSubPublisher {
+	const channels = pubSubChannels(options.prefix);
+	const { publisher } = options;
+	return {
+		async publishStatus(message) {
+			await publisher.publish(channels.runStatus, JSON.stringify(message));
+		},
+		async publishCancel(runIds) {
+			const payload: CancelPayload = { runIds: [...runIds] };
+			await publisher.publish(channels.cancel, JSON.stringify(payload));
+		},
+	};
+}
+
+export interface PubSub extends PubSubPublisher {
+	/**
+	 * Settles once the initial `SUBSCRIBE` was acknowledged (or failed, which is only logged): a
+	 * message published before that is not received by this instance. Never rejects.
+	 */
+	readonly ready: Promise<void>;
 	/** Fires for every `publishCancel` from any process sharing this `prefix`. Returns an unsubscribe. */
 	onCancel(handler: (runIds: string[]) => void): () => void;
 	/** Fires only for `publishStatus` messages whose `runId` matches. Returns an unsubscribe. */
@@ -77,8 +114,8 @@ export function createPubSub(options: PubSubOptions): PubSub {
 	const prefix = validateSqlIdentifier("prefix", options.prefix);
 	const logger = options.logger ?? defaultLogger;
 
-	const runStatusChannel = `${prefix}:run-status`;
-	const cancelChannel = `${prefix}:cancel`;
+	const { runStatus: runStatusChannel, cancel: cancelChannel } = pubSubChannels(prefix);
+	const publish = createPubSubPublisher({ publisher, prefix });
 
 	const cancelHandlers = new Set<(runIds: string[]) => void>();
 	const statusHandlers = new Map<string, Set<(message: RunStatusMessage) => void>>();
@@ -132,19 +169,22 @@ export function createPubSub(options: PubSubOptions): PubSub {
 	// Fire-and-forget: a failure here is logged, not thrown, so a transient issue subscribing
 	// doesn't crash whatever's constructing this pub/sub. `publishStatus`/`publishCancel` on the
 	// OTHER side still work regardless (publishing never depends on this connection's state).
-	subscriber.subscribe(runStatusChannel, cancelChannel).catch((error: unknown) => {
-		warn("failed to subscribe to pub/sub channels", { error });
-	});
+	const ready = subscriber.subscribe(runStatusChannel, cancelChannel).then(
+		() => undefined,
+		(error: unknown) => {
+			warn("failed to subscribe to pub/sub channels", { error });
+		}
+	);
 
 	return {
+		ready,
 		async publishStatus(message) {
 			if (closed) return;
-			await publisher.publish(runStatusChannel, JSON.stringify(message));
+			await publish.publishStatus(message);
 		},
 		async publishCancel(runIds) {
 			if (closed) return;
-			const payload: CancelPayload = { runIds: [...runIds] };
-			await publisher.publish(cancelChannel, JSON.stringify(payload));
+			await publish.publishCancel(runIds);
 		},
 		onCancel(handler) {
 			cancelHandlers.add(handler);

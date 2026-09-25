@@ -29,6 +29,17 @@ export default defineConfig({
 					hookTimeout: 30_000,
 				},
 			},
+			{
+				// FLUSHALL wipes the whole Redis: run alone, after the other projects (`pnpm test`).
+				extends: true,
+				test: {
+					name: "flushall",
+					include: ["test/integration-flushall/**/*.test.ts"],
+					globalSetup: ["test/helpers/global-setup.ts"],
+					testTimeout: 30_000,
+					hookTimeout: 30_000,
+				},
+			},
 		],
 	},
 });

@@ -38,6 +38,11 @@ export interface ReconcilerOptions {
 	 * is logged and counted in `errors`; the parent's resume still happens.
 	 */
 	onCanceled?: (runIds: readonly string[]) => void | Promise<void>;
+	/**
+	 * Called (synchronously, never awaited) after the reconciler changed a run's status (case 4:
+	 * stalled run requeued or failed). Must not throw; the engine publishes the status (best-effort).
+	 */
+	onStatusChange?: (runId: string) => void;
 }
 
 export interface StalledReport {
@@ -72,6 +77,7 @@ export function createReconciler(options: ReconcilerOptions): Reconciler {
 		batchSize,
 		reconcileSchedules,
 		onCanceled,
+		onStatusChange,
 	} = options;
 
 	function toEnqueueInput(req: EnqueueRequest): EnqueueRunInput {
@@ -168,6 +174,7 @@ export function createReconciler(options: ReconcilerOptions): Reconciler {
 		await forEachItem(ids, "stalled", report, async runId => {
 			const result = await store.runs.recoverStalled(runId, stallTimeoutMs, error);
 			if (result.kind === "not_stalled") return; // Recovered/changed concurrently; not an error.
+			onStatusChange?.(runId);
 			if (result.kind === "requeued") {
 				await transport.enqueueRun(toEnqueueInput(result.enqueue));
 				report.stalled.requeued++;

@@ -8,8 +8,8 @@ import type { Ownership, RunRecord } from "../store/types.js";
  * - `shutdown`: `engine.stop()` gave up waiting (decision 20) -> `stop()` releases the run, the
  *   execution writes nothing more;
  * - `lost`: a guarded write/heartbeat reported lost ownership (decision 5) -> stop silently;
- * - `canceled`: `engine.runs.cancel()` in this process (cross-process pub/sub: Phase 6) -> stop
- *   silently (the cancel already cleared ownership);
+ * - `canceled`: `engine.runs.cancel()` or a waitpoint expiry, in this or any other process (via
+ *   pub/sub) -> stop silently (the cancel already cleared ownership);
  * - `suspended`: the execution was suspended (decision 2) and the suspension transaction already
  *   ran; fired only so a task function that swallowed the `SuspendSignal` stops its own work.
  */
