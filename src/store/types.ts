@@ -776,6 +776,11 @@ export interface NewSchedule {
 }
 
 export interface UpsertScheduleResult {
+	/**
+	 * The row as it is after this call: the freshly written row normally, or -- only when
+	 * {@link UpsertScheduleOptions.requireSourceMatch} blocked the write -- the pre-existing row,
+	 * untouched (see {@link conflict}).
+	 */
 	schedule: ScheduleRecord;
 	/** True when this call inserted a new row (no previous `cron`/`timezone` to compare against). */
 	created: boolean;
@@ -783,6 +788,24 @@ export interface UpsertScheduleResult {
 	cronChanged: boolean;
 	/** True when `timezone` differs from what was previously stored; always true when `created`. */
 	timezoneChanged: boolean;
+	/**
+	 * Set (instead of writing anything) when `requireSourceMatch` was given and a row already
+	 * existed under a different `source` -- e.g. an `engine.schedules.upsert()` (`source: "api"`)
+	 * call racing/targeting an id already owned by `defineTask({ schedule })` (`source:
+	 * "declarative"`), or vice versa. The caller decides what to do with the conflict (fix 4,
+	 * `src/schedules.ts`): the declarative sync logs and skips; the public API throws.
+	 */
+	conflict?: { existingSource: ScheduleSource };
+}
+
+export interface UpsertScheduleOptions {
+	/**
+	 * When true, the write only proceeds if there is no existing row with this `id` or its `source`
+	 * already matches `input.source`; otherwise nothing is written and {@link UpsertScheduleResult.conflict}
+	 * is set instead. Default false (unconditioned overwrite, incl. `source`), which is what the
+	 * plain store contract tests exercise directly.
+	 */
+	requireSourceMatch?: boolean;
 }
 
 export interface ListSchedulesFilter {
@@ -802,7 +825,7 @@ export interface ScheduleStore {
 	 * The caller (engine) uses those flags to decide whether the BullMQ job scheduler needs a
 	 * matching `upsertJobScheduler` call.
 	 */
-	upsert(input: NewSchedule): Promise<UpsertScheduleResult>;
+	upsert(input: NewSchedule, options?: UpsertScheduleOptions): Promise<UpsertScheduleResult>;
 
 	/** True if a row with `id` existed and was deleted. */
 	delete(id: string): Promise<boolean>;

@@ -3,6 +3,7 @@ import type {
 	ListSchedulesFilter,
 	ScheduleRecord,
 	ScheduleStore,
+	UpsertScheduleOptions,
 	UpsertScheduleResult,
 } from "../types.js";
 import type { Exec } from "./resolve.js";
@@ -34,7 +35,7 @@ function listSchedules(tx: MemTx, filter: ListSchedulesFilter): ScheduleRecord[]
 
 export function createScheduleStore(exec: Exec): ScheduleStore {
 	return {
-		async upsert(input): Promise<UpsertScheduleResult> {
+		async upsert(input, options: UpsertScheduleOptions = {}): Promise<UpsertScheduleResult> {
 			if (!SCHEDULE_ID_PATTERN.test(input.id)) {
 				throw new ConfigError(
 					`schedule id "${input.id}" is invalid: must match ${SCHEDULE_ID_PATTERN.source}`
@@ -42,6 +43,17 @@ export function createScheduleStore(exec: Exec): ScheduleStore {
 			}
 			return exec.run(tx => {
 				const prev = tx.db.schedules.get(input.id);
+				if (options.requireSourceMatch && prev && prev.source !== input.source) {
+					// Fix 4 (mirrors the SQL store): don't let a declarative sync clobber an `api`
+					// row (or vice-versa) with the same id.
+					return {
+						schedule: mapSchedule(prev),
+						created: false,
+						cronChanged: false,
+						timezoneChanged: false,
+						conflict: { existingSource: prev.source },
+					};
+				}
 				const row: ScheduleRow = {
 					id: input.id,
 					taskId: input.taskId,

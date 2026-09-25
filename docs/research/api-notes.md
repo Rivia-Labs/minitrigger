@@ -300,14 +300,14 @@ getSchedulerNextJobId({ nextMillis, jobSchedulerId }) {
 Every iteration's `Job.id` is **exactly** `repeat:<jobSchedulerId>:<nextMillis>` — this is
 already a deterministic, per-tick idempotency key with no extra work needed. In addition, each
 job produced by a scheduler carries on its `opts`:
-- `opts.repeatJobKey` — the scheduler id (`jobSchedulerId`)
+- `job.repeatJobKey` — the scheduler id (`jobSchedulerId`). **Verified on bullmq 6.3.8: it is NOT on `job.opts` in the processor** (the `Job` constructor moves it to `this.repeatJobKey`); also put the id in the template `data` as a fallback.
 - `opts.prevMillis` — the scheduled tick timestamp (same value baked into `job.id`)
 - `job.timestamp` — wall-clock time the *iteration record* was created (not the same as the
   scheduled tick time; use `opts.prevMillis`/the `repeat:` id suffix for the tick's logical time,
   not `job.timestamp`).
 
 So for minitrigger's own idempotency key per tick, prefer:
-`` `${job.opts.repeatJobKey}:${job.opts.prevMillis}` `` (equivalent to `job.id` minus the
+`` `${job.repeatJobKey}:${job.opts.prevMillis}` `` (equivalent to `job.id` minus the
 `repeat:` prefix) rather than deriving anything from `job.timestamp`/`processedOn`.
 
 **Missed iterations are not backfilled.** `JobScheduler.upsertJobScheduler`'s tick-advance logic

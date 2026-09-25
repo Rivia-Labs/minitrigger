@@ -86,4 +86,17 @@ describe("checkRedisEvictionPolicy", () => {
 		expect(warning).toMatch(/could not read Redis/);
 		expect(warning).toMatch(/unknown command 'CONFIG'/);
 	});
+
+	// Fix 10 (opus review): an empty/unexpected reply is the check being *unable to answer*
+	// (decision 22), not a wrong answer -- it must warn, not throw.
+	it.each<[string, unknown]>([
+		["an empty array", []],
+		["null", null],
+		["an empty object", {}],
+		["a bare string", "noeviction"],
+	])("returns a warning (does not throw) for %s reply", async (_name, reply) => {
+		const warning = await checkRedisEvictionPolicy(fakeClient(reply));
+		expect(warning).toBeDefined();
+		expect(warning).toMatch(/unexpected/);
+	});
 });

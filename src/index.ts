@@ -24,6 +24,14 @@ export {
 	type TriggerOptions,
 } from "./engine.js";
 export {
+	type CheckEnvironmentOptions,
+	checkEnvironment,
+	type EnvCheckName,
+	type EnvCheckReport,
+	type EnvCheckWarning,
+	MIN_POSTGRES_VERSION_NUM,
+} from "./env-check.js";
+export {
 	AbortTaskRunError,
 	ConfigError,
 	DuplicateStepError,
@@ -35,6 +43,7 @@ export {
 	TaskNotRegisteredError,
 } from "./errors.js";
 export type { MigrateResult } from "./migrations/migrate.js";
+export type { EngineSchedules, Schedule, ScheduleUpsertInput } from "./schedules.js";
 export type { LogLevel, RunCursor, RunStatus, StepKind, StepStatus } from "./store/types.js";
 export type {
 	AnyTask,

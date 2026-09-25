@@ -6,6 +6,7 @@ import type {
 	ScheduleRecord,
 	ScheduleSource,
 	ScheduleStore,
+	UpsertScheduleOptions,
 	UpsertScheduleResult,
 } from "../types.js";
 import { atomic, direct, type SqlContext, type SqlExecutor } from "./db.js";
@@ -70,16 +71,39 @@ export function createScheduleStore(exec: SqlExecutor, ctx: SqlContext): Schedul
 	}
 
 	return {
-		async upsert(input: NewSchedule): Promise<UpsertScheduleResult> {
+		async upsert(
+			input: NewSchedule,
+			options: UpsertScheduleOptions = {}
+		): Promise<UpsertScheduleResult> {
 			validateScheduleId(input.id);
 			return atomic(exec, async db => {
 				// Lock any existing row first so a concurrent upsert of the same id can't read a
 				// stale "previous" cron/timezone while this one is still in flight.
-				const existing = await db.query<{ cron: string; timezone: string | null }>(
-					`SELECT cron, timezone FROM ${schedules} WHERE id = $1 FOR UPDATE`,
-					[input.id]
-				);
+				const existing = await db.query<{
+					cron: string;
+					timezone: string | null;
+					source: ScheduleSource;
+				}>(`SELECT cron, timezone, source FROM ${schedules} WHERE id = $1 FOR UPDATE`, [input.id]);
 				const prev = existing.rows[0];
+
+				if (options.requireSourceMatch && prev && prev.source !== input.source) {
+					// Fix 4: a declarative sync must not clobber an `api` row with the same id and
+					// vice-versa. Still holding the row lock from the SELECT above, but writing
+					// nothing: report the conflict and let the caller (`src/schedules.ts`) decide.
+					const { rows: currentRows } = await db.query<ScheduleRow>(
+						`SELECT ${SCHEDULE_COLUMNS} FROM ${schedules} WHERE id = $1`,
+						[input.id]
+					);
+					const current = currentRows[0];
+					if (!current) throw new Error("schedules upsert: row disappeared under FOR UPDATE");
+					return {
+						schedule: mapSchedule(current),
+						created: false,
+						cronChanged: false,
+						timezoneChanged: false,
+						conflict: { existingSource: prev.source },
+					};
+				}
 
 				const { rows } = await db.query<ScheduleRow>(
 					`INSERT INTO ${schedules} (id, task_id, cron, timezone, payload, source, created_at, updated_at)

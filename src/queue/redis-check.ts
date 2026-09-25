@@ -34,9 +34,19 @@ export async function checkRedisEvictionPolicy(
 	}
 
 	const policy = extractPolicy(reply);
+	if (policy === undefined) {
+		// Fix 10 (opus review): a reply that doesn't parse as `["maxmemory-policy", value]`/a
+		// map-like object -- e.g. empty, null, or some other unexpected shape from a proxy in front
+		// of Redis -- is the check being unable to get a definitive answer (decision 22), not the
+		// definitive wrong answer that should fail startup.
+		return (
+			`Redis's "CONFIG GET maxmemory-policy" replied with something unexpected ` +
+			`(${JSON.stringify(reply)}) -- skipping this check`
+		);
+	}
 	if (policy !== REQUIRED_POLICY) {
 		throw new ConfigError(
-			`Redis "maxmemory-policy" is "${policy ?? "unknown"}", but minitrigger requires ` +
+			`Redis "maxmemory-policy" is "${policy}", but minitrigger requires ` +
 				`"${REQUIRED_POLICY}": any other policy lets Redis evict keys under memory pressure, ` +
 				`which can silently drop queued/delayed BullMQ job data. Set ` +
 				`"maxmemory-policy ${REQUIRED_POLICY}" in your Redis configuration.`

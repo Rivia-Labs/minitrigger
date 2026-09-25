@@ -28,12 +28,23 @@ export type TaskQueueOptions = {
 	rateLimit?: { max: number; durationMs: number };
 };
 
-/** Declarative cron schedule (Phase 8). Synced by `engine.start()`. */
+/**
+ * Declarative cron schedule (Phase 8). Synced by `engine.start()`.
+ *
+ * `payload` is guarded the same way `engine.schedules.upsert()`'s payload field is
+ * ({@link TriggerPayloadField}, `src/schedules.ts`): optional for a task that takes no payload,
+ * required and {@link Serializable}-checked otherwise. This is a plain object property (not a
+ * function parameter), so -- unlike `defineTask`'s own `P`/`O` checks -- no contravariance
+ * work-around is needed; `NormalizePayload` only standardizes what "no payload" means (raw `P` as
+ * inferred from `run` can be `unknown`, not yet `NoPayload`) so this matches `TaskPayload<T>`'s own
+ * normalization.
+ */
 export type TaskScheduleOptions<P> = {
 	cron: string;
 	timezone?: string;
-	payload?: P;
-};
+} & ([NormalizePayload<P>] extends [NoPayload]
+	? { payload?: P }
+	: { payload: P & Serializable<P> });
 
 // ---------------------------------------------------------------------------
 // TaskOptions / defineTask
@@ -131,6 +142,15 @@ export type PayloadArgs<P, Rest extends unknown[]> = [P] extends [NoPayload]
 
 /** Extracts the output type `O` of a `Task`. */
 export type TaskOutput<T extends AnyTask> = T extends Task<any, any, infer O> ? O : never;
+
+/**
+ * The `payload` field of a trigger-like *options object* (as opposed to `PayloadArgs`'s positional
+ * argument list): absent for a task that takes no payload, required and {@link Serializable}-checked
+ * otherwise. Used by `engine.schedules.upsert()`'s `ScheduleUpsertInput` (`src/schedules.ts`, fix 5).
+ */
+export type TriggerPayloadField<T extends AnyTask> = [TaskPayload<T>] extends [NoPayload]
+	? { payload?: TaskPayload<T> }
+	: { payload: TaskPayload<T> & Serializable<TaskPayload<T>> };
 
 // ---------------------------------------------------------------------------
 // TaskContext / TaskLogger

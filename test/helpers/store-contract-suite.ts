@@ -1734,5 +1734,66 @@ export function defineStoreContractSuite(get: () => StoreHarness): void {
 			expect(await s().schedules.deleteDeclarativeExcept([])).toBe(1);
 			expect((await s().schedules.list()).map(x => x.id)).toEqual(["b"]);
 		});
+
+		// Fix 4 (opus review, Phase 8): `requireSourceMatch` guards a declarative sync
+		// (`defineTask({ schedule })`) and an `engine.schedules.upsert()` (source "api") call from
+		// clobbering each other's row when they collide on the same id.
+		describe("upsert({ requireSourceMatch: true })", () => {
+			it("writes normally when there is no existing row", async () => {
+				const result = await s().schedules.upsert(input({ id: "fresh" }), {
+					requireSourceMatch: true,
+				});
+				expect(result.conflict).toBeUndefined();
+				expect(result.created).toBe(true);
+				expect(result.schedule).toMatchObject({ id: "fresh", source: "api" });
+			});
+
+			it("writes normally when the existing row already has the same source", async () => {
+				await s().schedules.upsert(input({ id: "same-source", source: "api" }));
+				const result = await s().schedules.upsert(
+					input({ id: "same-source", source: "api", cron: "0 10 * * *" }),
+					{ requireSourceMatch: true }
+				);
+				expect(result.conflict).toBeUndefined();
+				expect(result.schedule.cron).toBe("0 10 * * *");
+			});
+
+			it("blocks the write and reports the conflict when the existing row has a different source (declarative vs api)", async () => {
+				await s().schedules.upsert(
+					input({ id: "conflict-1", source: "declarative", cron: "0 9 * * *" })
+				);
+				const result = await s().schedules.upsert(
+					input({ id: "conflict-1", source: "api", cron: "0 10 * * *" }),
+					{ requireSourceMatch: true }
+				);
+				expect(result.conflict).toEqual({ existingSource: "declarative" });
+				// Nothing was written: the row is exactly as it was before this call.
+				expect(result.schedule).toMatchObject({ source: "declarative", cron: "0 9 * * *" });
+				expect(await s().schedules.get("conflict-1")).toMatchObject({
+					source: "declarative",
+					cron: "0 9 * * *",
+				});
+			});
+
+			it("blocks the write in the other direction too (api vs declarative)", async () => {
+				await s().schedules.upsert(input({ id: "conflict-2", source: "api", cron: "0 9 * * *" }));
+				const result = await s().schedules.upsert(
+					input({ id: "conflict-2", source: "declarative", cron: "0 10 * * *" }),
+					{ requireSourceMatch: true }
+				);
+				expect(result.conflict).toEqual({ existingSource: "api" });
+				expect(await s().schedules.get("conflict-2")).toMatchObject({
+					source: "api",
+					cron: "0 9 * * *",
+				});
+			});
+
+			it("without requireSourceMatch, a different source still overwrites (unconditioned upsert)", async () => {
+				await s().schedules.upsert(input({ id: "no-guard", source: "declarative" }));
+				const result = await s().schedules.upsert(input({ id: "no-guard", source: "api" }));
+				expect(result.conflict).toBeUndefined();
+				expect(result.schedule.source).toBe("api");
+			});
+		});
 	});
 }

@@ -2,7 +2,7 @@ import { Job, Queue, Worker } from "bullmq";
 import { ConfigError } from "../errors.js";
 import { validateQueueName, validateSqlIdentifier } from "../utils/identifiers.js";
 import type { RedisConnections } from "./connections.js";
-import { runJobId, systemQueueName } from "./ids.js";
+import { runJobId, SCHEDULE_TICK_JOB_NAME, systemQueueName } from "./ids.js";
 import { checkRedisEvictionPolicy } from "./redis-check.js";
 
 /**
@@ -30,6 +30,16 @@ export interface CreateTransportOptions {
 	queues: ResolvedQueueConfig[];
 	/** Concurrency of the always-on `-system` worker (decision 8). */
 	systemConcurrency?: number;
+	/**
+	 * This engine's Postgres schema (fix 8, `docs/HANDOFF.md`/`CLAUDE.md` Phase 8 notes): tagged onto
+	 * every `upsertJobScheduler` job template's `data` (`{ scheduleId, schema }`) and readable back via
+	 * {@link JobSchedulerInfo.schema}, so `createReconcileSchedulesHook` can tell a scheduler that
+	 * belongs to a DIFFERENT engine sharing this Redis `prefix` apart from a genuine orphan and never
+	 * delete it. Optional: omitted in tests/call sites that don't need the distinction (every
+	 * scheduler is then untagged, matching the pre-fix behavior). `prefix` should still be unique per
+	 * schema in practice (documented in `README.md`); this tag is a safety net, not a substitute.
+	 */
+	schema?: string;
 }
 
 export interface EnqueueRunInput {
@@ -42,6 +52,29 @@ export interface EnqueueRunInput {
 export interface EnqueueSystemOptions {
 	jobId?: string;
 	delayMs?: number;
+}
+
+/** Input of {@link Transport.upsertJobScheduler} (Phase 8, decision 8). */
+export interface UpsertJobSchedulerInput {
+	/** The schedule's own id (`schedules.id`); used verbatim as the BullMQ job scheduler id. */
+	id: string;
+	/** Cron pattern (`RepeatOptions.pattern`). */
+	pattern: string;
+	/** IANA timezone (`RepeatOptions.tz`); omitted = BullMQ's default (UTC-based `cron-parser`). */
+	timezone?: string;
+}
+
+/** One BullMQ job scheduler's live cron/timezone, as read back from Redis. */
+export interface JobSchedulerInfo {
+	id: string;
+	pattern: string | undefined;
+	timezone: string | undefined;
+	/**
+	 * The schema tag from the job template's `data` (fix 8), when this scheduler was created by a
+	 * `createTransport` given a `schema` (every engine started after that fix). Omitted for a
+	 * scheduler created before this fix, by a caller that omitted `schema`, or by a plain test fake.
+	 */
+	schema?: string;
 }
 
 export type ProcessRunFn = (queue: string, data: RunJobData, job: Job<RunJobData>) => Promise<void>;
@@ -85,6 +118,20 @@ export interface Transport {
 	): Promise<void>;
 	/** Best-effort: ignores "locked" and "not found" (decision 10: expiry-job removal happens outside the resolving transaction). */
 	removeSystemJob(jobId: string): Promise<void>;
+	/**
+	 * Creates or updates a BullMQ job scheduler on the `-system` queue (decision 8): each tick it
+	 * produces is dispatched as a `schedule-tick` job (`queue/ids.ts#SCHEDULE_TICK_JOB_NAME`),
+	 * carrying `{ scheduleId: input.id }` and BullMQ's own deterministic id
+	 * `repeat:<input.id>:<nextMillis>`. Idempotent: re-upserting the same pattern/timezone is a
+	 * no-op tick-wise (BullMQ only replaces the pending next iteration).
+	 */
+	upsertJobScheduler(input: UpsertJobSchedulerInput): Promise<void>;
+	/** True if a scheduler with this id existed and was removed; false if there was none. */
+	removeJobScheduler(id: string): Promise<boolean>;
+	/** `undefined` if no scheduler with this id exists. */
+	getJobScheduler(id: string): Promise<JobSchedulerInfo | undefined>;
+	/** Every job scheduler currently registered on the `-system` queue. */
+	listJobSchedulers(): Promise<JobSchedulerInfo[]>;
 	startWorkers(opts: StartWorkersOptions): Promise<void>;
 	/**
 	 * Stops fetching new jobs immediately, waits up to `timeoutMs` for jobs
@@ -141,10 +188,22 @@ const STALLED_INTERVAL_MS = 30_000;
  */
 const WORKER_CLOSE_GRACE_MS = 2_000;
 
+/**
+ * `schedule-tick` jobs (Phase 8) are the one deliberate exception to decision 4's `attempts: 1`
+ * (which is about *run* jobs, not `-system` jobs -- see `CLAUDE.md`, Phase 8 notes): a tick that
+ * fails (e.g. this process doesn't have the schedule's task registered mid rolling-deploy) is safe
+ * to let BullMQ itself retry with backoff, because the run each tick creates is guarded by the
+ * `__schedule:${id}:${ts}` idempotency key (decision 9) -- a retried tick that already succeeded
+ * elsewhere is a harmless no-op `"existing"`, never a duplicate run.
+ */
+const SCHEDULE_TICK_ATTEMPTS = 5;
+const SCHEDULE_TICK_BACKOFF_DELAY_MS = 1_000;
+
 export function createTransport(options: CreateTransportOptions): Transport {
 	const prefix = validateSqlIdentifier("prefix", options.prefix);
 	const systemConcurrency = options.systemConcurrency ?? 5;
 	const connections = options.connections;
+	const schema = options.schema;
 
 	const resolvedQueues = options.queues.map(q => ({ ...q, name: validateQueueName(q.name) }));
 	const sysQueueName = systemQueueName(prefix);
@@ -235,6 +294,60 @@ export function createTransport(options: CreateTransportOptions): Transport {
 		} catch {
 			// Best-effort.
 		}
+	}
+
+	async function upsertJobScheduler(input: UpsertJobSchedulerInput): Promise<void> {
+		await systemQueue.upsertJobScheduler(
+			input.id,
+			{ pattern: input.pattern, ...(input.timezone !== undefined ? { tz: input.timezone } : {}) },
+			{
+				name: SCHEDULE_TICK_JOB_NAME,
+				data: { scheduleId: input.id, ...(schema !== undefined ? { schema } : {}) },
+				opts: {
+					removeOnComplete: true,
+					removeOnFail: true,
+					// Fix 2/3: see the module-level comment on `SCHEDULE_TICK_ATTEMPTS`.
+					attempts: SCHEDULE_TICK_ATTEMPTS,
+					backoff: { type: "exponential", delay: SCHEDULE_TICK_BACKOFF_DELAY_MS },
+				},
+			}
+		);
+	}
+
+	async function removeJobScheduler(id: string): Promise<boolean> {
+		return systemQueue.removeJobScheduler(id);
+	}
+
+	function schedulerInfo(
+		id: string,
+		scheduler: { pattern?: string; tz?: string; template?: { data?: unknown } }
+	): JobSchedulerInfo {
+		const data = scheduler.template?.data;
+		const taggedSchema =
+			data !== null &&
+			typeof data === "object" &&
+			typeof (data as { schema?: unknown }).schema === "string"
+				? (data as { schema: string }).schema
+				: undefined;
+		// `exactOptionalPropertyTypes`: `schema` must be omitted, not set to `undefined`, when untagged.
+		return {
+			id,
+			pattern: scheduler.pattern,
+			timezone: scheduler.tz,
+			...(taggedSchema !== undefined ? { schema: taggedSchema } : {}),
+		};
+	}
+
+	async function getJobScheduler(id: string): Promise<JobSchedulerInfo | undefined> {
+		const scheduler = await systemQueue.getJobScheduler(id);
+		if (!scheduler) return undefined;
+		return schedulerInfo(id, scheduler);
+	}
+
+	async function listJobSchedulers(): Promise<JobSchedulerInfo[]> {
+		// Default `start=0, end=-1` (BullMQ's own default) returns every scheduler.
+		const schedulers = await systemQueue.getJobSchedulers();
+		return schedulers.map(s => schedulerInfo(s.key, s));
 	}
 
 	async function startWorkers(opts: StartWorkersOptions): Promise<void> {
@@ -370,6 +483,10 @@ export function createTransport(options: CreateTransportOptions): Transport {
 		removeRunJob,
 		enqueueSystem,
 		removeSystemJob,
+		upsertJobScheduler,
+		removeJobScheduler,
+		getJobScheduler,
+		listJobSchedulers,
 		startWorkers,
 		closeWorkers,
 		checkRedis,

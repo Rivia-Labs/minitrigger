@@ -1,6 +1,8 @@
 import { DelayedError, type Job } from "bullmq";
 import type { ResolvedConfig } from "../config.js";
 import type { ProcessSystemFn, Transport } from "../queue/transport.js";
+import type { Registry } from "../registry.js";
+import { processScheduleTick } from "../schedules.js";
 import type { CanceledRun, Store } from "../store/types.js";
 import { afterResolution } from "./execute-run.js";
 import type { ActiveExecutions } from "./execution.js";
@@ -12,7 +14,15 @@ export type SystemJobName = "waitpoint-expire" | "reconcile" | "retention" | "sc
 export interface SystemDeps {
 	config: Pick<ResolvedConfig, "logger">;
 	store: Store;
-	transport: Pick<Transport, "enqueueRun" | "removeRunJob" | "removeSystemJob">;
+	transport: Pick<
+		Transport,
+		| "enqueueRun"
+		| "removeRunJob"
+		| "removeSystemJob"
+		| "upsertJobScheduler"
+		| "removeJobScheduler"
+		| "getJobScheduler"
+	>;
 	/** Local executions, aborted when the expiry cancels their run. */
 	active: ActiveExecutions;
 	/** Publishes cancels/status changes to the other processes (best-effort). */
@@ -22,19 +32,23 @@ export interface SystemDeps {
 	 * => the job is ignored.
 	 */
 	runRetention?: () => Promise<number>;
+	/** Needed by `schedule-tick` (Phase 8) to resolve the schedule's task (queue, maxAttempts). */
+	registry: Registry;
 }
 
 /**
- * Dispatcher for the `-system` worker: `waitpoint-expire` (Phase 5) and `retention` (Phase 6).
- * `reconcile` is not a job (the leader runs the reconciler inline on its own timer, see
- * `engine.ts`) and `schedule-tick` comes with Phase 8: both are acknowledged as no-ops. Handlers
- * never throw for expected conditions (BullMQ jobs use `attempts: 1`).
+ * Dispatcher for the `-system` worker: `waitpoint-expire` (Phase 5), `retention` (Phase 6) and
+ * `schedule-tick` (Phase 8, `src/schedules.ts#processScheduleTick`). `reconcile` is not a job (the
+ * leader runs the reconciler inline on its own timer, see `engine.ts`): acknowledged as a no-op.
+ * Handlers never throw for expected conditions (BullMQ jobs use `attempts: 1`).
  *
  * `retention` is enqueued only by the leader, once per `retention.intervalMs` window (deterministic
  * jobId), but it may be processed by the `-system` worker of ANY started engine: it does not check
  * leadership. That is safe because a sweep is idempotent (`deleteFinishedBatch` locks with
  * `FOR UPDATE SKIP LOCKED` and only deletes what is still eligible), so a rare second sweep in the
- * same window (e.g. right after a leadership change) only costs a few cheap queries.
+ * same window (e.g. right after a leadership change) only costs a few cheap queries. `schedule-tick`
+ * is the same: any `-system` worker may process a tick, made safe by the run's idempotency key
+ * (decision 9) rather than by leadership.
  */
 export function createSystemDispatcher(deps: SystemDeps): ProcessSystemFn {
 	const { logger } = deps.config;
@@ -44,14 +58,75 @@ export function createSystemDispatcher(deps: SystemDeps): ProcessSystemFn {
 				return expireWaitpoint(deps, data, job);
 			case "retention":
 				return retention(deps);
-			case "reconcile":
 			case "schedule-tick":
+				return scheduleTick(deps, data, job);
+			case "reconcile":
 				logger.debug({ job: name, data }, "system job has no handler yet; ignored");
 				return;
 			default:
 				logger.warn({ job: name }, "unknown system job ignored");
 		}
 	};
+}
+
+/**
+ * `job.repeatJobKey` is the schedule's own id, set by BullMQ itself on every job a job scheduler
+ * produces (a top-level `Job` property, NOT under `job.opts` -- verified against the installed
+ * `bullmq` version directly: `Job`'s constructor pulls `repeatJobKey` out of `opts` and assigns it
+ * to `this.repeatJobKey`, `dist/cjs/classes/job.js`; `docs/research/api-notes.md` §1.10 describes it
+ * as `opts.repeatJobKey`, which is only true of the `Job` instance `upsertJobScheduler()` itself
+ * returns, not of the job as received by a worker's processor). `data.scheduleId` (set by
+ * `Transport.upsertJobScheduler`'s job template) is a fallback for a job added some other way.
+ * `job.opts.prevMillis` is this tick's logical scheduled time; `job.timestamp` (when the job record
+ * was created) is the fallback if it is somehow missing. Both `job.repeatJobKey` and
+ * `job.opts.prevMillis` are properties of the underlying Redis job hash, so they survive a BullMQ
+ * retry of the same job unchanged (verified against `bullmq` 6.3.8: a retry re-processes the exact
+ * same `Job` record, it does not produce a new tick from the scheduler) -- the retry (fix 2/3,
+ * `upsertJobScheduler`'s `attempts: 5` + exponential backoff template opts) resolves the same
+ * `scheduleId`/`scheduledAtMs` every time, so it targets the same `__schedule:${id}:${ts}`
+ * idempotency key as the attempt(s) before it.
+ *
+ * Every failure -- including `processScheduleTick` propagating `TaskNotRegisteredError` when this
+ * process doesn't have `schedule.taskId` registered (fix 2/3: that case is deliberately NOT
+ * swallowed here or in `processScheduleTick`, so BullMQ's retry gets a chance to land on a process
+ * that does) -- is logged with `scheduleId`/`scheduledAtMs` before being rethrown, so it's always
+ * visible which occurrence of which schedule failed, even though the handler itself never catches
+ * it into a no-op.
+ */
+async function scheduleTick(deps: SystemDeps, data: unknown, job: Job): Promise<void> {
+	const { logger } = deps.config;
+	const scheduleId =
+		typeof job.repeatJobKey === "string"
+			? job.repeatJobKey
+			: (data as { scheduleId?: unknown } | null)?.scheduleId;
+	if (typeof scheduleId !== "string") {
+		logger.warn(
+			{ jobId: job.id, data },
+			"schedule-tick job without a resolvable scheduleId ignored"
+		);
+		return;
+	}
+	const scheduledAtMs =
+		typeof job.opts.prevMillis === "number" ? job.opts.prevMillis : job.timestamp;
+	try {
+		await processScheduleTick(
+			{
+				store: deps.store,
+				transport: deps.transport,
+				registry: deps.registry,
+				logger,
+				...(deps.notify ? { notify: deps.notify } : {}),
+			},
+			scheduleId,
+			scheduledAtMs
+		);
+	} catch (error) {
+		logger.error(
+			{ err: error, scheduleId, scheduledAtMs },
+			"schedule tick failed; BullMQ will retry it per the job scheduler's attempts/backoff"
+		);
+		throw error;
+	}
 }
 
 /**

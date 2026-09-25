@@ -1,6 +1,6 @@
 # Handoff — estado do projeto e próximos passos
 
-Atualizado em 2026-09-24, HEAD `615ccac`. Leia junto com `CLAUDE.md` (decisões e notas de implementação), `docs/SPEC.md` (fonte da verdade) e `docs/PLAN.md` (grafo de tarefas e modelos).
+Atualizado em 2026-09-25. Leia junto com `CLAUDE.md` (decisões e notas de implementação), `docs/SPEC.md` (fonte da verdade) e `docs/PLAN.md` (grafo de tarefas e modelos).
 
 ## Estado atual
 
@@ -33,37 +33,30 @@ Atualizado em 2026-09-24, HEAD `615ccac`. Leia junto com `CLAUDE.md` (decisões 
 ### 1. Pendência de desempenho — ✅ resolvida
 O `RunNotifier` recebe `RunStatusInfo` dos resultados da store; teste `test/integration/notify-perf.test.ts`.
 
-### 2. Fase 8 — agendamentos na engine (sonnet + revisão opus)
-Pronto: migration 002 e `ScheduleStore` (upsert/delete/get/list/listDeclarative/deleteDeclarativeExcept).
-Falta:
-- `engine.schedules.upsert/delete/list` gravando no Postgres e depois `upsertJobScheduler` na fila `${prefix}-system` (ticks na `-system`, decisão 8).
-- Handler do tick na `-system`: ler o schedule no Postgres; inexistente → remover o scheduler e não criar run; cron/timezone divergentes → refazer `upsertJobScheduler`; payload sempre do Postgres. Chave `__schedule:${id}:${timestampAgendado}` (o id do job do tick é `repeat:<schedulerId>:<nextMillis>`, ver `docs/research/api-notes.md`).
-- `schedule: { cron, timezone }` em `defineTask`: sync no `start()` (cria/atualiza; remoção só com `schedules: { pruneDeclarative: true }`).
-- Reconciliação bidirecional no reconciler (hook `reconcileSchedules` já existe em `src/reconciler.ts`).
-- Documentar que ticks perdidos com todos os processos parados não são recuperados.
-- Aceite: cron de alta frequência com dois processos sem duplicatas; declarativo removido persiste sem `pruneDeclarative`; `delete` com falha no BullMQ não gera run no tick seguinte; payload alterado só no Postgres é o usado.
-- Atualizar a seção `TODO(phase 8)` do README (linha ~349).
+### 2. Fase 8 — ✅ concluída
+`src/schedules.ts` (API, tick, sync declarativo, hook do reconciler); revisão opus aplicada (ordem de leitura do reconciler, retries do tick, guarda de `source`, tag de schema, tipos do payload). Notas no `CLAUDE.md`.
 
 ### 3. Fase 9 — modo de teste e DX (opus para 9.2a, sonnet para o resto)
 - `createTestEngine()` / `engine.runInline(task, payload)` usando `createMemoryStore` (`src/store/memory`), `sleep` instantâneo (relógio injetável), tokens completáveis manualmente, sem Redis. Exige um transporte em memória no lugar do BullMQ (interface de `src/queue/transport.ts`).
 - Observação: a engine lê o relógio do banco direto via `pool.query` para a janela de retenção — no modo de teste usar o relógio da store em memória.
-- Checagens na inicialização: versão do Postgres, `maxmemory-policy` (já em `src/queue/redis-check.ts`), migrations pendentes (`pendingMigrations`). Decisão 22: comando indisponível → aviso; resposta errada → erro.
+- ✅ Checagens na inicialização: `src/env-check.ts` (`checkEnvironment`, Postgres ≥ 13, `maxmemory-policy`, migrations pendentes), ligado ao `start()` e exportado.
 - Mensagens de erro acionáveis (revisar as existentes).
 - Testes de tipo de `Serializable<T>` com erros legíveis (já há boa cobertura em `test/unit/serializable-types.test.ts` e `task-types.test.ts`; completar).
 - Aceite: exemplo de teste de task do usuário sem infra; teste da checagem de Redis simulando `CONFIG` bloqueado.
 
 ### 4. Fase 10 — exemplo, docs, empacotamento (sonnet)
-- `examples/basic` completo: steps, sleep, token de aprovação, subtask, cron, agente de IA simples (LLM mockado). Só importar de `"minitrigger"`.
+- ✅ `examples/basic` completo (`pnpm start` em `examples/basic`, sai com 0 em ~3 s).
 - `pnpm pack` → instalar o `.tgz` num diretório limpo, importar em ESM e CJS, rodar o exemplo.
 - Instalação via GitHub (`pnpm add github:usuario/minitrigger`): o `prepare` roda o tsup e o pnpm pode bloquear scripts de dependências git; validar ou documentar e adotar `.tgz` em GitHub Releases.
 - README: remover os `TODO(phase N)` restantes (linha ~61 é a instalação via GitHub), conferir toda a API pública contra `src/index.ts`.
-- Benchmark `pnpm bench`: 1.000 runs de 3 steps, throughput e latência de retomada; registrar no `CLAUDE.md`.
+- ✅ `pnpm bench` e `pnpm check:pack` (resultados no `CLAUDE.md`); instalação via GitHub investigada em `docs/research/github-install.md` (falta levar a recomendação ao README).
 
 ### 5. Pontos menores registrados (sem urgência)
 - `runs.list` sem `taskId` ordena todas as linhas: considerar índice `runs(created_at DESC, id DESC)` (nota em `docs/store-contract.md`).
 - Token que expirou sozinho numa run que depois terminou reporta `run_finished`.
 - Task que lança com steps ainda em voo não espera por eles (gravações tardias são rejeitadas pelo ownership).
 - Filtros de data de `runs.list` se chamam `createdFrom`/`createdTo` (spec não fixa nomes).
+- `step.run` com retorno em união precisa de genérico explícito (`ctx.step.run<T>(...)`): a inferência pelo guard `StepRunResult<T>` colapsa a união (visto no exemplo).
 - Argumentos inválidos de step (fn não-função, duração inválida) ainda contam tentativa; só nome inválido é fatal.
 
 ## Como retomar

@@ -16,6 +16,7 @@ import {
 	type ResolvedConfig,
 	resolveConfig,
 } from "./config.js";
+import { checkEnvironment } from "./env-check.js";
 import { ConfigError, MinitriggerError } from "./errors.js";
 import {
 	ActiveExecutions,
@@ -46,6 +47,12 @@ import { createTransport, type Transport } from "./queue/transport.js";
 import { createReconciler } from "./reconciler.js";
 import { buildRegistry, getTask, type Registry } from "./registry.js";
 import { createRetention } from "./retention.js";
+import {
+	createReconcileSchedulesHook,
+	createSchedulesApi,
+	type EngineSchedules,
+	syncDeclarativeSchedules,
+} from "./schedules.js";
 import { createSqlStore } from "./store/sql/index.js";
 import {
 	type Json,
@@ -310,6 +317,7 @@ export interface Engine {
 	): Promise<RunHandle<TaskOutput<T>>>;
 	runs: EngineRuns;
 	tokens: EngineTokens;
+	schedules: EngineSchedules;
 	/** Local run events of this process. */
 	events: EngineEvents;
 }
@@ -339,6 +347,7 @@ export function createEngine(config: EngineConfig): Engine {
 		connections,
 		queues: Array.from(registry.queues.values()),
 		systemConcurrency: resolved.systemConcurrency,
+		schema: resolved.schema,
 	});
 
 	const active = new ActiveExecutions();
@@ -444,6 +453,17 @@ export function createEngine(config: EngineConfig): Engine {
 
 	const streams = createStreams({ redis: connections.shared(), prefix: resolved.prefix });
 
+	// --- Schedules (Phase 8, decisions 8, 9, 17, 21). `engine.schedules.*` works without start()
+	// (the `-system` `Queue` already exists once the transport is built); only the tick HANDLER
+	// (which needs the `-system` worker) and the declarative sync require it. ---
+	const schedules: EngineSchedules = createSchedulesApi({
+		store,
+		transport,
+		registry,
+		logger,
+		maxPayloadBytes: resolved.limits.maxPayloadBytes,
+	});
+
 	const deps: ExecutorDeps = {
 		store,
 		transport,
@@ -488,6 +508,12 @@ export function createEngine(config: EngineConfig): Engine {
 		graceMs: resolved.reconciler.graceMs,
 		stallTimeoutMs: resolved.stallTimeoutMs,
 		batchSize: resolved.reconciler.batchSize,
+		reconcileSchedules: createReconcileSchedulesHook({
+			store,
+			transport,
+			logger,
+			schema: resolved.schema,
+		}),
 		onCanceled: canceled => {
 			const runIds = canceled.map(c => c.runId);
 			abortLocal(runIds);
@@ -616,9 +642,19 @@ export function createEngine(config: EngineConfig): Engine {
 		}
 		lifecycle = "starting";
 		const attempt = (async () => {
-			// Decision 22: a check that cannot run only warns; a wrong answer throws.
-			const warning = await transport.checkRedis();
-			if (warning !== undefined) logger.warn({}, warning);
+			// Decision 22: a check that cannot run only warns; a wrong answer throws (Postgres
+			// version, Redis eviction policy, pending migrations -- `autoMigrate: false` because
+			// `start()` does not call `migrate()` itself; a pending migration must be applied via
+			// `engine.migrate()` first, and the thrown `ConfigError` says so).
+			// `checkEnvironment` itself calls `logger.warn` per warning; nothing else to do with the
+			// returned report here.
+			await checkEnvironment({
+				pool,
+				redis: connections.shared(),
+				schema: resolved.schema,
+				logger,
+				autoMigrate: false,
+			});
 
 			// On failure `startWorkers` closes whatever workers it already created.
 			await transport.startWorkers({
@@ -639,7 +675,18 @@ export function createEngine(config: EngineConfig): Engine {
 					active,
 					notify: notifier,
 					runRetention: () => retention.runOnce(),
+					registry,
 				}),
+			});
+
+			// Phase 8, decision 21: create/update every `defineTask({ schedule })` in Postgres + BullMQ.
+			await syncDeclarativeSchedules({
+				store,
+				transport,
+				registry,
+				logger,
+				maxPayloadBytes: resolved.limits.maxPayloadBytes,
+				pruneDeclarative: resolved.schedules.pruneDeclarative,
 			});
 
 			const ps = getPubSub();
@@ -1087,6 +1134,7 @@ export function createEngine(config: EngineConfig): Engine {
 		trigger,
 		runs,
 		tokens,
+		schedules,
 		events,
 	};
 }

@@ -292,6 +292,11 @@ interface Engine {
 	tokens: {
 		complete(tokenId: string, output?: unknown): Promise<CompleteTokenOutcome>;
 	};
+	schedules: {
+		upsert<T extends AnyTask>(input: ScheduleUpsertInput<T>): Promise<Schedule>;
+		delete(id: string): Promise<boolean>;
+		list(): Promise<Schedule[]>;
+	};
 	events: {
 		on(event: RunEventName, handler: (event: RunEvent) => void | Promise<void>): () => void;
 	};
@@ -346,27 +351,84 @@ for await (const token of engine.runs.readStream<string>(runId, "answer")) proce
   kept) and ends at the writer's end marker. Each reader uses its own Redis connection, closed when
   the iteration ends (or on `stop()`).
 
-<!-- TODO(phase 8): verify against implementation -->
-Declarative and imperative cron schedules are also part of the target API but not yet exposed on
-`Engine`:
+### Schedules (cron)
 
 ```ts
-// Target shape (not yet implemented):
+// Imperative: source "api" in Postgres, key by any id you choose.
 await engine.schedules.upsert({
 	id: "daily",
 	task: myTask,
-	cron: "0 9 * * *",
-	timezone: "America/Belem",
-	payload: { url: "..." },
+	cron: "0 9 * * *",      // 5-7 whitespace-separated fields; a 6th "seconds" field is allowed
+	timezone: "America/Belem", // optional IANA zone; omitted = BullMQ's default (UTC-based)
+	payload: { url: "..." },   // optional; must match myTask's payload type, defaults to null
 });
-await engine.schedules.delete("daily");
-await engine.schedules.list();
+await engine.schedules.delete("daily"); // true if a schedule with this id existed
+await engine.schedules.list();          // every schedule (api + declarative), by id
+
+// Declarative: synced by every engine.start() (source "declarative" in Postgres, id = task id).
+export const dailyDigest = defineTask({
+	id: "daily-digest",
+	schedule: { cron: "0 9 * * *", timezone: "America/Belem", payload: { url: "..." } },
+	run: async (payload: { url: string }) => { /* ... */ },
+});
 ```
 
-`defineTask` already accepts a declarative `schedule: { cron, timezone, payload? }` option meant to
-be synced by `engine.start()`; by default nothing declared this way is ever deleted automatically —
-removing a schedule from code requires `schedules: { pruneDeclarative: true }` on the engine
-config once that option exists.
+Postgres is the source of truth for `cron`/`timezone`/`payload` (decision 8): `engine.schedules.*`
+and the declarative sync write it first, then sync the BullMQ job scheduler on the internal
+`${prefix}-system` queue; a BullMQ failure right after the Postgres write is only logged — the
+leader's reconciler tick and the schedule's own next fire both self-heal it (a schedule missing its
+BullMQ scheduler is re-upserted, an orphaned BullMQ scheduler with no matching Postgres row is
+removed, a scheduler whose live cron/timezone drifted from Postgres is re-upserted). Every tick
+reads `cron`/`timezone`/`payload` fresh from Postgres — never from the BullMQ job's own copy — and
+triggers the task with idempotency key `` `__schedule:${id}:${scheduledAtMs}` `` (the tick's
+logical scheduled time, not `Date.now()`), so two processes' `-system` workers racing the same tick
+(or a BullMQ-level job redelivery) create exactly one run.
+
+**Ticks missed while every process is down are not recovered.** A BullMQ job scheduler only ever
+keeps one pending "next iteration" job; if no process is running to process it across several
+intervals, only the single next occurrence after the time a process comes back gets scheduled —
+every occurrence in between is silently skipped (`docs/research/api-notes.md` §1.10).
+
+By default nothing declared with `defineTask({ schedule })` is ever deleted automatically, even
+after removing it from code (decision 21) — set `schedules: { pruneDeclarative: true }` in the
+engine config to also delete (Postgres row + BullMQ scheduler) a declarative schedule no task
+declares anymore on the next `start()`. This never touches `"api"` schedules created with
+`engine.schedules.upsert()`.
+
+**`pruneDeclarative` footgun: it looks at every task registered on *this* engine.** If different
+processes start engines with different (heterogeneous) task registries against the same schema —
+e.g. a rolling deploy where the old and new versions briefly run side by side, or two services
+intentionally sharing one schema but each only registering some of the tasks — a `start()` with
+`pruneDeclarative: true` on a process whose registry doesn't include a given task will treat that
+task's declarative schedule as "no longer declared" and delete it, even though another process
+still declares (and needs) it. Prefer `pruneDeclarative: true` only on a single process/deploy that
+is guaranteed to have the full, current set of scheduled tasks registered; otherwise leave it off
+and delete stale schedules explicitly. A schedule deleted from Postgres this way still leaves its
+BullMQ job scheduler behind if the removal races another process, but the reconciler cleans up that
+kind of orphan on its own (no action needed).
+
+**A schedule id can't switch source underneath itself.** `engine.schedules.upsert()` (source
+`"api"`) and `defineTask({ schedule })` (source `"declarative"`, keyed by the task's own id) never
+overwrite each other's row for the same id: an `upsert()` targeting an id already owned by a
+declarative schedule throws `ConfigError` (rename the schedule, or drop the `schedule` option from
+that task's `defineTask()` if it should be API-managed instead); the declarative sync, symmetrically,
+skips (logs an error naming the task, leaves the existing `"api"` row untouched) instead of taking
+over an id an `upsert()` call already owns — every other task's sync and `pruneDeclarative` still run.
+
+**A tick whose task isn't registered in this process retries.** If `processScheduleTick` can't
+resolve `schedule.taskId` in this process's registry (e.g. mid rolling-deploy), the `schedule-tick`
+job fails instead of being silently dropped — its BullMQ job scheduler template gives it
+`attempts: 5` with exponential backoff (the one exception to the "run jobs use `attempts: 1`"
+rule: it's safe here because the `__schedule:${id}:${scheduledAtMs}` idempotency key makes a retry
+that lands on a process that already succeeded a no-op), so another process (or this one, once the
+deploy finishes) gets a chance to pick up the same tick before it's lost for good.
+
+**`prefix` should be unique per schema.** The internal `${prefix}-system` BullMQ queue is scoped by
+`prefix` alone, not `schema` — two engines with the same `prefix` but different `schema`s would
+share one `-system` queue and could see each other's job schedulers. Every `upsertJobScheduler`
+call tags its job template with the creating engine's `schema`, and the reconciler never deletes a
+scheduler tagged with a different schema even if it has no matching row in this one, as a safety
+net — but treat that as a safety net, not a reason to reuse a `prefix` across schemas on purpose.
 
 ### `ctx` (second argument of a task's `run`)
 
@@ -425,6 +487,7 @@ interface StepApi {
 | `retention.days` | `30` | Finished runs older than this are deleted (only once unparented or their parent is finished). |
 | `retention.intervalMs` | `3 600 000` | How often (per window) the leader schedules a retention sweep. |
 | `retention.batchSize` | `1 000` | Runs deleted per statement during a sweep. |
+| `schedules.pruneDeclarative` | `false` | On `start()`, also delete (Postgres + BullMQ) a `defineTask({ schedule })` schedule no registered task declares anymore. Never touches `engine.schedules.upsert()` (`"api"`) schedules. |
 | `reconciler.intervalMs` | `15 000` | Leader-election + reconciler tick. Also the worst-case latency to recover a lost enqueue (plus `graceMs`). |
 | `reconciler.graceMs` | `30 000` | How long a `queued`/`waiting` run may sit past its `run_after` before the reconciler re-enqueues it. |
 | `reconciler.batchSize` | `100` | Rows handled per reconciler case per tick. |
@@ -442,6 +505,15 @@ interface StepApi {
 
 ## Operation
 
+- **Startup environment checks.** `engine.start()` runs `checkEnvironment()` before starting any
+  worker: Postgres server version, Redis `maxmemory-policy`, and pending migrations against
+  `schema` (with `autoMigrate: false` — call `engine.migrate()` yourself first). Per decision 22, a
+  check whose command couldn't even run (e.g. `CONFIG GET` blocked by a managed Redis provider, or
+  an unexpected/empty reply from it) only logs a `warn` and is included in the returned report; only
+  a check that *does* get a definitive, wrong answer (Postgres too old, eviction policy isn't
+  `noeviction`, migrations genuinely pending) throws `ConfigError` naming every problem found. The
+  same function (`checkEnvironment`, exported from the package root along with its types) can be
+  called standalone too, e.g. in a health check or before `migrate()` in a deploy script.
 - **Postgres is the source of truth.** `trigger()` does two non-atomic writes: insert the run in
   Postgres, then enqueue it in Redis. If the process dies between the two, the run exists but was
   never enqueued. This is recovered by the **reconciler**, which periodically re-enqueues

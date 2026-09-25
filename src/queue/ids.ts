@@ -29,6 +29,16 @@ export function systemQueueName(prefix: string): string {
 }
 
 /**
+ * BullMQ job **name** (not id) given to every job a `upsertJobScheduler` job scheduler produces
+ * for minitrigger (Phase 8, decision 8): the `-system` worker's dispatcher (`executor/system.ts`)
+ * switches on it. Each tick's job **id** is BullMQ's own deterministic
+ * `repeat:<jobSchedulerId>:<nextMillis>` (see `docs/research/api-notes.md` §1.10); the schedule's
+ * own id is carried on `job.opts.repeatJobKey` (and mirrored into `job.data.scheduleId` as a
+ * fallback).
+ */
+export const SCHEDULE_TICK_JOB_NAME = "schedule-tick";
+
+/**
  * Guards against the two hard BullMQ jobId restrictions (verified in
  * `dist/cjs/classes/job.js`, see `docs/research/api-notes.md` §1.5): a `:` in
  * the id (BullMQ throws, except for a narrow 3-segment legacy repeatable-job

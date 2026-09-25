@@ -145,3 +145,72 @@ describe("tasks without a payload parameter", () => {
 		expectTypeOf(useStep).returns.toBeVoid();
 	});
 });
+
+describe("TaskScheduleOptions: schedule.payload required/Serializable when the task requires one (fix 5)", () => {
+	it("rejects defineTask({ schedule }) omitting payload when run requires one", () => {
+		defineTask({
+			id: "sched-missing-payload",
+			// @ts-expect-error schedule.payload is required: run's payload isn't optional
+			schedule: { cron: "0 9 * * *" },
+			run: async (payload: { url: string }) => payload.url,
+		});
+	});
+
+	it("rejects a schedule payload that doesn't match the task's own payload type", () => {
+		defineTask({
+			id: "sched-mismatched-payload",
+			// @ts-expect-error `url` must be a string
+			schedule: { cron: "0 9 * * *", payload: { url: 123 } },
+			run: async (payload: { url: string }) => payload.url,
+		});
+	});
+
+	it("accepts a matching schedule payload for a task that requires one", () => {
+		const task = defineTask({
+			id: "sched-ok-payload",
+			schedule: { cron: "0 9 * * *", payload: { url: "https://example.com" } },
+			run: async (payload: { url: string }) => payload.url,
+		});
+		expectTypeOf<TaskPayload<typeof task>>().toEqualTypeOf<{ url: string }>();
+	});
+
+	it("allows an omitted schedule.payload for a task that takes none", () => {
+		defineTask({ id: "sched-no-payload", schedule: { cron: "0 9 * * *" }, run: async () => {} });
+	});
+});
+
+describe("engine.schedules.upsert: payload required/Serializable when the task requires one (fix 5)", () => {
+	const withPayload = defineTask({
+		id: "sched-upsert-with-payload",
+		run: async (payload: { url: string }) => payload,
+	});
+	const withoutPayload = defineTask({ id: "sched-upsert-no-payload", run: async () => {} });
+
+	it("requires payload when the task needs one; accepts a valid one", () => {
+		function use(engine: Engine) {
+			// @ts-expect-error payload is required
+			engine.schedules.upsert({ id: "s1", task: withPayload, cron: "0 9 * * *" });
+			engine.schedules.upsert({
+				id: "s1",
+				task: withPayload,
+				cron: "0 9 * * *",
+				payload: { url: "x" },
+			});
+			engine.schedules.upsert({
+				id: "s1",
+				task: withPayload,
+				cron: "0 9 * * *",
+				// @ts-expect-error wrong payload shape
+				payload: { text: "nope" },
+			});
+		}
+		expectTypeOf(use).returns.toBeVoid();
+	});
+
+	it("allows omitting payload for a task without one", () => {
+		function use(engine: Engine) {
+			engine.schedules.upsert({ id: "s2", task: withoutPayload, cron: "0 9 * * *" });
+		}
+		expectTypeOf(use).returns.toBeVoid();
+	});
+});

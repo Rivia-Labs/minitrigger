@@ -78,6 +78,15 @@ export interface EngineConfig {
 		/** Default 1 000. */
 		batchSize?: number;
 	};
+	/** Declarative schedules (`defineTask({ schedule })`, Phase 8, decision 21). */
+	schedules?: {
+		/**
+		 * On `start()`, also delete (Postgres row + BullMQ job scheduler) every declarative schedule
+		 * no longer declared by any registered task. Default `false`: a schedule removed from code is
+		 * left alone (decision 21 -- declarative sync never deletes by default).
+		 */
+		pruneDeclarative?: boolean;
+	};
 	/** Reconciler (Phase 6), run by the leader only (decision 16). */
 	reconciler?: {
 		/** How often every started engine tries to become leader and, if leader, reconciles. Default 15 000 ms. */
@@ -119,6 +128,7 @@ export interface ResolvedConfig {
 	retentionDays: number;
 	retentionIntervalMs: number;
 	retentionBatchSize: number;
+	schedules: { pruneDeclarative: boolean };
 	reconciler: { intervalMs: number; graceMs: number; batchSize: number };
 	limits: Required<EngineLimits>;
 	logging: { minLevel: LogLevel; mirror: boolean };
@@ -147,6 +157,7 @@ export const DEFAULTS = {
 	retentionDays: 30,
 	retentionIntervalMs: 3_600_000,
 	retentionBatchSize: 1_000,
+	schedules: { pruneDeclarative: false },
 	reconciler: { intervalMs: 15_000, graceMs: 30_000, batchSize: 100 },
 	systemConcurrency: 5,
 	logging: { minLevel: "info", mirror: true },
@@ -220,6 +231,15 @@ export function resolveConfig(config: EngineConfig): ResolvedConfig {
 		"retention.batchSize",
 		config.retention?.batchSize ?? DEFAULTS.retentionBatchSize
 	);
+	const pruneDeclarative =
+		config.schedules?.pruneDeclarative ?? DEFAULTS.schedules.pruneDeclarative;
+	if (typeof pruneDeclarative !== "boolean") {
+		throw new ConfigError(
+			`schedules.pruneDeclarative must be a boolean, got ${String(pruneDeclarative)}`
+		);
+	}
+	const schedules = { pruneDeclarative };
+
 	const reconciler = {
 		intervalMs: timerMs(
 			"reconciler.intervalMs",
@@ -301,6 +321,7 @@ export function resolveConfig(config: EngineConfig): ResolvedConfig {
 		retentionDays,
 		retentionIntervalMs,
 		retentionBatchSize,
+		schedules,
 		reconciler,
 		limits,
 		logging,
