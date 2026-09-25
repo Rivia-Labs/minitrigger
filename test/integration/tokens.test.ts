@@ -157,10 +157,11 @@ describe("tokens", () => {
 		expect(run.output).toMatchObject({ ok: false, error: { name: "Timeout" } });
 		expect((await waitpointsOf(handle.id))[0]?.status).toBe("timed_out");
 		const tokenId = (await waitpointsOf(handle.id))[0]?.id ?? "";
-		// The token's run already finished: `run_finished`, not a misleading `timed_out`.
+		// The token timed out on its own (its own `expire`, before the run went on to complete in
+		// a later transaction): `timed_out`, not a misleading `run_finished`.
 		expect(await engine.tokens.complete(tokenId, 1)).toEqual({
 			completed: false,
-			reason: "run_finished",
+			reason: "timed_out",
 		});
 	});
 

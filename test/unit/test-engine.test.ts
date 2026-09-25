@@ -222,6 +222,37 @@ describe("createTestEngine: retries", () => {
 	});
 });
 
+describe("createTestEngine: task throws with steps in flight", () => {
+	it("waits for the in-flight steps; the retry reuses their recorded outputs", async () => {
+		const bStarts: number[] = [];
+		const task = defineTask({
+			id: "drain",
+			retry: { maxAttempts: 2, backoff: { type: "fixed", baseMs: 1_000, jitter: false } },
+			run: async (_payload: null, ctx) => {
+				const attempt = ctx.run.attempt;
+				await Promise.all([
+					ctx.step.run("a", async () => {
+						if (attempt === 1) throw new Error("a fails on attempt 1");
+						return "a";
+					}),
+					ctx.step.run("b", async () => {
+						bStarts.push(attempt);
+						await new Promise(resolve => setTimeout(resolve, 50));
+						return "b";
+					}),
+				]);
+				return "done";
+			},
+		});
+		const engine = testEngine({ tasks: [task] });
+
+		const result = await engine.runInline(task, null);
+
+		expect(result).toMatchObject({ status: "completed", output: "done", attempt: 2 });
+		expect(bStarts).toEqual([1]);
+	});
+});
+
 describe("createTestEngine: non-determinism", () => {
 	it("surfaces a NonDeterminismError when the replay calls different steps", async () => {
 		// Simulates a deploy that renamed a step while a run was suspended.
@@ -398,6 +429,77 @@ describe("createTestEngine: additional coverage", () => {
 		await engine.clock.advance("1h");
 		expect((await engine.runs.get(first.runId))?.status).toBe("waiting");
 
+		expect(await engine.tokens.complete(token.id, { approved: true })).toEqual({
+			completed: false,
+			reason: "timed_out",
+		});
+	});
+
+	it("tokens.complete still reports timed_out after the run later completes on its own, not run_finished", async () => {
+		const task = defineTask({
+			id: "token-self-expire-then-complete",
+			run: async (_payload: null, ctx) => {
+				const token = await ctx.step.createToken("approve", { timeout: "1h" });
+				await ctx.step.sleep("wait", "2h");
+				const decision = await ctx.step.waitForToken<{ approved: boolean }>(token);
+				return decision.ok ? "approved" : decision.error.name;
+			},
+		});
+		const engine = testEngine({
+			tasks: [task],
+			clock: { start: START, autoAdvance: false },
+		});
+
+		const first = await engine.runInline(task, null);
+		expect(first.status).toBe("waiting");
+		const [token] = await engine.tokens.pending(first.runId);
+		if (!token) throw new Error("no pending token");
+
+		// The token's own 1h expiry fires first, in its own transaction; the run stays suspended
+		// on the 2h sleep.
+		await engine.clock.advance("1h");
+		expect((await engine.runs.get(first.runId))?.status).toBe("waiting");
+
+		// The 2h sleep elapses later: the run resumes, reads the already-timed-out token, and
+		// completes on its own -- in a later, separate transaction from the token's own expiry.
+		await engine.clock.advance("1h");
+		const final = await engine.drive(first.runId);
+		expect(final).toMatchObject({ status: "completed", output: "Timeout" });
+
+		// Timed out on its own, not by this later terminal exit: `timed_out`, not `run_finished`.
+		expect(await engine.tokens.complete(token.id, { approved: true })).toEqual({
+			completed: false,
+			reason: "timed_out",
+		});
+	});
+
+	it("tokens.complete reports timed_out, not run_finished, when the token's own expiry and the run's terminal exit land in the same clock tick", async () => {
+		const task = defineTask({
+			id: "token-self-expire-same-tick",
+			run: async (_payload: null, ctx) => {
+				const token = await ctx.step.createToken("approve", { timeout: "1h" });
+				const decision = await ctx.step.waitForToken<{ approved: boolean }>(token);
+				return decision.ok ? "approved" : decision.error.name;
+			},
+		});
+		const engine = testEngine({
+			tasks: [task],
+			clock: { start: START, autoAdvance: false },
+		});
+
+		const first = await engine.runInline(task, null);
+		expect(first.status).toBe("waiting");
+		const [token] = await engine.tokens.pending(first.runId);
+		if (!token) throw new Error("no pending token");
+
+		// With no sleep after the token, the token's own expiry AND the run's resulting completion
+		// happen inside the very same `clock.advance` drain, at the same frozen clock tick:
+		// `resolvedAt` (token) and `finishedAt` (run) land on the exact same timestamp.
+		await engine.clock.advance("1h");
+		expect((await engine.runs.get(first.runId))?.status).toBe("completed");
+
+		// Timed out on its own, not by this run's own terminal exit: `timed_out`, not a misleading
+		// `run_finished`, even though both transactions share the same frozen clock tick.
 		expect(await engine.tokens.complete(token.id, { approved: true })).toEqual({
 			completed: false,
 			reason: "timed_out",

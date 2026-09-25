@@ -244,7 +244,9 @@ export function cancelDescendants(
 
 /**
  * Every pending waitpoint owned by `runIds` becomes `timed_out`; returns the (sorted) ids of the
- * ones with `expires_at`, whose `wp-${id}-expire` jobs the caller removes.
+ * ones with `expires_at`, whose `wp-${id}-expire` jobs the caller removes. Called once per
+ * terminal run transition (complete/fail/cancel/recoverStalled/expiry-of-a-parent's-children), so
+ * every waitpoint it touches is tagged `timedOutByRunExit: true` (see `completeToken`).
  */
 export function timeOutWaitpointsOf(tx: MemTx, runIds: readonly string[]): string[] {
 	if (runIds.length === 0) return [];
@@ -252,7 +254,12 @@ export function timeOutWaitpointsOf(tx: MemTx, runIds: readonly string[]): strin
 	const withExpiry: string[] = [];
 	for (const wp of [...tx.db.waitpoints.values()]) {
 		if (!ids.has(wp.runId) || wp.status !== "pending") continue;
-		tx.set(tx.db.waitpoints, wp.id, { ...wp, status: "timed_out", resolvedAt: tx.now });
+		tx.set(tx.db.waitpoints, wp.id, {
+			...wp,
+			status: "timed_out",
+			resolvedAt: tx.now,
+			timedOutByRunExit: true,
+		});
 		if (wp.expiresAt !== null) withExpiry.push(wp.id);
 	}
 	return withExpiry.sort();

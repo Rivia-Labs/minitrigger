@@ -5,7 +5,9 @@ import {
 	ExecutionLostError,
 	NestedStepError,
 	NonDeterminismError,
+	SerializationError,
 } from "../../src/errors.js";
+import { resolveChildTask } from "../../src/executor/execute-run.js";
 import { ExecutionState } from "../../src/executor/execution.js";
 import {
 	createStepContext,
@@ -13,6 +15,7 @@ import {
 	type StepWaitDeps,
 	SuspendSignal,
 } from "../../src/executor/step-context.js";
+import { buildRegistry } from "../../src/registry.js";
 import type {
 	ExecutionSnapshot,
 	Json,
@@ -20,6 +23,7 @@ import type {
 	RunRecord,
 	StepStore,
 } from "../../src/store/types.js";
+import { type AnyTask, defineTask } from "../../src/task.js";
 
 const NOW = new Date("2026-01-01T00:00:00.000Z");
 
@@ -108,7 +112,10 @@ const unusedWaits: StepWaitDeps = {
 	scheduleExpire: notUsed,
 };
 
-function setup(saved: LoadedStep[] = [], opts: { deferred?: Map<number, Json>; now?: Date } = {}) {
+function setup(
+	saved: LoadedStep[] = [],
+	opts: { deferred?: Map<number, Json>; now?: Date; waits?: Partial<StepWaitDeps> } = {}
+) {
 	const state = new ExecutionState(runRecord(), "exec-1");
 	const store = fakeStore(saved, opts.deferred);
 	const snapshot: ExecutionSnapshot = {
@@ -119,7 +126,7 @@ function setup(saved: LoadedStep[] = [], opts: { deferred?: Map<number, Json>; n
 	};
 	const ctx = createStepContext(
 		state,
-		{ steps: store, maxStepOutputBytes: 1024, waits: unusedWaits },
+		{ steps: store, maxStepOutputBytes: 1024, waits: { ...unusedWaits, ...opts.waits } },
 		snapshot
 	);
 	return { state, store, ctx, step: ctx.api };
@@ -499,5 +506,99 @@ describe("StepContext", () => {
 			const other = setup();
 			await expect(other.step.run("a:b", () => 1)).rejects.toBeInstanceOf(ConfigError);
 		});
+	});
+	describe("child task and child payload arguments (fatal, no retry)", () => {
+		const spec = { id: "child", queue: "default", maxAttempts: 3 };
+		const child = { id: "child", options: {} } as unknown as AnyTask;
+
+		it("a task the resolver rejects is a fatal error", async () => {
+			const { step, state } = setup([], {
+				waits: {
+					resolveTask: () => {
+						throw new ConfigError("malformed task");
+					},
+				},
+			});
+			await expect(step.trigger("t", child, 1)).rejects.toThrow(/malformed task/);
+			expect(state.fatalError).toBeInstanceOf(ConfigError);
+		});
+
+		for (const [label, payload] of [
+			["a Date", { at: new Date(0) }],
+			["an oversized value", "x".repeat(2_000)],
+		] as const) {
+			it(`a child payload with ${label} is a fatal SerializationError (all three methods)`, async () => {
+				for (const call of [
+					(s: ReturnType<typeof setup>["step"]) => s.trigger("t", child, payload as never),
+					(s: ReturnType<typeof setup>["step"]) => s.triggerAndWait("t", child, payload as never),
+					(s: ReturnType<typeof setup>["step"]) =>
+						s.batchTriggerAndWait("t", child, [1, payload] as never),
+				]) {
+					const { step, state } = setup([], { waits: { resolveTask: () => spec } });
+					await expect(call(step)).rejects.toBeInstanceOf(SerializationError);
+					expect(state.fatalError).toBeInstanceOf(SerializationError);
+					// Later steps rethrow it: the code bug stops the run.
+					await expect(step.run("next", () => 1)).rejects.toBe(state.fatalError);
+				}
+			});
+		}
+	});
+});
+
+describe("resolveChildTask", () => {
+	const registered = defineTask({
+		id: "known",
+		queue: { name: "known-q" },
+		retry: { maxAttempts: 7 },
+		run: async (p: number) => p,
+	});
+	const registry = buildRegistry([registered]);
+
+	it("uses the registered task when its id is registered in this process", () => {
+		const stale = { id: "known", options: { queue: { name: "other-q" } } } as unknown as AnyTask;
+		expect(resolveChildTask(registry, stale)).toEqual({
+			id: "known",
+			queue: "known-q",
+			maxAttempts: 7,
+		});
+	});
+
+	it("builds the spec from the task object itself when it is not registered here", () => {
+		const remote = defineTask({
+			id: "remote",
+			queue: { name: "remote-q" },
+			retry: { maxAttempts: 2 },
+			run: async () => null,
+		});
+		expect(resolveChildTask(registry, remote)).toEqual({
+			id: "remote",
+			queue: "remote-q",
+			maxAttempts: 2,
+		});
+		const bare = defineTask({ id: "bare", run: async () => null });
+		expect(resolveChildTask(registry, bare)).toEqual({
+			id: "bare",
+			queue: "default",
+			maxAttempts: 3,
+		});
+	});
+
+	it("rejects a malformed task object or an invalid queue name with a ConfigError", () => {
+		for (const bad of [
+			null,
+			undefined,
+			"remote",
+			{},
+			{ id: 1, options: {} },
+			{ id: "", options: {} },
+			{ id: "remote" },
+			{ id: "remote", options: null },
+			{ id: "remote", options: { queue: { name: "Bad Queue" } } },
+			{ id: "remote", options: { queue: { name: "system" } } },
+			{ id: "remote", options: { queue: { name: 5 } } },
+			{ id: "remote", options: { retry: { maxAttempts: 0 } } },
+		]) {
+			expect(() => resolveChildTask(registry, bad as unknown as AnyTask)).toThrow(ConfigError);
+		}
 	});
 });

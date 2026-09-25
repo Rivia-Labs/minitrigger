@@ -7,9 +7,9 @@ import {
 	MinitriggerError,
 	TaskNotRegisteredError,
 } from "../errors.js";
-import { waitpointExpireJobId } from "../queue/ids.js";
+import { systemQueueName, waitpointExpireJobId } from "../queue/ids.js";
 import type { Transport } from "../queue/transport.js";
-import { getTask, type Registry } from "../registry.js";
+import type { Registry } from "../registry.js";
 import type {
 	EnqueueRequest,
 	ExecutionSnapshot,
@@ -21,7 +21,8 @@ import type {
 import type { Streams } from "../streams.js";
 import type { AnyTask, TaskContext } from "../task.js";
 import { computeBackoffMs, DEFAULT_RETRY } from "../utils/backoff.js";
-import { formatError } from "../utils/error-format.js";
+import { describeOffendingValue, formatError } from "../utils/error-format.js";
+import { validateQueueName, validateTaskId } from "../utils/identifiers.js";
 import { assertSerializable, type Json, normalizeOutput } from "../utils/serialization.js";
 import { type AbortKind, type ActiveExecutions, ExecutionState } from "./execution.js";
 import { createRunLogger } from "./logger.js";
@@ -188,6 +189,19 @@ async function runAcquired(deps: ExecutorDeps, state: ExecutionState): Promise<v
 		if (outcome.kind === "success" && state.inFlight.size > 0) {
 			outcome = await settleBeforeComplete(deps, state, outcome);
 		}
+		// A fatal error (decision: coordinator, deviating from the original plan): `ctx.step.*`
+		// refuses to persist anything once `state.fatalError` is set (every later call rethrows it),
+		// and the run fails without retry regardless of what any in-flight step does -- waiting only
+		// delays the terminal write and risks a hang if that step never settles on its own (e.g. one
+		// that only stops when `ctx.signal` aborts, and no `maxDurationMs` is configured).
+		if (
+			outcome.kind === "error" &&
+			state.inFlight.size > 0 &&
+			!ownershipGone(state) &&
+			state.fatalError === undefined
+		) {
+			outcome = await settleBeforeFail(deps, state, outcome);
+		}
 		if (outcome.kind === "suspended") outcome = await settleInFlight(state);
 		clearTimeout(timer);
 		heartbeat.stop();
@@ -243,7 +257,8 @@ async function execute(
 				runs: deps.store.runs,
 				waitpoints: deps.store.waitpoints,
 				maxPayloadBytes: limits.maxPayloadBytes,
-				resolveTask: child => childTaskSpec(getTask(deps.registry, child)),
+				resolveTask: child =>
+					resolveChildTask(deps.registry, child, { prefix: deps.config.prefix }),
 				// Only used for the children `triggerChildren` just created: fresh runs, always
 				// `attempt: 1` with no error yet (`triggerChildren`'s SQL/memory insert), so no
 				// `runs.get` is needed to notify them.
@@ -328,6 +343,38 @@ async function settleBeforeComplete(
 	const aborted = await drainInFlight(state);
 	if (aborted !== undefined) return aborted;
 	return state.suspended ? { kind: "suspended" } : outcome;
+}
+
+/**
+ * The task function threw (e.g. one step of a `Promise.all` rejected) while other steps were still
+ * in flight. Failing right away would let them keep running alongside the retry, which re-runs
+ * them from scratch (a side effect twice). So the executor first waits for them, WITHOUT aborting
+ * `ctx.signal`: a step that completes meanwhile is recorded and memoized for the retry. Heartbeat
+ * and `maxDurationMs` keep running; a timeout ends the wait and the attempt still fails with the
+ * ORIGINAL error (not a `TimeoutError`). A step that suspends meanwhile is ignored: the function
+ * already failed, so the error wins over the suspension. The caller skips this entirely for a
+ * fatal error (`state.fatalError` set, decision: coordinator, deviating from the original plan):
+ * `ctx.step.*` refuses to persist anything after a fatal error and the run fails without retry
+ * regardless, so waiting would only delay the terminal write (and hang if the in-flight step never
+ * settles on its own). Only lost/canceled/shutdown (ownership gone) replace the outcome, since
+ * nothing may be written anymore.
+ */
+async function settleBeforeFail(
+	deps: ExecutorDeps,
+	state: ExecutionState,
+	outcome: Extract<Outcome, { kind: "error" }>
+): Promise<Outcome> {
+	const steps = Array.from(state.inFlight.values());
+	deps.config.logger.warn(
+		{ runId: state.runId, taskId: state.taskId, steps },
+		`task function threw while steps are still in flight (${steps
+			.map(s => `step "${s}" is still in flight`)
+			.join("; ")}); waiting for them before recording the failure. A step that only stops when ` +
+			"ctx.signal aborts will block this until maxDurationMs (if set) times it out"
+	);
+	const aborted = await drainInFlight(state);
+	if (aborted?.kind === "aborted" && aborted.reason !== "timeout") return aborted;
+	return outcome;
 }
 
 function invoke(
@@ -628,6 +675,68 @@ export function childTaskSpec(task: AnyTask): ChildTaskSpec {
 		queue: taskQueueName(task),
 		maxAttempts: task.options.retry?.maxAttempts ?? DEFAULT_RETRY.maxAttempts,
 	};
+}
+
+/**
+ * The child spec of `ctx.step.trigger*`'s `task` argument. A task registered in this process wins
+ * (its registered definition, even if the passed object differs). Otherwise the child is built
+ * from the passed object itself: a worker of another process (e.g. a service that owns that task)
+ * executes it, since the transport enqueues onto queues this process never declared. The object is
+ * checked first (string `id`, object `options`, valid queue name that is not this engine's
+ * `-system` queue, integer `retry.maxAttempts >= 1`); a malformed one is a bug in the calling
+ * code: throws `ConfigError` (the step context marks it fatal: the run fails without retry).
+ */
+export function resolveChildTask(
+	registry: Registry,
+	task: AnyTask,
+	opts: { prefix?: string } = {}
+): ChildTaskSpec {
+	const candidate = task as unknown;
+	if (
+		candidate === null ||
+		typeof candidate !== "object" ||
+		typeof (candidate as { id?: unknown }).id !== "string"
+	) {
+		throw new ConfigError(
+			`child task must be a task returned by defineTask(), got ${describeOffendingValue(candidate)}`
+		);
+	}
+	const registered = registry.tasks.get(task.id);
+	if (registered !== undefined) return childTaskSpec(registered);
+
+	const options = (candidate as { options?: unknown }).options;
+	const where = `child task "${task.id}" (not registered in this engine)`;
+	if (options === null || typeof options !== "object") {
+		throw new ConfigError(
+			`${where}: must be a task returned by defineTask() (its "options" is ${describeOffendingValue(options)})`
+		);
+	}
+	validateTaskId(task.id);
+	const queue = (options as { queue?: unknown }).queue;
+	if (queue !== undefined) {
+		const name = (queue as { name?: unknown } | null)?.name;
+		if (typeof name !== "string") {
+			throw new ConfigError(
+				`${where}: queue.name must be a string, got ${describeOffendingValue(name)}`
+			);
+		}
+		validateQueueName(name);
+		if (opts.prefix !== undefined && name === systemQueueName(opts.prefix)) {
+			throw new ConfigError(
+				`${where}: queue name "${name}" is reserved for the internal system queue of prefix "${opts.prefix}"`
+			);
+		}
+	}
+	const retry = (options as { retry?: unknown }).retry;
+	if (retry !== undefined) {
+		const maxAttempts = (retry as { maxAttempts?: unknown } | null)?.maxAttempts;
+		if (typeof maxAttempts !== "number" || !Number.isInteger(maxAttempts) || maxAttempts < 1) {
+			throw new ConfigError(
+				`${where}: retry.maxAttempts must be an integer >= 1, got ${describeOffendingValue(maxAttempts)}`
+			);
+		}
+	}
+	return childTaskSpec(task);
 }
 
 /**

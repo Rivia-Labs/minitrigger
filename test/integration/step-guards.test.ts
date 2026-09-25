@@ -1,6 +1,8 @@
 /**
  * Audit fixes on the step/executor boundary: `:` reserved in step names (collision with the
- * internal `__child:*` keys, decisions 9/11) and `ctx.signal` aborted once the attempt ended.
+ * internal `__child:*` keys, decisions 9/11), steps in flight when the task function throws,
+ * child tasks not registered in this process, invalid child payloads (fatal) and `ctx.signal`
+ * aborted once the attempt ended.
  */
 import { randomUUID } from "node:crypto";
 import { escapeIdentifier } from "pg";
@@ -121,12 +123,12 @@ describe("':' in step names (decision 11)", () => {
 	});
 });
 
-describe("ctx.signal after the attempt ended", () => {
-	it("aborts a still-running step of a failed attempt before the retry runs it again", async () => {
+describe("task function throws while other steps are in flight", () => {
+	it("waits for them: a completed in-flight step is recorded once and the retry reuses it", async () => {
 		const abortedDuringB: Array<{ attempt: number; aborted: boolean }> = [];
 		const bStarts: number[] = [];
 		const task = defineTask({
-			id: uniqueTaskId("finished"),
+			id: uniqueTaskId("drain"),
 			queue: { name: uniqueQueue() },
 			retry: fastRetry(2),
 			run: async (_p: { v: number }, ctx) => {
@@ -139,11 +141,9 @@ describe("ctx.signal after the attempt ended", () => {
 					}),
 					ctx.step.run("b", async () => {
 						bStarts.push(attempt);
-						if (attempt === 1) {
-							// Long side effect: by the time it would continue, the attempt is over.
-							await sleep(1_000);
-							abortedDuringB.push({ attempt, aborted: ctx.signal.aborted });
-						}
+						// Long side effect, still running when "a" rejects the Promise.all.
+						await sleep(500);
+						abortedDuringB.push({ attempt, aborted: ctx.signal.aborted });
 						return "b";
 					}),
 				]);
@@ -154,11 +154,264 @@ describe("ctx.signal after the attempt ended", () => {
 		const handle = await engine.trigger(task, { v: 1 });
 		const run = await waitForStatus(engine, handle.id, "completed");
 		expect(run.attempt).toBe(2);
-		await waitFor(async () => abortedDuringB.length === 1, { timeoutMs: 5_000, intervalMs: 20 });
-		expect(bStarts).toEqual([1, 2]);
-		expect(abortedDuringB).toEqual([{ attempt: 1, aborted: true }]);
+		expect(bStarts).toEqual([1]);
+		expect(abortedDuringB).toEqual([{ attempt: 1, aborted: false }]);
+		const steps = await engine.runs.steps(handle.id);
+		expect(steps.map(s => [s.name, s.status, s.output])).toEqual([
+			["a", "completed", "a"],
+			["b", "completed", "b"],
+		]);
 	});
 
+	it("maxDurationMs bounds the wait; the attempt fails with the original error", async () => {
+		let bAborted: boolean | undefined;
+		// "b" only stops when this is released (a stand-in for a step that ignores ctx.signal), so
+		// the test controls exactly how long it runs instead of a real multi-second timer that would
+		// keep firing in the background well past this test's own assertions (golden rule 14).
+		let releaseB: () => void = () => {};
+		const bReleased = new Promise<void>(resolve => {
+			releaseB = resolve;
+		});
+		const task = defineTask({
+			id: uniqueTaskId("drain-timeout"),
+			queue: { name: uniqueQueue() },
+			retry: { maxAttempts: 1 },
+			maxDurationMs: 400,
+			run: async (_p: { v: number }, ctx) => {
+				await Promise.all([
+					ctx.step.run("a", async () => {
+						throw new Error("a fails");
+					}),
+					ctx.step.run("b", async () => {
+						await bReleased; // ignores ctx.signal
+						bAborted = ctx.signal.aborted;
+						return "b";
+					}),
+				]);
+				return "done";
+			},
+		});
+		try {
+			const engine = await startedEngine([task]);
+			const handle = await engine.trigger(task, { v: 1 });
+			const started = Date.now();
+			const run = await waitForStatus(engine, handle.id, "failed", 4_000);
+			expect(Date.now() - started).toBeLessThan(4_000);
+			expect(run.attempt).toBe(1);
+			expect(run.error).toMatchObject({ name: "Error", message: "a fails", retryable: true });
+			expect(bAborted).toBeUndefined();
+			const steps = await engine.runs.steps(handle.id);
+			expect(steps).toEqual([]);
+		} finally {
+			releaseB();
+		}
+	});
+
+	it("logs a warn naming the in-flight steps before draining for a failure (diagnosability)", async () => {
+		const warnLogs: { fields: unknown; message: string }[] = [];
+		const capturingLogger: EngineLogger = {
+			debug: noop,
+			info: noop,
+			warn: (fields, message) => warnLogs.push({ fields, message }),
+			error: noop,
+		};
+		const task = defineTask({
+			id: uniqueTaskId("drain-fail-warn"),
+			queue: { name: uniqueQueue() },
+			retry: { maxAttempts: 1 },
+			run: async (_p: { v: number }, ctx) => {
+				await Promise.all([
+					ctx.step.run("a", () => {
+						throw new Error("a fails");
+					}),
+					ctx.step.run("slow-b", async () => {
+						await sleep(50);
+						return "b";
+					}),
+				]);
+				return "done";
+			},
+		});
+		const engine = await startedEngine([task], { logger: capturingLogger });
+		const handle = await engine.trigger(task, { v: 1 });
+		await waitForStatus(engine, handle.id, "failed");
+		const warned = warnLogs.find(l => l.message.includes("in flight"));
+		expect(warned?.message).toContain('"slow-b"');
+		expect(warned?.fields).toMatchObject({ runId: handle.id, steps: ["slow-b"] });
+	});
+
+	it("an in-flight step that suspends during the wait does not prevent the failure", async () => {
+		const task = defineTask({
+			id: uniqueTaskId("drain-suspend"),
+			queue: { name: uniqueQueue() },
+			retry: { maxAttempts: 1 },
+			run: async (_p: { v: number }, ctx) => {
+				await Promise.all([
+					ctx.step.run("a", () => {
+						throw new Error("a fails");
+					}),
+					ctx.step.sleep("nap", "1h"),
+				]);
+				return "done";
+			},
+		});
+		const engine = await startedEngine([task]);
+		const handle = await engine.trigger(task, { v: 1 });
+		const run = await waitForStatus(engine, handle.id, "failed");
+		expect(run.attempt).toBe(1);
+		expect(run.error).toMatchObject({ message: "a fails", retryable: true });
+		// The sleep was recorded while the executor waited for it (instead of racing the fail).
+		const steps = await engine.runs.steps(handle.id);
+		expect(steps.map(s => [s.name, s.kind])).toEqual([["nap", "sleep"]]);
+	});
+
+	it("a sleep recorded during the drain replays correctly on retry and the run completes", async () => {
+		const task = defineTask({
+			id: uniqueTaskId("drain-sleep-retry"),
+			queue: { name: uniqueQueue() },
+			retry: fastRetry(2),
+			run: async (_p: { v: number }, ctx) => {
+				const attempt = ctx.run.attempt;
+				const [a] = await Promise.all([
+					ctx.step.run("a", async () => {
+						if (attempt === 1) throw new Error("a fails on attempt 1");
+						return "a";
+					}),
+					ctx.step.sleep("nap", "50ms"),
+				]);
+				return a;
+			},
+		});
+		const engine = await startedEngine([task]);
+		const handle = await engine.trigger(task, { v: 1 });
+		const run = await waitForStatus(engine, handle.id, "completed");
+		expect(run.attempt).toBe(2);
+		expect(run.output).toBe("a");
+		// "nap" was recorded `waiting` during attempt 1's drain and replayed to `completed` on the
+		// retry, instead of being re-run from scratch or causing a NonDeterminismError.
+		const steps = await engine.runs.steps(handle.id);
+		expect(steps.map(s => [s.name, s.kind, s.status])).toEqual([
+			["a", "run", "completed"],
+			["nap", "sleep", "completed"],
+		]);
+	});
+
+	it("a cancel during the drain writes nothing from the executor; the run ends canceled", async () => {
+		let bStarted = false;
+		let bFinished = false;
+		const task = defineTask({
+			id: uniqueTaskId("drain-cancel"),
+			queue: { name: uniqueQueue() },
+			retry: { maxAttempts: 1 },
+			run: async (_p: { v: number }, ctx) => {
+				await Promise.all([
+					ctx.step.run("a", () => {
+						throw new Error("a fails");
+					}),
+					ctx.step.run("b", async () => {
+						bStarted = true;
+						await sleep(300); // real timer, ignores ctx.signal, short and self-terminating
+						bFinished = true;
+						return "b";
+					}),
+				]);
+				return "done";
+			},
+		});
+		const engine = await startedEngine([task]);
+		const handle = await engine.trigger(task, { v: 1 });
+		await waitFor(async () => bStarted, { timeoutMs: 5_000, intervalMs: 10 });
+		expect(await engine.runs.cancel(handle.id)).toBe("canceled");
+		const run = await waitForStatus(engine, handle.id, "canceled");
+		expect(run.error).toMatchObject({ name: "Canceled" });
+		// "b" keeps running for real (it never checked ctx.signal) and eventually finishes, but its
+		// write lands after the cancel already cleared ownership (decision 5): discarded, not a
+		// second terminal write racing the cancel.
+		await waitFor(async () => bFinished, { timeoutMs: 2_000, intervalMs: 10 });
+		expect((await engine.runs.get(handle.id))?.status).toBe("canceled");
+	});
+});
+
+describe("a fatal step error fails the run promptly (does not wait for in-flight steps)", () => {
+	it("a fatal NonDeterminismError (duplicate name) with a long in-flight step fails without waiting for it", async () => {
+		const task = defineTask({
+			id: uniqueTaskId("fatal-no-wait"),
+			queue: { name: uniqueQueue() },
+			retry: fastRetry(3),
+			run: async (_p: { v: number }, ctx) => {
+				// Started first, still in flight (never settles) when the second call below fails
+				// synchronously with a fatal, code-bug error.
+				void ctx.step.run("slow", () => new Promise(() => {}));
+				await ctx.step.run("slow", () => "dup");
+				return "done";
+			},
+		});
+		const engine = await startedEngine([task]);
+		const handle = await engine.trigger(task, { v: 1 });
+		const started = Date.now();
+		const run = await waitForStatus(engine, handle.id, "failed", 3_000);
+		expect(Date.now() - started).toBeLessThan(3_000);
+		expect(run.attempt).toBe(1);
+		expect(run.error).toMatchObject({ name: "DuplicateStepError", retryable: false });
+		const steps = await engine.runs.steps(handle.id);
+		expect(steps).toEqual([]);
+	}, 5_000);
+});
+
+describe("child tasks not registered in this process, invalid child payloads", () => {
+	it("a child registered only in another engine runs there and the parent gets its output", async () => {
+		const child = defineTask({
+			id: uniqueTaskId("remote-child"),
+			queue: { name: uniqueQueue() },
+			run: async (p: { n: number }) => ({ doubled: p.n * 2 }),
+		});
+		const parent = defineTask({
+			id: uniqueTaskId("parent"),
+			queue: { name: uniqueQueue() },
+			retry: fastRetry(3),
+			run: async (_p: { v: number }, ctx) => {
+				const result = await ctx.step.triggerAndWait("child", child, { n: 21 });
+				return result.ok ? result.output : null;
+			},
+		});
+		const parentEngine = await startedEngine([parent]); // does not know `child`
+		await startedEngine([child]);
+		const handle = await parentEngine.trigger(parent, { v: 1 });
+		const run = await waitForStatus(parentEngine, handle.id, "completed");
+		expect(run.attempt).toBe(1);
+		expect(run.output).toEqual({ doubled: 42 });
+	});
+
+	for (const [label, payload] of [
+		["a Date", { at: new Date(0) }],
+		["a value over maxPayloadBytes", { blob: "x".repeat(4_096) }],
+	] as const) {
+		it(`a child payload with ${label} fails the parent on attempt 1 without retry`, async () => {
+			const child = defineTask({
+				id: uniqueTaskId("child"),
+				queue: { name: uniqueQueue() },
+				run: async (_p: unknown) => null,
+			});
+			const parent = defineTask({
+				id: uniqueTaskId("parent"),
+				queue: { name: uniqueQueue() },
+				retry: fastRetry(3),
+				run: async (_p: { v: number }, ctx) => {
+					await ctx.step.triggerAndWait("child", child, payload as never);
+					return "unreachable";
+				},
+			});
+			const engine = await startedEngine([parent, child], { limits: { maxPayloadBytes: 1_024 } });
+			const handle = await engine.trigger(parent, { v: 1 });
+			const run = await waitForStatus(engine, handle.id, "failed");
+			expect(run.attempt).toBe(1);
+			expect(run.error).toMatchObject({ name: "SerializationError", retryable: false });
+			expect(await childCount(handle.id)).toBe(0);
+		});
+	}
+});
+
+describe("ctx.signal after the attempt ended", () => {
 	it("aborts the signal once the run completed, with a 'finished' reason", async () => {
 		let signal: AbortSignal | undefined;
 		const task = defineTask({

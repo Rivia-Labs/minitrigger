@@ -70,6 +70,13 @@ export interface WaitpointRow {
 	readonly expiresAt: number | null;
 	readonly createdAt: number;
 	readonly resolvedAt: number | null;
+	/**
+	 * Set only by `timeOutWaitpointsOf` (every terminal run transition times out its own pending
+	 * waitpoints in the same transaction): distinguishes that from a waitpoint that expired on its
+	 * own (`waitpoints.ts#expire`), even when both happen to share the same frozen `tx.now` (the
+	 * memory clock does not advance on its own between transactions, unlike Postgres' `now()`).
+	 */
+	readonly timedOutByRunExit?: boolean;
 }
 
 export interface KeyRow {

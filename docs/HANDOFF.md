@@ -10,18 +10,18 @@ Atualizado em 2026-09-25. Leia junto com `CLAUDE.md` (decisões e notas de imple
 
 ### O que existe (resumo)
 
-| Área | Arquivos principais |
-|---|---|
-| Base, utilitários | `src/utils/*`, `src/errors.ts` |
-| Schema e migrations | `src/migrations/001_init.sql`, `002_schedules.sql`, `migrate.ts` |
-| Store (contrato + SQL + memória) | `src/store/types.ts`, `src/store/sql/*`, `src/store/memory/*`, `docs/store-contract.md` |
-| Tasks e filas | `src/task.ts`, `src/registry.ts`, `src/queue/*` |
-| Executor | `src/executor/*` (aquisição, heartbeat, steps, suspensão, tokens, subtasks, logs, notificação) |
-| Engine | `src/engine.ts`, `src/config.ts` |
-| Resiliência | `src/leader.ts`, `src/reconciler.ts`, `src/retention.ts`, `src/pubsub.ts` |
-| Logs e streams | `src/logs/buffer.ts`, `src/streams.ts` |
-| Testes | `test/unit`, `test/integration`, `test/integration-flushall`, `test/helpers` (namespace por arquivo, suíte de contrato de store) |
-| Docs | `README.md` (rascunho quase completo), `examples/basic` (mínimo) |
+| Área                             | Arquivos principais                                                                                                              |
+| -------------------------------- | -------------------------------------------------------------------------------------------------------------------------------- |
+| Base, utilitários                | `src/utils/*`, `src/errors.ts`                                                                                                   |
+| Schema e migrations              | `src/migrations/001_init.sql`, `002_schedules.sql`, `migrate.ts`                                                                 |
+| Store (contrato + SQL + memória) | `src/store/types.ts`, `src/store/sql/*`, `src/store/memory/*`, `docs/store-contract.md`                                          |
+| Tasks e filas                    | `src/task.ts`, `src/registry.ts`, `src/queue/*`                                                                                  |
+| Executor                         | `src/executor/*` (aquisição, heartbeat, steps, suspensão, tokens, subtasks, logs, notificação)                                   |
+| Engine                           | `src/engine.ts`, `src/config.ts`                                                                                                 |
+| Resiliência                      | `src/leader.ts`, `src/reconciler.ts`, `src/retention.ts`, `src/pubsub.ts`                                                        |
+| Logs e streams                   | `src/logs/buffer.ts`, `src/streams.ts`                                                                                           |
+| Testes                           | `test/unit`, `test/integration`, `test/integration-flushall`, `test/helpers` (namespace por arquivo, suíte de contrato de store) |
+| Docs                             | `README.md` (rascunho quase completo), `examples/basic` (mínimo)                                                                 |
 
 ### Decisões tomadas com o dono do projeto
 
@@ -31,21 +31,25 @@ Atualizado em 2026-09-25. Leia junto com `CLAUDE.md` (decisões e notas de imple
 ## O que falta
 
 ### Próximos passos (fora das fases do kickoff)
+
 - ✅ **v0.1.0 publicado** no repositório privado `igorabreu29/minitrigger` (GitHub Release com o `.tgz`). A partir daqui, mudanças de schema só em migrations novas (001–003 não podem mais ser editadas). Novo release: subir `version`, `pnpm check:pack`, tag `vX.Y.Z`, `gh release create` com o `.tgz`.
 - Opcional: `TestEngine.start()` que drena em segundo plano (hoje o test engine só roda quando o teste chama `drain`/`runInline`/`drive`).
 
 ### Pontos em aberto registrados (sem urgência, comportamento documentado)
-- Token que expirou sozinho numa run que depois terminou reporta `run_finished`.
-- Task que lança com steps ainda em voo não espera por eles (gravações tardias são rejeitadas pelo ownership).
-- Filtros de data de `runs.list` se chamam `createdFrom`/`createdTo` (spec não fixa nomes).
-- Payload de filha não serializável e task filha não registrada continuam retryable (os demais argumentos inválidos de step são fatais).
-- `sideEffects: false` só ajuda bundlers: em Node o `dist/index.js` único é carregado inteiro (inclui o modo de teste).
+
+- ✅ Token que expirou sozinho agora reporta `timed_out`; `run_finished` só quando o timeout veio da saída terminal da run (SQL: `resolved_at = finished_at` na mesma transação; memória: flag `timedOutByRunExit`).
+- ✅ Task que lança com steps em voo: o executor espera os steps terminarem (sem abortar) antes de gravar falha/retry; o retry reaproveita os que concluíram. Erro fatal não espera.
+- Filtros de data de `runs.list` se chamam `createdFrom`/`createdTo` (nomes mantidos, decisão do dono).
+- ✅ `step.trigger*` aceita task filha não registrada (spec sai do próprio objeto); objeto malformado, fila inválida e payload de filha inválido são fatais.
+- `sideEffects: false` só ajuda bundlers; em Node o `dist/index.js` único é carregado inteiro, incluindo o modo de teste. **Avaliado em 2026-09-25 e mantido:** o código do minitrigger inteiro carrega em ~2,3 ms, contra ~44 ms das peers (bullmq/ioredis/pg). Se um dia for necessário: subpath `minitrigger/testing` com `splitting: true` no tsup (chunk compartilhado para não duplicar as classes de erro e quebrar o `instanceof`), o que é uma mudança incompatível de import.
 
 ### Auditoria externa (2026-09-25)
+
 - 13 achados + itens baixos, todos confirmados e corrigidos (resumo em `CLAUDE.md`, "Auditoria externa"). Único ajuste de decisão: `:` reservado em nomes de step (decisão 11, autorizado pelo dono).
 - Conhecido e não tratado: `{}` como tipo de payload/output passa no `Serializable` (atalho `[T] extends [Json]` evita TS2589).
 
 ### Concluído nesta sessão (2026-09-25)
+
 - Notificador sem `runs.get` extra por transição (`test/integration/notify-perf.test.ts`).
 - Fase 8: `src/schedules.ts` (API, tick com idempotência por ocorrência e retries, sync declarativo com guarda de `source`, reconciliação bidirecional com tag de schema).
 - Fase 9: `checkEnvironment` no `start()`; `createTestEngine` (`src/testing/`); mensagens de erro acionáveis; inferência de `step.run` com união.

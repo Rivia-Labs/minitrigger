@@ -99,7 +99,10 @@ export interface StepWaitDeps {
 	waitpoints: Pick<WaitpointStore, "createToken" | "getToken">;
 	/** Child payloads follow the payload limit (decision 12). */
 	maxPayloadBytes: number;
-	/** Registered task -> child spec; throws `TaskNotRegisteredError`. */
+	/**
+	 * Task argument -> child spec (the registered task, or the passed object itself when not
+	 * registered in this process); throws `ConfigError` for a malformed task (fatal).
+	 */
 	resolveTask(task: AnyTask): ChildTaskSpec;
 	enqueueRun(request: EnqueueRequest): Promise<void>;
 	/** Adds `waitpoint-expire` with jobId `wp-${id}-expire` (deterministic: re-adding is a no-op). */
@@ -609,7 +612,7 @@ export class StepContext {
 			"trigger",
 			name,
 			() => {
-				spec = this.deps.waits.resolveTask(task);
+				spec = this.childTask(task);
 				json = this.childPayload(spec.id, payload);
 				if (opts?.delay !== undefined) delayMs = this.parseDurationArg(opts.delay);
 			},
@@ -643,7 +646,7 @@ export class StepContext {
 			"trigger_wait",
 			name,
 			() => {
-				spec = this.deps.waits.resolveTask(task);
+				spec = this.childTask(task);
 				json = this.childPayload(spec.id, payload);
 				if (opts?.timeout !== undefined) timeoutMs = this.parseDurationArg(opts.timeout);
 			},
@@ -686,7 +689,7 @@ export class StepContext {
 						)
 					);
 				}
-				spec = this.deps.waits.resolveTask(task);
+				spec = this.childTask(task);
 				jsons = payloads.map(p => this.childPayload(spec.id, p));
 				if (opts?.timeout !== undefined) timeoutMs = this.parseDurationArg(opts.timeout);
 			},
@@ -701,13 +704,33 @@ export class StepContext {
 		);
 	}
 
-	/** Validates a child payload like `engine.trigger` does (`undefined` -> `null`). */
+	/**
+	 * Resolves the child task argument. A malformed task (or invalid queue name) is a bug in the
+	 * calling code, like an invalid duration: fatal, the run fails without retry.
+	 */
+	private childTask(task: AnyTask): ChildTaskSpec {
+		try {
+			return this.deps.waits.resolveTask(task);
+		} catch (error) {
+			throw this.fatal(error as Error);
+		}
+	}
+
+	/**
+	 * Validates a child payload like `engine.trigger` does (`undefined` -> `null`). A payload that
+	 * is not serializable or over `maxPayloadBytes` is deterministic for the same code path, so it
+	 * is fatal (no retry would help).
+	 */
 	private childPayload(taskId: string, payload: unknown): Json {
 		const value = payload === undefined ? null : payload;
-		assertSerializable(value, {
-			label: `payload of task "${taskId}"`,
-			maxBytes: this.deps.waits.maxPayloadBytes,
-		});
+		try {
+			assertSerializable(value, {
+				label: `payload of task "${taskId}"`,
+				maxBytes: this.deps.waits.maxPayloadBytes,
+			});
+		} catch (error) {
+			throw this.fatal(error as Error);
+		}
 		return value as Json;
 	}
 

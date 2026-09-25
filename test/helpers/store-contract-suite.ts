@@ -1109,6 +1109,24 @@ export function defineStoreContractSuite(get: () => StoreHarness): void {
 			});
 		});
 
+		it("a token that expired on its own reports timed_out even after the run later finishes", async () => {
+			const { owner } = await running();
+			const tok = await token(owner, "t0", 1_000, false);
+			await get().advance(2_000);
+			const expireRes = await s().waitpoints.expire(tok.waitpointId);
+			if (expireRes.kind !== "expired") throw new Error("expected expired");
+			expect((await s().waitpoints.getToken(tok.waitpointId))?.status).toBe("timed_out");
+			// No further `advance()`: the run completes at the same clock tick the token expired at
+			// (for the memory store, an unadvanced manual clock; for SQL, `now()` inside the very next
+			// transaction can, in principle, collide too). Timed out on its own, not by the run's own
+			// terminal exit, must still report `timed_out`, not a misleading `run_finished`.
+			expect(await s().runs.complete(owner, "ok")).toMatchObject({ kind: "completed" });
+			expect(await s().waitpoints.completeToken(tok.waitpointId, "late")).toEqual({
+				kind: "not_pending",
+				status: "timed_out",
+			});
+		});
+
 		it("expiry racing completion: exactly one wins, one resume (10 rounds)", async () => {
 			for (let round = 0; round < 10; round++) {
 				const { owner } = await running();

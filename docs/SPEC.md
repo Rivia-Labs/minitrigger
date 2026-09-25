@@ -53,22 +53,27 @@ Trabalhe **fase por fase**, na ordem, e só avance quando os critérios de aceit
      - sem nenhuma espera pendente (tudo foi resolvido enquanto a run ainda executava): `queued`, `enqueue_seq + 1`, `run_after = now()`, enqueue imediato.
 
      Sem essa re-checagem, um token completado entre sua criação e a suspensão deixaria a run `waiting` sem ninguém para acordá-la.
+
    - O reconciler é a rede de segurança: run `waiting` sem waitpoint pendente e com `run_after < now() - grace` é reenfileirada com o **mesmo** `enqueue_seq` (o jobId garante que o job só é criado se não existir).
 
 4. **Retries controlados pelo motor, não pelo BullMQ.** Jobs do BullMQ usam `attempts: 1`. O motor incrementa `attempt` no Postgres e reenfileira com delay de backoff. `attempt` incrementa apenas em falha de tentativa e em stall recuperado pelo reconciler; **nunca** em retomada de `waiting`. `maxDurationMs` é por tentativa: o timer começa na aquisição e não corre enquanto a run está suspensa.
 
 5. **Execução exclusiva por transição atômica com ownership explícito.** Um worker só executa uma run se conseguir:
+
    ```sql
    UPDATE runs SET status='running', execution_id=$2, heartbeat_at=now(), started_at=coalesce(started_at, now())
    WHERE id=$1 AND status IN ('queued','waiting') AND enqueue_seq=$3
    RETURNING *
    ```
+
    O `enqueue_seq=$3` rejeita jobs obsoletos (ex.: a retomada agendada de um `sleep` que ficou para trás porque a run já foi reenfileirada por outro caminho). Um job rejeitado termina como no-op, sem erro. Toda escrita posterior daquela execução confere ownership travando a linha da run:
+
    ```sql
    ... WHERE EXISTS (
      SELECT 1 FROM runs WHERE id=$1 AND execution_id=$2 AND status='running' FOR SHARE
    )
    ```
+
    O `FOR SHARE` impede que o reconciler ou um cancelamento troque o status entre a checagem e a escrita; sem ele, sob READ COMMITTED, uma execução zumbi ainda consegue gravar um step. `rowCount = 0` significa que a execução perdeu a run (cancelada, timeout, stall recuperado): o executor lança `ExecutionLostError`, dispara o `AbortSignal` e não grava mais nada. Isso é também a checagem de cancelamento por fronteira de step, sem query extra por step.
    **Toda saída de `running`** (completed, failed, waiting, canceled, timeout, stop graceful, stall) faz `execution_id = NULL`, para que uma execução zumbi não consiga voltar a escrever.
 
@@ -98,10 +103,10 @@ Trabalhe **fase por fase**, na ordem, e só avance quando os critérios de aceit
    Chaves de usuário sem TTL explícito recebem `idempotencyKeyTtl` (padrão 7 dias). A engine rejeita na criação um TTL maior que `retention.days`. Chaves internas usam `expires_at NULL` (vivas até a retenção da run).
 
 10. **Waitpoints nascem na mesma transação que sua causa.** Em `triggerAndWait`, o insert da run filha (com `parent_run_id`, `parent_waitpoint_id`), o insert do waitpoint e a marcação do step `waiting` acontecem numa única transação, antes de qualquer enqueue. `batchTriggerAndWait` cria **um** waitpoint `kind='batch'` com `pending_count`, decrementado atomicamente; cada filha guarda `batch_index`; o pai é retomado uma única vez, quando o contador chegar a zero. `triggerAndWait` e `batchTriggerAndWait` aceitam `timeout` opcional; no timeout, o waitpoint vira `timed_out`, retorna `{ ok: false }` e as filhas pendentes são canceladas.
-   Todo waitpoint com timeout (token, `child_run`, `batch`) agenda a expiração na fila `-system` com jobId determinístico `wp-${waitpointId}-expire`. O handler só age se o waitpoint ainda estiver `pending`; caso contrário é no-op. Quem resolve o waitpoint antes do prazo remove esse job (best-effort, fora da transação). Cancelar uma run cancela recursivamente todas as descendentes pendentes.
-   Resultados de `triggerAndWait`/`batchTriggerAndWait` **não** são copiados para `steps.output`. O step guarda só a referência ao waitpoint; no replay, o executor lê `runs.output`/`runs.error` das filhas numa única query por `parent_waitpoint_id ORDER BY batch_index`. Tokens seguem a mesma regra: o step `${name}#wait` guarda só a referência e o replay lê `waitpoints.output`.
-   **Qualquer** estado terminal de uma filha com `parent_waitpoint_id` resolve o waitpoint do pai: `completed` → `{ ok: true, output }`, `failed` definitivo → `{ ok: false, error }`, `canceled` → `{ ok: false, error: { name: "Canceled" } }`. Numa filha de batch, isso decrementa `pending_count`. Se o waitpoint já estiver `timed_out` ou `completed`, é no-op.
-   `parent_run_id` e `parent_waitpoint_id` são FKs com `ON DELETE SET NULL`. A retenção só apaga uma run sem pai ou cujo pai já está finalizado. Uma filha que termina com `parent_waitpoint_id` nulo não tenta resolver nada.
+    Todo waitpoint com timeout (token, `child_run`, `batch`) agenda a expiração na fila `-system` com jobId determinístico `wp-${waitpointId}-expire`. O handler só age se o waitpoint ainda estiver `pending`; caso contrário é no-op. Quem resolve o waitpoint antes do prazo remove esse job (best-effort, fora da transação). Cancelar uma run cancela recursivamente todas as descendentes pendentes.
+    Resultados de `triggerAndWait`/`batchTriggerAndWait` **não** são copiados para `steps.output`. O step guarda só a referência ao waitpoint; no replay, o executor lê `runs.output`/`runs.error` das filhas numa única query por `parent_waitpoint_id ORDER BY batch_index`. Tokens seguem a mesma regra: o step `${name}#wait` guarda só a referência e o replay lê `waitpoints.output`.
+    **Qualquer** estado terminal de uma filha com `parent_waitpoint_id` resolve o waitpoint do pai: `completed` → `{ ok: true, output }`, `failed` definitivo → `{ ok: false, error }`, `canceled` → `{ ok: false, error: { name: "Canceled" } }`. Numa filha de batch, isso decrementa `pending_count`. Se o waitpoint já estiver `timed_out` ou `completed`, é no-op.
+    `parent_run_id` e `parent_waitpoint_id` são FKs com `ON DELETE SET NULL`. A retenção só apaga uma run sem pai ou cujo pai já está finalizado. Uma filha que termina com `parent_waitpoint_id` nulo não tenta resolver nada.
 
 11. **Detecção de não-determinismo.** Cada step é gravado com `name` e `seq_index`. No replay, se o step na posição `i` tem nome diferente do salvo, lance `NonDeterminismError`. Nome repetido na mesma execução lança `DuplicateStepError`. `createToken` e `waitForToken` são steps e consomem `seq_index`: `createToken(name)` grava o step `${name}` (output `{ id }`) e `waitForToken` grava `${name}#wait`. `waitForToken(name)` sem `createToken` prévio equivale a `createToken(name)` seguido da espera. `#` e `:` são reservados: nomes de step do usuário contendo `#` ou `:` são rejeitados (`:` separa os componentes das chaves internas `__child:*` da decisão 9).
 
@@ -136,20 +141,37 @@ import { createEngine, defineTask } from "minitrigger";
 
 export const resumirVaga = defineTask({
   id: "resumir-vaga",
-  queue: { name: "llm", concurrency: 2, rateLimit: { max: 10, durationMs: 60_000 } },
-  retry: { maxAttempts: 3, backoff: { type: "exponential", baseMs: 1_000, maxMs: 60_000 } },
+  queue: {
+    name: "llm",
+    concurrency: 2,
+    rateLimit: { max: 10, durationMs: 60_000 },
+  },
+  retry: {
+    maxAttempts: 3,
+    backoff: { type: "exponential", baseMs: 1_000, maxMs: 60_000 },
+  },
   maxDurationMs: 5 * 60_000, // por tentativa, não conta tempo suspenso
   run: async (payload: { url: string }, ctx) => {
-    const html = await ctx.step.run("baixar", () => fetch(payload.url).then(r => r.text()));
-    const resumo = await ctx.step.run("llm", () => chamarLLM(html, { signal: ctx.signal }));
+    const html = await ctx.step.run("baixar", () =>
+      fetch(payload.url).then((r) => r.text()),
+    );
+    const resumo = await ctx.step.run("llm", () =>
+      chamarLLM(html, { signal: ctx.signal }),
+    );
 
     const token = await ctx.step.createToken("aprovacao", { timeout: "2d" });
     await ctx.step.run("pedir-aprovacao", () => enviarLinkAprovacao(token.id));
     const aprovado = await ctx.step.waitForToken<boolean>(token);
-    if (!aprovado.ok || !aprovado.output) return { status: "rejeitado" as const };
+    if (!aprovado.ok || !aprovado.output)
+      return { status: "rejeitado" as const };
 
     await ctx.step.sleep("esfriar", "1h");
-    const filho = await ctx.step.triggerAndWait("salvar", salvarResumo, { resumo }, { timeout: "1h" });
+    const filho = await ctx.step.triggerAndWait(
+      "salvar",
+      salvarResumo,
+      { resumo },
+      { timeout: "1h" },
+    );
     await ctx.step.trigger("notificar", notificar, { url: payload.url }); // dispara sem esperar
     ctx.logger.info("finalizado", { filhoOk: filho.ok });
     return { status: "ok" as const, resumo };
@@ -157,23 +179,33 @@ export const resumirVaga = defineTask({
 });
 
 const engine = createEngine({
-  postgres: process.env.DATABASE_URL!,   // ou { pool }
-  redis: process.env.REDIS_URL!,         // ou { connection }
+  postgres: process.env.DATABASE_URL!, // ou { pool }
+  redis: process.env.REDIS_URL!, // ou { connection }
   schema: "minitrigger",
   prefix: "minitrigger",
   tasks: [resumirVaga, salvarResumo, notificar],
 });
 
 await engine.migrate();
-await engine.start();                    // opcional: { queues: ["llm"] }
+await engine.start(); // opcional: { queues: ["llm"] }
 
-const handle = await engine.trigger(resumirVaga, { url: "..." }, { idempotencyKey: "vaga-123", delay: "5m" });
+const handle = await engine.trigger(
+  resumirVaga,
+  { url: "..." },
+  { idempotencyKey: "vaga-123", delay: "5m" },
+);
 await engine.runs.get(handle.id);
 await engine.runs.list({ taskId: "resumir-vaga", status: "failed", limit: 20 });
 await engine.runs.cancel(handle.id);
 await engine.runs.replay(handle.id);
 await engine.tokens.complete(tokenId, true);
-await engine.schedules.upsert({ id: "diario", task: resumirVaga, cron: "0 9 * * *", timezone: "America/Belem", payload: { url: "..." } });
+await engine.schedules.upsert({
+  id: "diario",
+  task: resumirVaga,
+  cron: "0 9 * * *",
+  timezone: "America/Belem",
+  payload: { url: "..." },
+});
 
 await engine.stop();
 ```

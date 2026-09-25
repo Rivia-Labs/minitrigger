@@ -9,7 +9,6 @@ import {
 	applyResumeRule,
 	cancelDescendants,
 	type Exec,
-	isTerminal,
 	owned,
 	timeOutWaitpointsOf,
 } from "./resolve.js";
@@ -94,9 +93,14 @@ export function createWaitpointStore(exec: Exec): WaitpointStore {
 			return exec.run(tx => {
 				const wp = tx.db.waitpoints.get(uuid(waitpointId));
 				if (wp?.kind !== "token") return { kind: "not_found" };
-				const runStatus = tx.db.runs.get(wp.runId)?.status;
 				if (wp.status !== "pending") {
-					if (wp.status === "timed_out" && runStatus !== undefined && isTerminal(runStatus)) {
+					// `run_finished` only when the token was timed out BY the run's own terminal exit:
+					// `timeOutWaitpointsOf` (called once per terminal transition) tags the row with
+					// `timedOutByRunExit`. Not a timestamp comparison: the memory clock does not
+					// advance on its own between transactions (unlike Postgres' `now()`), so a token
+					// that expired on its own (`expire()`, which never sets the flag) can share the
+					// exact same frozen `tx.now` as a later, unrelated terminal transition.
+					if (wp.status === "timed_out" && wp.timedOutByRunExit === true) {
 						return { kind: "run_finished" };
 					}
 					return { kind: "not_pending", status: wp.status };

@@ -290,9 +290,12 @@ export interface EngineRuns {
  * `{ completed: false, reason }`:
  * - `not_found`: unknown id (or not a token);
  * - `completed`: the token was already completed;
- * - `timed_out`: the token's own timeout fired first;
- * - `run_finished`: the token's run already completed, failed or was canceled (every terminal
- *   transition times out the run's pending tokens, so nothing will ever read this output).
+ * - `timed_out`: the token's own timeout fired first, in an earlier transaction than any run
+ *   terminal exit — including a token that timed out on its own and whose run only finished
+ *   later;
+ * - `run_finished`: the token's run already completed, failed or was canceled, and that very
+ *   terminal transition is what timed out this token (same transaction, so nothing will ever
+ *   read this output).
  */
 export type CompleteTokenOutcome =
 	| { completed: true }
@@ -305,9 +308,10 @@ export interface EngineTokens {
 	/**
 	 * Completes a token created by `ctx.step.createToken` (decisions 3, 12): `output` is validated
 	 * like a payload (`maxPayloadBytes`; `undefined` is stored as `null`). Resumes the waiting run
-	 * only if it is `waiting` with nothing else blocking. When the token's run already finished
-	 * (completed/failed/canceled) the result is `{ completed: false, reason: "run_finished" }`,
-	 * not `timed_out`, even though the finished run timed out its pending tokens.
+	 * only if it is `waiting` with nothing else blocking. When the token's own terminal exit is
+	 * what timed it out (completed/failed/canceled run, same transaction as the timeout) the
+	 * result is `{ completed: false, reason: "run_finished" }`; a token that timed out on its own
+	 * first, in an earlier transaction, reports `"timed_out"` even if its run later finished.
 	 */
 	complete(tokenId: string, output?: unknown): Promise<CompleteTokenOutcome>;
 }

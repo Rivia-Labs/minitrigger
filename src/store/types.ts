@@ -659,8 +659,10 @@ export type CompleteTokenResult =
 	| { kind: "not_found" }
 	| { kind: "not_pending"; status: WaitpointStatus }
 	/**
-	 * The token is not pending because its run already reached a terminal status (which times out
-	 * the run's own pending tokens). Checked under the run's `FOR UPDATE` lock.
+	 * The token is `timed_out` because its own run's terminal exit is what timed it out, in the
+	 * same transaction (`waitpoints.resolved_at = runs.finished_at` exactly, checked under the
+	 * run's `FOR UPDATE` lock). A token that expired on its own first, in an earlier transaction,
+	 * whose run only finished later, is `not_pending` with `status: "timed_out"` instead.
 	 */
 	| { kind: "run_finished" }
 	| { kind: "completed"; resolution: WaitpointResolution };
@@ -697,8 +699,11 @@ export interface WaitpointStore {
 	 * `engine.tokens.complete` (decision 3). Read `run_id` unlocked, lock that run
 	 * FOR UPDATE, then `UPDATE waitpoints SET status='completed', output WHERE id AND
 	 * kind='token' AND status='pending'`, then the resume rule (no enqueue if the
-	 * run is `running` or has other blocking waitpoints). Not pending: `run_finished` when the
-	 * token is `timed_out` and its run (read under the same lock) is terminal, else `not_pending`.
+	 * run is `running` or has other blocking waitpoints). Not pending: `run_finished` only when
+	 * the token is `timed_out` AND its run is terminal AND `resolved_at = finished_at` exactly
+	 * (same transaction: the run's own terminal exit is what timed it out); otherwise
+	 * `not_pending` with the token's status (a token that expired on its own, in an earlier
+	 * transaction, whose run later finished is `not_pending` with `status: "timed_out"`).
 	 */
 	completeToken(waitpointId: string, output: Json): Promise<CompleteTokenResult>;
 

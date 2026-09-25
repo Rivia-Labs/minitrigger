@@ -302,7 +302,7 @@ A task/step function that returns `void` (or `undefined`) has that output stored
 | `DuplicateStepError` | The same step name was used twice within one execution. |
 | `NestedStepError` | `ctx.step.*` was called from inside a `step.run` callback (nested steps aren't supported). |
 | `ExecutionLostError` | The executing process lost ownership of the run (canceled, timed out, stolen by the reconciler, handed back on shutdown) — thrown into in-flight step calls; no further writes happen. |
-| `TaskNotRegisteredError` | A task id was referenced (e.g. via `step.trigger`) that isn't registered on this engine. |
+| `TaskNotRegisteredError` | `engine.trigger` / a schedule referenced a task that isn't registered on this engine, or a worker acquired a run of a task it doesn't know (retryable, e.g. during a rolling deploy). `step.trigger*` accepts an unregistered child task: another process that registers it runs the child. |
 
 All of the above extend `MinitriggerError`.
 
@@ -511,7 +511,7 @@ a run.
 
 `ctx.signal` also aborts once the attempt is over (completed, failed, retry scheduled, released,
 or any other exit of the executor; its reason is a `"finished"` abort), so work the task left
-running (a step left behind by a rejected `Promise.all`, an un-awaited promise, a stream) stops
+running (an un-awaited promise, a stream, a step still running when `maxDurationMs` cut the wait for in-flight steps short) stops
 instead of duplicating side effects alongside the next attempt. A suspension aborts it too.
 
 `ctx.stream(name, source)` appends every item of `source` (strings or JSON values) to a Redis
@@ -596,6 +596,7 @@ it("approves a document", async () => {
 });
 ```
 
+- A child triggered with `step.trigger*` whose task isn't in the test engine's `tasks` stays unprocessed: the test engine only runs registered tasks, so the child fails with a retryable `TaskNotRegisteredError`. Register every task your test exercises.
 - `runInline(task, payload, options?)` returns `{ runId, status, output, error, attempt }`.
   Children of `triggerAndWait`/`batchTriggerAndWait` run inline too. A failed run is returned,
   not thrown: `error` is the stored error (e.g. `{ name: "NonDeterminismError", ... }`).
@@ -767,3 +768,12 @@ install](#install) exercises.
     outside a memoized step may run again unless it's idempotent.
 13. **Missed cron ticks are not backfilled.** If every process is down when a scheduled tick would
     have fired, that occurrence is skipped for good — it doesn't run late and doesn't accumulate.
+14. **A failed attempt waits for its steps still in flight.** When the task function throws while
+    other steps are still running (e.g. one step of a `Promise.all` rejects), the engine waits for
+    them before recording the failure, without aborting `ctx.signal`: a step that completes is
+    recorded and the retry reuses its output instead of running it again. `maxDurationMs` still
+    bounds that wait (the attempt then fails with the original error, and the unfinished steps
+    re-run on the retry); a step that would suspend meanwhile is ignored — the error wins. A step
+    whose function only stops when `ctx.signal` aborts (instead of on its own) will block the
+    failure/retry until it finishes; set `maxDurationMs` if that step could run long, or it hangs
+    the attempt indefinitely.

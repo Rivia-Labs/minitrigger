@@ -3,7 +3,6 @@ import type {
 	CreateTokenResult,
 	ExpireWaitpointResult,
 	Json,
-	RunStatus,
 	WaitpointKind,
 	WaitpointStatus,
 	WaitpointStore,
@@ -13,7 +12,6 @@ import { atomic, direct, type SqlContext, type SqlExecutor } from "./db.js";
 import {
 	applyResumeRule,
 	cancelDescendants,
-	isTerminal,
 	jsonParam,
 	nowPlusMs,
 	timeOutWaitpointsOf,
@@ -102,11 +100,7 @@ export function createWaitpointStore(exec: SqlExecutor, ctx: SqlContext): Waitpo
 				const wp = found[0];
 				if (wp?.kind !== "token") return { kind: "not_found" };
 				// Decision 3: lock the waiting run before touching its waitpoints.
-				const { rows: owning } = await db.query<{ status: RunStatus }>(
-					`SELECT status FROM ${runs} WHERE id = $1 FOR UPDATE`,
-					[wp.run_id]
-				);
-				const runStatus = owning[0]?.status;
+				await db.query(`SELECT 1 FROM ${runs} WHERE id = $1 FOR UPDATE`, [wp.run_id]);
 				const { rows } = await db.query<{ has_expiry: boolean }>(
 					`UPDATE ${waitpoints}
 					 SET status = 'completed', output = $2::jsonb, resolved_at = now()
@@ -116,18 +110,29 @@ export function createWaitpointStore(exec: SqlExecutor, ctx: SqlContext): Waitpo
 				);
 				const updated = rows[0];
 				if (!updated) {
-					const { rows: cur } = await db.query<{ status: WaitpointStatus }>(
-						`SELECT status FROM ${waitpoints} WHERE id = $1`,
+					// `run_finished` only when the token was timed out BY the run's own terminal exit
+					// (every terminal transition times out the run's pending tokens in the same
+					// transaction, so `resolved_at = finished_at` exactly, same `now()`), never for a
+					// token that expired on its own in an earlier transaction whose run later
+					// finished. Computed in SQL (not by comparing JS `Date`s) to avoid any precision
+					// loss from the driver's timestamp mapping.
+					const { rows: cur } = await db.query<{
+						status: WaitpointStatus;
+						run_finished: boolean;
+					}>(
+						`SELECT w.status,
+						   (r.finished_at IS NOT NULL AND w.resolved_at = r.finished_at) AS run_finished
+						 FROM ${waitpoints} w
+						 LEFT JOIN ${runs} r ON r.id = w.run_id
+						 WHERE w.id = $1`,
 						[waitpointId]
 					);
-					const status = cur[0]?.status;
-					if (!status) return { kind: "not_found" };
-					// Every terminal transition times out the run's own pending tokens: report that
-					// the run is gone rather than a misleading `timed_out`.
-					if (status === "timed_out" && runStatus !== undefined && isTerminal(runStatus)) {
+					const row = cur[0];
+					if (!row) return { kind: "not_found" };
+					if (row.status === "timed_out" && row.run_finished) {
 						return { kind: "run_finished" };
 					}
-					return { kind: "not_pending", status };
+					return { kind: "not_pending", status: row.status };
 				}
 				const resume = await applyResumeRule(db, ctx, wp.run_id);
 				return {
