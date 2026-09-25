@@ -31,7 +31,7 @@ Atualizado em 2026-09-25. Leia junto com `CLAUDE.md` (decisões e notas de imple
 ## O que falta
 
 ### Próximos passos (fora das fases do kickoff)
-- **Publicar o primeiro release:** `pnpm check:pack`, criar tag `v0.1.0` e anexar o `.tgz` ao GitHub Release (caminho recomendado no README). Depois disso, mudanças de schema só em migrations novas (a 001 não pode mais ser editada).
+- ✅ **v0.1.0 publicado** no repositório privado `igorabreu29/minitrigger` (GitHub Release com o `.tgz`). A partir daqui, mudanças de schema só em migrations novas (001–003 não podem mais ser editadas). Novo release: subir `version`, `pnpm check:pack`, tag `vX.Y.Z`, `gh release create` com o `.tgz`.
 - Opcional: `TestEngine.start()` que drena em segundo plano (hoje o test engine só roda quando o teste chama `drain`/`runInline`/`drive`).
 
 ### Pontos em aberto registrados (sem urgência, comportamento documentado)

@@ -47,11 +47,17 @@ straight from GitHub (works, but needs one opt-in on your side). Either way, `bu
 
 ### Recommended: `.tgz` from GitHub Releases
 
+The repository (`igorabreu29/minitrigger`) is **private**, so release assets need GitHub
+authentication. Download the tarball with the GitHub CLI (logged in with access to the repo) and add
+it from disk:
+
 ```bash
-pnpm add https://github.com/<owner>/minitrigger/releases/download/vX.Y.Z/minitrigger-X.Y.Z.tgz \
-  bullmq ioredis pg
+gh release download v0.1.0 -R igorabreu29/minitrigger -p "minitrigger-*.tgz"
+pnpm add ./minitrigger-0.1.0.tgz bullmq ioredis pg
 pnpm add -D @types/pg   # optional, only needed if you use TypeScript
 ```
+
+Commit the `.tgz` (e.g. under `vendor/`) or fetch it in CI with a token that can read the repo.
 
 A release tarball already contains the built `dist/` (`pnpm pack`'s `files: ["dist"]`), so nothing
 builds on install: no pnpm `allowBuilds` opt-in, and no fresh, possibly-differently-resolved
@@ -61,8 +67,10 @@ check:pack` (see [Benchmark](#benchmark)) exercises exactly this pack → instal
 
 ### Fallback: install straight from GitHub
 
+Needs git access to the private repo (SSH key or a credential helper for HTTPS).
+
 ```bash
-pnpm add github:<owner>/minitrigger bullmq ioredis pg
+pnpm add github:igorabreu29/minitrigger#v0.1.0 bullmq ioredis pg
 ```
 
 `dist/` is `.gitignore`d and only produced by minitrigger's own `prepare` script, and pnpm 10+
@@ -72,7 +80,7 @@ blocks a git dependency's lifecycle scripts by default — so a plain `pnpm add 
 ```yaml
 # your project's pnpm-workspace.yaml
 allowBuilds:
-  minitrigger@github.com/<owner>/minitrigger#<commit-or-tag>: true
+  minitrigger@github.com/igorabreu29/minitrigger#<resolved-commit>: true
   msgpackr-extract: true # ioredis's optional native accelerator; blocked by the same pnpm mechanism
 ```
 
