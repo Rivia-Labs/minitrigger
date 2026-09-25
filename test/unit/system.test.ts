@@ -57,6 +57,7 @@ function runRecord(overrides: Partial<RunRecord> = {}): RunRecord {
 		finishedAt: null,
 		createdAt: NOW,
 		updatedAt: NOW,
+		progress: null,
 		...overrides,
 	};
 }

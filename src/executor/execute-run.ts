@@ -27,6 +27,7 @@ import { assertSerializable, type Json, normalizeOutput } from "../utils/seriali
 import { type AbortKind, type ActiveExecutions, ExecutionState } from "./execution.js";
 import { createRunLogger } from "./logger.js";
 import type { RunNotifier } from "./notify.js";
+import { createRunProgress, type RunProgress } from "./progress.js";
 import { type ChildTaskSpec, createStepContext, SuspendSignal } from "./step-context.js";
 
 export interface ExecutorDeps {
@@ -173,6 +174,15 @@ async function runAcquired(deps: ExecutorDeps, state: ExecutionState): Promise<v
 			ownershipGone: () => ownershipGone(state),
 		}
 	);
+	const progress = createRunProgress(
+		{ runs: deps.store.runs, config: deps.config, ...(deps.notify ? { notify: deps.notify } : {}) },
+		{
+			runId: run.id,
+			executionId: state.executionId,
+			taskId: run.taskId,
+			ownershipGone: () => ownershipGone(state),
+		}
+	);
 
 	const heartbeat = startHeartbeat(deps, state);
 	const maxDurationMs = task?.options.maxDurationMs;
@@ -185,7 +195,7 @@ async function runAcquired(deps: ExecutorDeps, state: ExecutionState): Promise<v
 				);
 
 	try {
-		let outcome = await execute(deps, task, state, logger);
+		let outcome = await execute(deps, task, state, logger, progress);
 		if (outcome.kind === "success" && state.inFlight.size > 0) {
 			outcome = await settleBeforeComplete(deps, state, outcome);
 		}
@@ -205,8 +215,10 @@ async function runAcquired(deps: ExecutorDeps, state: ExecutionState): Promise<v
 		if (outcome.kind === "suspended") outcome = await settleInFlight(state);
 		clearTimeout(timer);
 		heartbeat.stop();
-		// Pending logs land BEFORE the terminal/suspension write (dropped if ownership is gone).
+		// Pending logs/progress land BEFORE the terminal/suspension write (dropped if ownership is
+		// gone).
 		await logger.close();
+		await progress.close();
 		await settle(deps, state, task, outcome, maxDurationMs);
 	} finally {
 		// The attempt is over (terminal write, retry, suspension, release or an unexpected
@@ -216,6 +228,7 @@ async function runAcquired(deps: ExecutorDeps, state: ExecutionState): Promise<v
 		clearTimeout(timer);
 		heartbeat.stop();
 		await logger.close();
+		await progress.close();
 	}
 }
 
@@ -224,7 +237,8 @@ async function execute(
 	deps: ExecutorDeps,
 	task: AnyTask | undefined,
 	state: ExecutionState,
-	logger: TaskContext["logger"]
+	logger: TaskContext["logger"],
+	progress: RunProgress
 ): Promise<Outcome> {
 	if (!task) {
 		// E.g. a rolling deploy where this process doesn't know the task yet: count it as a failed
@@ -286,6 +300,23 @@ async function execute(
 		signal: state.signal,
 		run: { id: run.id, taskId: run.taskId, attempt: run.attempt, createdAt: run.createdAt },
 		stream: (name, source) => streamTo(deps, state, name, source),
+		progress: {
+			async set(value) {
+				// Not a step (decision 23): no `register()`/`seq_index`, and this never touches
+				// `state.fatalError` -- an oversized/non-serializable value is a normal error the
+				// task can catch, unlike the argument errors `ctx.step.*` treats as fatal bugs.
+				assertSerializable(value, {
+					label: `progress of run ${run.id}`,
+					maxBytes: limits.maxProgressBytes,
+				});
+				// Snapshot the now-validated value before handing it to the coalescer: `set()` may
+				// return well before the write actually happens (coalesced up to `intervalMs`), and
+				// the caller is free to keep mutating the object it passed in. Without this, a later
+				// mutation would bypass the validation just performed above (and could still be
+				// caught by nothing -- `jsonParam` has no size/serializability check of its own).
+				progress.set(structuredClone(value) as Json);
+			},
+		},
 	};
 	return invoke(deps, task, state, ctx);
 }

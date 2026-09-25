@@ -24,7 +24,7 @@
  */
 
 import type { Redis } from "ioredis";
-import type { RunStatus } from "./store/types.js";
+import type { Json, RunStatus } from "./store/types.js";
 import { validateSqlIdentifier } from "./utils/identifiers.js";
 
 /** Minimal logger shape (pino- and console-compatible), same shape as `EngineLogger`. */
@@ -47,6 +47,13 @@ export interface RunStatusMessage {
 	status: RunStatus;
 	/** ISO 8601 (decision 17: the caller reads this from the database clock, not `Date.now()`). */
 	updatedAt: string;
+	/**
+	 * Present only on a message published for a `ctx.progress.set` write (decision 23; always
+	 * `status: "running"` then) or when the publisher had the latest value cheaply at hand.
+	 * Omitted on an ordinary status transition message; `isStatusPayload` still accepts those
+	 * (an older publisher's messages never carried this field either).
+	 */
+	progress?: Json | null;
 }
 
 /** The publishing half of {@link PubSub}; needs no subscriber connection. */

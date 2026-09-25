@@ -212,6 +212,80 @@ export function defineStoreContractSuite(get: () => StoreHarness): void {
 	});
 
 	// -------------------------------------------------------------------------
+	describe("contract: runs.setProgress (decision 23)", () => {
+		it("starts null; a guarded write sets it and bumps updated_at", async () => {
+			const { run, owner } = await running();
+			expect(run.progress).toBeNull();
+			await get().advance(5);
+			const result = await s().runs.setProgress(
+				owner.runId,
+				owner.executionId,
+				{
+					step: "importing",
+					processed: 1,
+				},
+				5_000
+			);
+			if (result.kind !== "ok") throw new Error("expected ok");
+			const got = await s().runs.get(owner.runId);
+			expect(got?.progress).toEqual({ step: "importing", processed: 1 });
+			expect(got?.updatedAt.getTime()).toBe(result.updatedAt.getTime());
+			expect(got?.updatedAt.getTime()).toBeGreaterThan(run.updatedAt.getTime());
+		});
+
+		it("overwrites the previous value; not merged", async () => {
+			const { owner } = await running();
+			await s().runs.setProgress(owner.runId, owner.executionId, { a: 1 }, 5_000);
+			await s().runs.setProgress(owner.runId, owner.executionId, { b: 2 }, 5_000);
+			expect((await s().runs.get(owner.runId))?.progress).toEqual({ b: 2 });
+		});
+
+		it("accepts every JSON shape (null, primitives, arrays, nested objects)", async () => {
+			const { owner } = await running();
+			const values: Json[] = [null, 0, false, "x", [1, 2, 3], { nested: { a: [true, null] } }];
+			for (const value of values) {
+				const result = await s().runs.setProgress(owner.runId, owner.executionId, value, 5_000);
+				expect(result.kind).toBe("ok");
+				expect((await s().runs.get(owner.runId))?.progress).toEqual(value);
+			}
+		});
+
+		it("lost: wrong executionId, or the run is no longer running", async () => {
+			const { owner } = await running();
+			expect(await s().runs.setProgress(owner.runId, randomUUID(), { x: 1 }, 5_000)).toEqual({
+				kind: "lost",
+			});
+			expect(await s().runs.setProgress(randomUUID(), owner.executionId, { x: 1 }, 5_000)).toEqual({
+				kind: "lost",
+			});
+			const retried = await s().runs.retry(owner, ERR, 0);
+			if (retried.kind !== "retrying") throw new Error("retry lost");
+			// The old execution no longer owns the (now queued) run.
+			expect(await s().runs.setProgress(owner.runId, owner.executionId, { x: 1 }, 5_000)).toEqual({
+				kind: "lost",
+			});
+		});
+
+		it("survives a retry: unaffected by a transition that doesn't touch it", async () => {
+			const { owner } = await running();
+			await s().runs.setProgress(owner.runId, owner.executionId, { done: 1 }, 5_000);
+			const retried = await s().runs.retry(owner, ERR, 0);
+			if (retried.kind !== "retrying") throw new Error("retry lost");
+			expect((await s().runs.get(owner.runId))?.progress).toEqual({ done: 1 });
+			// ... and across the next attempt's acquire/resume too.
+			const next = await acquire(owner.runId);
+			expect((await s().runs.get(next.runId))?.progress).toEqual({ done: 1 });
+		});
+
+		it("rejects U+0000 like any other jsonb column (22P05)", async () => {
+			const { owner } = await running();
+			await expect(
+				s().runs.setProgress(owner.runId, owner.executionId, { a: "x\u0000y" }, 5_000)
+			).rejects.toMatchObject({ code: "22P05" });
+		});
+	});
+
+	// -------------------------------------------------------------------------
 	describe("contract: runs terminal transitions and ownership", () => {
 		it("complete sets output/finished_at, clears execution_id/run_after/error", async () => {
 			const { owner } = await running();

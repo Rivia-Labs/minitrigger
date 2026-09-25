@@ -58,6 +58,7 @@ export type {
 	TaskOptions,
 	TaskOutput,
 	TaskPayload,
+	TaskProgress,
 	TaskQueueOptions,
 	TaskScheduleOptions,
 	TokenHandle,

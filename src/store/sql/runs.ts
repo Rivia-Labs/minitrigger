@@ -405,6 +405,25 @@ export function createRunStore(exec: SqlExecutor, ctx: SqlContext): RunStore {
 			return row ? { kind: "released", enqueue: mapEnqueue(row) } : { kind: "lost" };
 		},
 
+		async setProgress(runId, executionId, value, timeoutMs) {
+			if (exec.kind === "tx") {
+				throw new Error("setProgress must not run inside a StoreTx (SET LOCAL would leak)");
+			}
+			const ms = Math.max(1, Math.floor(timeoutMs));
+			if (!Number.isSafeInteger(ms)) throw new Error(`invalid setProgress timeout: ${timeoutMs}`);
+			return atomic(exec, async db => {
+				// SET cannot take bind parameters; `ms` is a validated integer.
+				await db.query(`SET LOCAL statement_timeout = ${ms}`);
+				const { rows } = await db.query<{ updated_at: Date }>(
+					`UPDATE ${runs} SET progress = $3::jsonb, updated_at = now() WHERE ${OWNED}
+					 RETURNING updated_at`,
+					[runId, executionId, jsonParam(value)]
+				);
+				const row = rows[0];
+				return row ? { kind: "ok", updatedAt: row.updated_at } : { kind: "lost" };
+			});
+		},
+
 		suspend(owner) {
 			return atomic(exec, async db => {
 				const locked = await db.query(`SELECT 1 FROM ${runs} WHERE ${OWNED} FOR UPDATE`, [

@@ -30,6 +30,7 @@ describe("resolveConfig", () => {
 			maxStepOutputBytes: 256 * 1024,
 			maxLogEntryBytes: 16 * 1024,
 			maxInlineStepOutputBytes: 16 * 1024 * 1024,
+			maxProgressBytes: 16 * 1024,
 		});
 		expect(r.logging).toEqual({ minLevel: "info", mirror: true });
 		expect(typeof r.logger.warn).toBe("function");
@@ -62,7 +63,7 @@ describe("resolveConfig", () => {
 			stallTimeoutMs: 1_000,
 			idempotencyKeyTtl: "2d",
 			retention: { days: 3 },
-			limits: { maxPayloadBytes: 10 },
+			limits: { maxPayloadBytes: 10, maxProgressBytes: 500 },
 			systemConcurrency: 2,
 			logger,
 		});
@@ -73,6 +74,7 @@ describe("resolveConfig", () => {
 		expect(r.retentionDays).toBe(3);
 		expect(r.limits.maxPayloadBytes).toBe(10);
 		expect(r.limits.maxStepOutputBytes).toBe(256 * 1024);
+		expect(r.limits.maxProgressBytes).toBe(500);
 		expect(r.logger).toBe(logger);
 	});
 
@@ -124,6 +126,7 @@ describe("resolveConfig", () => {
 		{ retention: { days: 0 } },
 		{ idempotencyKeyTtl: 0 },
 		{ limits: { maxStepOutputBytes: 0 } },
+		{ limits: { maxProgressBytes: 0 } },
 		{ reconciler: { intervalMs: 0 } },
 		{ reconciler: { graceMs: -1 } },
 		{ reconciler: { batchSize: 1.5 } },

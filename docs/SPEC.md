@@ -132,6 +132,8 @@ Trabalhe **fase por fase**, na ordem, e só avance quando os critérios de aceit
 
 22. **Checagens de ambiente são avisos, não falhas fatais**, quando o comando não está disponível (`CONFIG GET maxmemory-policy` bloqueado em Redis gerenciado). Falhar apenas quando a checagem responde e está errada.
 
+23. **Progresso por run.** `ctx.progress.set(value)` mantém um único valor mutável por run (`runs.progress`, migration 004, coluna não indexada), escrito só pela execução dona (mesma guarda de ownership da decisão 5). Não é step: não participa da checagem de não-determinismo nem consome `seq_index`. `value` é validado como um payload (`Serializable`, `limits.maxProgressBytes`, padrão 16 KB); estourar o limite lança `SerializationError` comum, capturável pelo usuário (ao contrário de um argumento inválido de `ctx.step.*`, que é fatal). Gravações são agrupadas (no máximo uma a cada 250 ms; só o último valor de uma rajada é escrito) e sempre esvaziadas antes da próxima escrita terminal ou de suspensão da run (mesmo ponto onde `ctx.logger` é esvaziado). Publicado no pub/sub best-effort (mesmo canal `run-status`, sem evento local dedicado); `runs.subscribe` emite quando só o progresso muda. Sobrevive a retry e a retomada — a engine nunca zera o valor sozinha.
+
 ---
 
 ## 3. API pública alvo
@@ -174,6 +176,7 @@ export const resumirVaga = defineTask({
     );
     await ctx.step.trigger("notificar", notificar, { url: payload.url }); // dispara sem esperar
     ctx.logger.info("finalizado", { filhoOk: filho.ok });
+    await ctx.progress.set({ step: "concluido" }); // runs.progress; não é step, sem seq_index
     return { status: "ok" as const, resumo };
   },
 });
@@ -216,7 +219,7 @@ Requisitos de tipos:
 - `defineTask` infere `Payload` e `Output` a partir de `run`.
 - `trigger`, `step.trigger`, `step.triggerAndWait` e `step.batchTriggerAndWait` só aceitam o payload correto para aquela task.
 - `triggerAndWait`, `batchTriggerAndWait` (por item) e `waitForToken` retornam `{ ok: true, output } | { ok: false, error }`, sem lançar exceção para falha da subtask ou timeout.
-- `ctx` expõe: `step`, `logger`, `signal` (AbortSignal: cancelamento, `maxDurationMs`, perda de ownership ou shutdown), `run` (`{ id, taskId, attempt, createdAt }`).
+- `ctx` expõe: `step`, `logger`, `signal` (AbortSignal: cancelamento, `maxDurationMs`, perda de ownership ou shutdown), `run` (`{ id, taskId, attempt, createdAt }`), `progress.set(value)` (decisão 23).
 
 ---
 

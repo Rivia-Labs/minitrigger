@@ -50,6 +50,7 @@ function runRecord(): RunRecord {
 		finishedAt: null,
 		createdAt: NOW,
 		updatedAt: NOW,
+		progress: null,
 	};
 }
 

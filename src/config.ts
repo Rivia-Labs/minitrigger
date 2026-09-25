@@ -36,6 +36,8 @@ export interface EngineLimits {
 	maxLogEntryBytes?: number;
 	/** `$2` of the Phase 4 step-window query. Default 16 MB. */
 	maxInlineStepOutputBytes?: number;
+	/** `ctx.progress.set` value (decision 23; `runs.progress`). Default 16 KB. */
+	maxProgressBytes?: number;
 }
 
 export interface EngineConfig {
@@ -184,6 +186,7 @@ export const DEFAULTS = {
 		maxStepOutputBytes: 256 * 1024,
 		maxLogEntryBytes: 16 * 1024,
 		maxInlineStepOutputBytes: 16 * 1024 * 1024,
+		maxProgressBytes: 16 * 1024,
 	},
 } as const;
 
@@ -315,6 +318,10 @@ export function resolveConfig(config: EngineConfig): ResolvedConfig {
 		maxInlineStepOutputBytes: positiveInt(
 			"limits.maxInlineStepOutputBytes",
 			config.limits?.maxInlineStepOutputBytes ?? DEFAULTS.limits.maxInlineStepOutputBytes
+		),
+		maxProgressBytes: positiveInt(
+			"limits.maxProgressBytes",
+			config.limits?.maxProgressBytes ?? DEFAULTS.limits.maxProgressBytes
 		),
 	};
 

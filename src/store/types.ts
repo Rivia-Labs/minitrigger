@@ -117,6 +117,12 @@ export interface RunRecord {
 	finishedAt: Date | null;
 	createdAt: Date;
 	updatedAt: Date;
+	/**
+	 * `ctx.progress.set` (decision 23): a single mutable value overwritten by its owning execution,
+	 * unrelated to steps (not memoized, no `seq_index`). `null` until the first `set`. Survives
+	 * retry and resume (never reset by the engine).
+	 */
+	progress: Json | null;
 }
 
 /** One row of `steps` (PK `(run_id, name)`). */
@@ -318,6 +324,7 @@ export type FailRunResult =
 	| Lost;
 export type RetryRunResult = { kind: "retrying"; attempt: number; enqueue: EnqueueRequest } | Lost;
 export type ReleaseRunResult = { kind: "released"; enqueue: EnqueueRequest } | Lost;
+export type SetProgressResult = { kind: "ok"; updatedAt: Date } | Lost;
 
 export type CancelRunResult =
 	| { kind: "not_found" }
@@ -447,6 +454,24 @@ export interface RunStore {
 	 * `execution_id = NULL`, `run_after = now()`, `enqueue_seq + 1`, attempt unchanged.
 	 */
 	release(owner: Ownership): Promise<ReleaseRunResult>;
+
+	/**
+	 * `ctx.progress.set` (decision 23). Guarded single-statement update, like {@link heartbeat}
+	 * (own short transaction, `SET LOCAL statement_timeout = timeoutMs`, never on a StoreTx) but
+	 * touching `progress` and (unlike `heartbeat`) `updated_at`, so `runs.subscribe` sees it as a
+	 * change: `UPDATE runs SET progress = $3::jsonb, updated_at = now() WHERE <ownership guard>
+	 * RETURNING updated_at`. Guard failed (ownership lost) => `lost`. Overwrites the whole value
+	 * (not a merge); survives retry/resume because nothing else ever touches this column. Bounded
+	 * by `timeoutMs` so a write blocked behind another transaction's lock on the run row can't hang
+	 * indefinitely (e.g. `close()` awaiting it during shutdown, after the heartbeat already
+	 * stopped).
+	 */
+	setProgress(
+		runId: string,
+		executionId: string,
+		value: Json,
+		timeoutMs: number
+	): Promise<SetProgressResult>;
 
 	/**
 	 * Suspension transaction (decision 3), after `Promise.allSettled` of in-flight

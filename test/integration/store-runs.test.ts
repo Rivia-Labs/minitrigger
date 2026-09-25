@@ -103,6 +103,50 @@ describe("RunStore: create / acquire / heartbeat", () => {
 		const rows = await f.sql<{ statement_timeout: string }>("SHOW statement_timeout");
 		expect(rows[0]?.statement_timeout).toBe("0");
 	});
+
+	it("setProgress touches progress + updated_at; lost after ownership changes; not on a tx", async () => {
+		const { owner } = await f.running();
+		const result = await f.runs.setProgress(owner.runId, owner.executionId, { step: 1 }, 5_000);
+		if (result.kind !== "ok") throw new Error("expected ok");
+		expect((await rawRun(owner.runId))?.updated_at.getTime()).toBe(result.updatedAt.getTime());
+		expect(await f.runs.setProgress(owner.runId, randomUUID(), { step: 2 }, 5_000)).toEqual({
+			kind: "lost",
+		});
+
+		const client = await ns.pool.connect();
+		try {
+			const txRuns = createRunStore({ kind: "tx", client }, createSqlContext(ns.schema));
+			await expect(
+				txRuns.setProgress(owner.runId, owner.executionId, { step: 3 }, 5_000)
+			).rejects.toThrow();
+		} finally {
+			client.release();
+		}
+		// statement_timeout was LOCAL: the pool's sessions still have the default.
+		const rows = await f.sql<{ statement_timeout: string }>("SHOW statement_timeout");
+		expect(rows[0]?.statement_timeout).toBe("0");
+	});
+
+	it("setProgress is bounded by its own statement_timeout when blocked behind another lock", async () => {
+		const { owner } = await f.running();
+		const locker = await ns.pool.connect();
+		try {
+			await locker.query("BEGIN");
+			// Holds the run row locked without committing -- `setProgress`'s UPDATE would otherwise
+			// block until this transaction ends, which could be indefinite (e.g. `close()`, awaited
+			// after the heartbeat already stopped, must never hang on this).
+			await locker.query(`SELECT 1 FROM ${f.t("runs")} WHERE id = $1 FOR UPDATE`, [owner.runId]);
+
+			const start = Date.now();
+			await expect(
+				f.runs.setProgress(owner.runId, owner.executionId, { step: 1 }, 150)
+			).rejects.toMatchObject({ code: "57014" }); // query_canceled (statement_timeout)
+			expect(Date.now() - start).toBeLessThan(2_000);
+		} finally {
+			await locker.query("ROLLBACK").catch(() => {});
+			locker.release();
+		}
+	});
 });
 
 describe("RunStore: terminal transitions and ownership", () => {

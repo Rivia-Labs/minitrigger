@@ -43,6 +43,8 @@ export interface RunRow {
 	readonly finishedAt: number | null;
 	readonly createdAt: number;
 	readonly updatedAt: number;
+	/** `ctx.progress.set` (decision 23); `null` until the first `set`. */
+	readonly progress: Json | null;
 }
 
 export interface StepRow {

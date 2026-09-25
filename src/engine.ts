@@ -137,6 +137,8 @@ export interface Run<O = unknown> {
 	finishedAt: Date | null;
 	createdAt: Date;
 	updatedAt: Date;
+	/** Last value written by `ctx.progress.set` (decision 23); `null` until the first `set`. */
+	progress: Json | null;
 }
 
 export interface ListRunsOptions {
@@ -207,6 +209,13 @@ export interface RunStatusUpdate {
 	status: RunStatus;
 	/** `runs.updated_at` of that change (database clock, decision 17). */
 	updatedAt: Date;
+	/**
+	 * Latest known progress (decision 23): the initial emission's is read from Postgres; a later
+	 * one keeps the previous value when the message that triggered it didn't carry a fresher one
+	 * (an ordinary status transition, cheaply omitting it) and updates it on a `ctx.progress.set`
+	 * write or a transition published with the value at hand.
+	 */
+	progress: Json | null;
 }
 
 export interface SubscribeOptions {
@@ -496,9 +505,28 @@ export function createEngineCore(
 			"run status"
 		);
 	}
+	/**
+	 * `ctx.progress.set` (decision 23): publishes the new value for `runs.subscribe`, as a
+	 * `running`-status message (the write only ever happens while the run is `running`, decision
+	 * 5). No local event: progress isn't a transition (`RunTransition`/`engine.events` stay as-is).
+	 */
+	function notifyProgress(runId: string, updatedAt: Date, value: Json | null): void {
+		trackNotification(
+			publisher.publishStatus({
+				runId,
+				status: "running",
+				updatedAt: updatedAt.toISOString(),
+				progress: value,
+			}),
+			"run progress"
+		);
+	}
 	const notifier: RunNotifier = {
 		status(info) {
 			notifyStatus(info);
+		},
+		progress(runId, updatedAt, value) {
+			notifyProgress(runId, updatedAt, value);
 		},
 		canceled(runIds) {
 			if (runIds.length === 0) return;
@@ -761,22 +789,37 @@ export function createEngineCore(
 			// (2) Postgres is the source of truth for the starting point.
 			const row = await store.runs.get(runId);
 			if (!row || ended) return;
-			let last: RunStatusUpdate = { runId, status: row.status, updatedAt: row.updatedAt };
+			let last: RunStatusUpdate = {
+				runId,
+				status: row.status,
+				updatedAt: row.updatedAt,
+				progress: row.progress,
+			};
 			yield last;
 			if (isTerminal(last.status)) return;
 
-			// (3) Only strictly newer changes (a same-millisecond change counts when its status
-			// differs: JS dates drop Postgres' microseconds).
-			const isNewer = (status: RunStatus, updatedAt: Date) => {
-				const delta = updatedAt.getTime() - last.updatedAt.getTime();
-				return delta > 0 || (delta === 0 && status !== last.status);
-			};
+			// (3) Only strictly newer changes; see `isNewerRunUpdate` for the same-millisecond rules
+			// (status differs, or -- decision 23 -- only the progress value differs).
 			while (!ended) {
 				const message = pending.shift();
 				if (message) {
 					const updatedAt = new Date(message.updatedAt);
-					if (Number.isNaN(updatedAt.getTime()) || !isNewer(message.status, updatedAt)) continue;
-					last = { runId, status: message.status, updatedAt };
+					if (
+						Number.isNaN(updatedAt.getTime()) ||
+						!isNewerRunUpdate(last, {
+							status: message.status,
+							updatedAt,
+							progress: message.progress,
+						})
+					) {
+						continue;
+					}
+					last = {
+						runId,
+						status: message.status,
+						updatedAt,
+						progress: message.progress !== undefined ? message.progress : last.progress,
+					};
 					yield last;
 					// (4)
 					if (isTerminal(last.status)) return;
@@ -794,11 +837,18 @@ export function createEngineCore(
 				// Safety net: pub/sub may drop messages (e.g. on a reconnect).
 				const current = await store.runs.get(runId);
 				if (!current) return;
-				if (isNewer(current.status, current.updatedAt)) {
+				if (
+					isNewerRunUpdate(last, {
+						status: current.status,
+						updatedAt: current.updatedAt,
+						progress: current.progress,
+					})
+				) {
 					pending.push({
 						runId,
 						status: current.status,
 						updatedAt: current.updatedAt.toISOString(),
+						progress: current.progress,
 					});
 				}
 			}
@@ -1517,6 +1567,77 @@ function runIdOf(run: string | RunHandle<unknown>): string {
 	return typeof run === "string" ? run : run.id;
 }
 
+/**
+ * Structural equality of two progress values (decision 23's `runs.subscribe` `isNewer` check),
+ * ignoring key order: jsonb (and the memory store's own `normalizeKeys`) can reorder an object's
+ * keys, so a JSON-text comparison (`JSON.stringify(a) === JSON.stringify(b)`) would treat an
+ * unchanged value written back under a different key order as a change.
+ */
+function jsonEqual(a: Json | null, b: Json | null): boolean {
+	if (a === b) return true;
+	if (a === null || b === null) return false;
+	if (Array.isArray(a) || Array.isArray(b)) {
+		if (!Array.isArray(a) || !Array.isArray(b) || a.length !== b.length) return false;
+		return a.every((v, i) => jsonEqual(v, b[i] as Json));
+	}
+	if (typeof a !== "object" || typeof b !== "object") return a === b;
+	const ao = a as { [key: string]: Json | undefined };
+	const bo = b as { [key: string]: Json | undefined };
+	const ak = Object.keys(ao);
+	const bk = Object.keys(bo);
+	if (ak.length !== bk.length) return false;
+	return ak.every(k => {
+		const av = ao[k];
+		const bv = bo[k];
+		return av === undefined ? bv === undefined : bv !== undefined && jsonEqual(av, bv);
+	});
+}
+
+/**
+ * Whether a candidate run-status update is newer than the last one emitted by `runs.subscribe`
+ * (decision 23, `subscribeRun`'s ordering rule): only a strictly newer `updatedAt` wins outright.
+ * JS `Date` drops Postgres' microseconds, so two writes can share the same millisecond; a
+ * same-millisecond update still counts as newer when its `status` differs from the last emitted
+ * one, or -- decision 23 -- when only the progress value differs, compared structurally via
+ * {@link jsonEqual} rather than by JSON text.
+ *
+ * One more same-millisecond case is filtered out instead of counting as "status differs": a
+ * `"running"` status carrying a `progress` field is always a `ctx.progress.set` write's own status
+ * message (`RunNotifier.progress`), and that write is always flushed strictly BEFORE any
+ * terminal/suspension write -- so it can only ever precede a same-millisecond non-running status,
+ * never follow one. If the last emitted update is already non-running and a same-millisecond
+ * `"running"` + `progress` message shows up after it, that is the earlier progress write arriving
+ * late (pub/sub redelivery/reordering), not a real transition back to running: dropping it
+ * prevents a `waiting` -> `running` -> `waiting` flicker in what `runs.subscribe` emits. A genuine
+ * re-acquire at the same millisecond publishes its own `"running"` status message without a
+ * `progress` field, so it is unaffected by this rule.
+ *
+ * (Two `ctx.progress.set` writes landing within the same millisecond can't be ordered against each
+ * other from the timestamp alone either -- that's inherent and transient, corrected by the next
+ * message or `runs.subscribe`'s periodic re-read, not something this function tries to fix.)
+ *
+ * @internal exported for `test/unit/subscribe-ordering.test.ts`.
+ */
+export function isNewerRunUpdate(
+	last: { status: RunStatus; updatedAt: Date; progress: Json | null },
+	candidate: { status: RunStatus; updatedAt: Date; progress: Json | undefined }
+): boolean {
+	const delta = candidate.updatedAt.getTime() - last.updatedAt.getTime();
+	if (delta > 0) return true;
+	if (delta < 0) return false;
+	if (
+		candidate.status === "running" &&
+		candidate.progress !== undefined &&
+		last.status !== "running"
+	) {
+		return false;
+	}
+	return (
+		candidate.status !== last.status ||
+		(candidate.progress !== undefined && !jsonEqual(candidate.progress, last.progress))
+	);
+}
+
 function toPublicRun<O>(record: RunRecord): Run<O> {
 	return {
 		id: record.id,
@@ -1535,6 +1656,7 @@ function toPublicRun<O>(record: RunRecord): Run<O> {
 		finishedAt: record.finishedAt,
 		createdAt: record.createdAt,
 		updatedAt: record.updatedAt,
+		progress: record.progress,
 	};
 }
 

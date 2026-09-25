@@ -545,3 +545,44 @@ describe("createTestEngine: additional coverage", () => {
 		expect(second).toMatchObject({ status: "completed", output: 42 });
 	});
 });
+
+describe("createTestEngine: progress (decision 23)", () => {
+	it("ctx.progress.set persists through the shared core; runs.get sees the last value", async () => {
+		const task = defineTask({
+			id: "progress-task",
+			run: async (_payload: undefined, ctx) => {
+				await ctx.progress.set({ step: 1 });
+				await ctx.progress.set({ step: 2 });
+				return { ok: true };
+			},
+		});
+		const engine = testEngine({ tasks: [task] });
+
+		const result = await engine.runInline(task);
+		expect(result.status).toBe("completed");
+		const run = await engine.runs.get(result.runId);
+		expect(run?.progress).toEqual({ step: 2 });
+	});
+
+	it("survives suspension: the value set before a sleep is visible while the run waits", async () => {
+		const task = defineTask({
+			id: "progress-suspend-task",
+			run: async (_payload: undefined, ctx) => {
+				await ctx.progress.set({ step: "before-sleep" });
+				await ctx.step.sleep("wait", "1h");
+				return "done";
+			},
+		});
+		const engine = testEngine({ tasks: [task], clock: { start: START, autoAdvance: false } });
+
+		const first = await engine.runInline(task);
+		expect(first.status).toBe("waiting");
+		expect((await engine.runs.get(first.runId))?.progress).toEqual({ step: "before-sleep" });
+
+		await engine.clock.advance("1h");
+		const final = await engine.drive(first.runId);
+		expect(final).toMatchObject({ status: "completed", output: "done" });
+		// Unaffected by resuming without a further `set`.
+		expect((await engine.runs.get(first.runId))?.progress).toEqual({ step: "before-sleep" });
+	});
+});

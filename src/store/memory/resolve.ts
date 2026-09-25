@@ -60,6 +60,7 @@ export function mapRun(row: RunRow): RunRecord {
 		finishedAt: toDate(row.finishedAt),
 		createdAt: new Date(row.createdAt),
 		updatedAt: new Date(row.updatedAt),
+		progress: cloneJson(row.progress),
 	};
 }
 

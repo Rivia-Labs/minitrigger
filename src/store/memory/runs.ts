@@ -99,6 +99,7 @@ function insertRun(tx: MemTx, input: InsertRun): RunRow {
 		finishedAt: null,
 		createdAt: truncMs(tx.now),
 		updatedAt: tx.now,
+		progress: null,
 	};
 	tx.set(tx.db.runs, id, row);
 	return row;
@@ -382,6 +383,19 @@ export function createRunStore(exec: Exec): RunStore {
 					updatedAt: tx.now,
 				});
 				return { kind: "released", enqueue: enqueueOf(next, tx.now) };
+			});
+		},
+
+		setProgress(runId, executionId, value, timeoutMs) {
+			// Synchronous store, nothing to time out; validated the same way as `heartbeat` for
+			// signature parity and to catch a nonsensical value early.
+			const ms = Math.max(1, Math.floor(timeoutMs));
+			if (!Number.isSafeInteger(ms)) throw new Error(`invalid setProgress timeout: ${timeoutMs}`);
+			return exec.run(tx => {
+				const row = owned(tx, uuid(runId), uuid(executionId));
+				if (!row) return { kind: "lost" };
+				const next = updateRun(tx, row, { progress: toJsonb(value), updatedAt: tx.now });
+				return { kind: "ok", updatedAt: toDate(next.updatedAt) };
 			});
 		},
 

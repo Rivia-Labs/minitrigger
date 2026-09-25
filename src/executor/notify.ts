@@ -1,4 +1,4 @@
-import type { RunStatus, SerializedError } from "../store/types.js";
+import type { Json, RunStatus, SerializedError } from "../store/types.js";
 
 /**
  * Which transition this process just made (Phase 7 local events, `engine.events.on`):
@@ -46,12 +46,20 @@ export interface RunNotifier {
 	 * duplicate publish is harmless: subscribers order by `updatedAt`.
 	 */
 	status(info: RunStatusInfo): void;
+	/**
+	 * Publishes a `ctx.progress.set` write (decision 23) as a `running`-status pub/sub message
+	 * carrying the new value, so `runs.subscribe` sees progress-only changes too. Best-effort, like
+	 * every other method here; `updatedAt` is the run row's `updated_at` from the same write
+	 * (decision 17, no extra `runs.get`).
+	 */
+	progress(runId: string, updatedAt: Date, value: Json | null): void;
 	/** Aborts the executions of these (already canceled) runs in every process (pub/sub). */
 	canceled(runIds: readonly string[]): void;
 }
 
 export const noopNotifier: RunNotifier = {
 	status() {},
+	progress() {},
 	canceled() {},
 };
 

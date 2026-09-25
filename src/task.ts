@@ -177,6 +177,22 @@ export type TaskLogger = {
 	error(message: string, data?: Json): void;
 };
 
+/**
+ * `ctx.progress` (decision 23): a single mutable value per run (`runs.progress`), read back by
+ * `engine.runs.get`/`runs.list` and `runs.subscribe`. Not a step: not memoized, no `seq_index`,
+ * and calling it does not participate in non-determinism detection.
+ */
+export type TaskProgress = {
+	/**
+	 * Overwrites the run's progress value. Validated synchronously against `Serializable`/
+	 * `limits.maxProgressBytes`, like a payload; rejects with `SerializationError` (a normal error
+	 * the task can catch, unlike an invalid `ctx.step.*` argument). Resolves once the value is
+	 * accepted by the internal coalescer (writes are batched at most every 250 ms and always
+	 * flushed before the run's terminal/suspension write), not necessarily once persisted.
+	 */
+	set(value: Json): Promise<void>;
+};
+
 /** Context passed as the second argument of a task's `run`. */
 export type TaskContext = {
 	step: StepApi;
@@ -191,6 +207,7 @@ export type TaskContext = {
 	 * Not a step: not memoized, so a replay streams again.
 	 */
 	stream(name: string, source: AsyncIterable<Json | string>): Promise<void>;
+	progress: TaskProgress;
 };
 
 // ---------------------------------------------------------------------------

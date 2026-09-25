@@ -76,6 +76,7 @@ function runRecord(overrides: Partial<RunRecord> = {}): RunRecord {
 		finishedAt: null,
 		createdAt: NOW,
 		updatedAt: NOW,
+		progress: null,
 		...overrides,
 	};
 }
@@ -836,7 +837,7 @@ describe("processScheduleTick", () => {
 			getJobScheduler: async () => ({ id: "daily", pattern: schedule.cron, timezone: undefined }),
 		});
 		const { logger } = silentLogger();
-		const notify = { status: vi.fn(), canceled: vi.fn() };
+		const notify = { status: vi.fn(), progress: vi.fn(), canceled: vi.fn() };
 
 		await processScheduleTick(
 			{ store, transport, registry: registryOf(echoTask), logger, notify },
@@ -864,7 +865,7 @@ describe("processScheduleTick", () => {
 			getJobScheduler: async () => ({ id: "daily", pattern: schedule.cron, timezone: undefined }),
 		});
 		const { logger } = silentLogger();
-		const notify = { status: vi.fn(), canceled: vi.fn() };
+		const notify = { status: vi.fn(), progress: vi.fn(), canceled: vi.fn() };
 
 		await processScheduleTick(
 			{ store, transport, registry: registryOf(echoTask), logger, notify },

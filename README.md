@@ -296,7 +296,7 @@ A task/step function that returns `void` (or `undefined`) has that output stored
 | Error | When |
 |---|---|
 | `ConfigError` | Invalid engine/task configuration (durations, identifiers, queue conflicts, retry/backoff options, bad env). |
-| `SerializationError` | A payload/output/log value failed the JSON-serializability check or exceeded its size limit. |
+| `SerializationError` | A payload/output/log/progress value failed the JSON-serializability check or exceeded its size limit. |
 | `AbortTaskRunError` | Thrown by user code to fail the run permanently, with no retry. |
 | `NonDeterminismError` | The step sequence observed on replay diverged from what was recorded (wrong name or kind at a given position). |
 | `DuplicateStepError` | The same step name was used twice within one execution. |
@@ -369,9 +369,11 @@ await engine.runs.steps(runId);
 // cursor (`nextCursor` of the previous page), limit (default 20, max 100). Newest first.
 await engine.runs.list({ status: ["failed", "canceled"], createdFrom: yesterday, limit: 50 });
 
-// Status updates of one run, across processes (Postgres + Redis pub/sub).
+// Status updates of one run, across processes (Postgres + Redis pub/sub). `progress` is the last
+// known value written by ctx.progress.set (below); it is emitted again on its own, even when the
+// status doesn't change.
 for await (const update of engine.runs.subscribe(runId, { signal })) {
-	console.log(update.status, update.updatedAt); // ends after completed/failed/canceled
+	console.log(update.status, update.progress, update.updatedAt); // ends after completed/failed/canceled
 }
 
 // Local events of THIS process; returns an unsubscribe function.
@@ -401,6 +403,37 @@ for await (const token of engine.runs.readStream<string>(runId, "answer")) proce
   attempt's `ctx.stream` with the same name appends to the same stream key, after that marker:
   a reader starting from the beginning never sees the retry's chunks. Use a per-attempt name
   (e.g. `` `answer-${ctx.run.attempt}` ``) when a stream must survive retries.
+
+#### Progress
+
+```ts
+run: async (payload, ctx) => {
+	for (let i = 0; i < items.length; i++) {
+		await process(items[i]);
+		await ctx.progress.set({ processed: i + 1, total: items.length });
+	}
+},
+```
+
+```ts
+(await engine.runs.get(runId))?.progress; // { processed: 340, total: 800 } | null
+```
+
+`ctx.progress.set(value)` overwrites a single value per run (`runs.progress`; `null` until the
+first call) — not a log, not a step: it isn't memoized and doesn't participate in non-determinism
+detection, so calling it a different number of times across replays is fine. `value` is validated
+like a payload (`Serializable`, `limits.maxProgressBytes`, default 16 KB) and rejects with
+`SerializationError` if it's too large — a normal error the task can catch, unlike an invalid
+`ctx.step.*` argument. Writes are coalesced (at most one every 250 ms; only the latest value
+survives a burst) and the last value set is flushed before the run's next completion, failure or
+suspension is written, unless this execution has already lost ownership of the run (canceled, hand
+back on shutdown, ...) — that's the same "drop with a warning" fallback `ctx.logger` uses when it
+loses the run. A write that fails is retried once; if the retry also fails, only that value is
+dropped (with a warning) — a transient store hiccup doesn't disable progress for the rest of the
+execution. It survives retries and resumes (the engine never resets it on its own).
+`engine.runs.get`/`runs.list` read the latest value back; `runs.subscribe` emits `update.progress`
+on each persisted change (best-effort over pub/sub, with a periodic re-read as a safety net; a
+progress-only change is emitted on its own, not just as a side effect of a status transition).
 
 ### Schedules (cron)
 
@@ -497,6 +530,7 @@ type TaskContext = {
 	signal: AbortSignal;               // cancellation, maxDurationMs, lost ownership, shutdown, or the attempt ending
 	run: { id: string; taskId: string; attempt: number; createdAt: Date };
 	stream(name: string, source: AsyncIterable<Json | string>): Promise<void>;
+	progress: { set(value: Json): Promise<void> };   // see "Progress" above
 };
 ```
 
@@ -560,6 +594,7 @@ interface StepApi {
 | `limits.maxPayloadBytes` | `1 MB` | Trigger payloads, token outputs, task outputs. |
 | `limits.maxStepOutputBytes` | `256 KB` | `step.run` outputs. |
 | `limits.maxLogEntryBytes` | `16 KB` | One `ctx.logger` entry's `data`. |
+| `limits.maxProgressBytes` | `16 KB` | `ctx.progress.set` value (`runs.progress`). |
 | `logging.minLevel` | `"info"` | `ctx.logger` entries below this level are neither stored nor mirrored. |
 | `logging.mirror` | `true` | Also send `ctx.logger` entries to `logger` (with `runId`, `taskId`, `attempt`). |
 | `limits.maxInlineStepOutputBytes` | `16 MB` | Threshold above which a run's step outputs are loaded lazily in batches instead of in the single startup query. |
