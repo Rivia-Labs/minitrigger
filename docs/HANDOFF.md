@@ -30,8 +30,8 @@ Atualizado em 2026-09-24, HEAD `615ccac`. Leia junto com `CLAUDE.md` (decisões 
 
 ## O que falta
 
-### 1. Pendência de desempenho (pequena, fazer primeiro)
-- `src/executor/notify.ts` (RunNotifier) ainda faz um `runs.get` extra por transição para obter `updatedAt`. Os resultados do store já trazem `status`/`updatedAt` (commit `615ccac`; mapa dos campos em `docs/store-contract.md`). Trocar para usar esses campos. Eventos ainda precisam de `taskId`/`attempt` — obter do contexto da execução, não do banco.
+### 1. Pendência de desempenho — ✅ resolvida
+O `RunNotifier` recebe `RunStatusInfo` dos resultados da store; teste `test/integration/notify-perf.test.ts`.
 
 ### 2. Fase 8 — agendamentos na engine (sonnet + revisão opus)
 Pronto: migration 002 e `ScheduleStore` (upsert/delete/get/list/listDeclarative/deleteDeclarativeExcept).

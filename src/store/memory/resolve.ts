@@ -201,6 +201,7 @@ export function cancelDescendants(
 	reason: string
 ): CanceledRun[] {
 	const canceled: CanceledRun[] = [];
+	const error = canceledError(reason);
 	const visited = new Set<string>();
 	let level: RunRow[];
 	if ("waitpointId" in start) {
@@ -223,9 +224,12 @@ export function cancelDescendants(
 		for (const r of toCancel) {
 			canceled.push({
 				runId: r.id,
+				taskId: r.taskId,
 				queue: r.queue,
 				enqueueSeq: r.enqueueSeq,
 				previousStatus: r.status as CanceledRun["previousStatus"],
+				attempt: r.attempt,
+				error,
 				updatedAt: toDate(tx.now),
 			});
 		}

@@ -212,9 +212,14 @@ export interface WaitpointResolution {
 /** A run moved to `canceled`; caller removes job `${runId}-${enqueueSeq}` and publishes an abort. */
 export interface CanceledRun {
 	runId: string;
+	taskId: string;
 	queue: string;
 	enqueueSeq: number;
 	previousStatus: "queued" | "running" | "waiting";
+	/** Unchanged by cancel; carried so notifiers don't need a `runs.get` (Phase 7 perf). */
+	attempt: number;
+	/** Always `{ name: "Canceled", message: reason, retryable: false }` for this cancel call. */
+	error: SerializedError;
 	/** The run row's `updated_at` after this cancel (status is always `canceled`; no `runs.get` needed). */
 	updatedAt: Date;
 }
@@ -335,6 +340,9 @@ export type RecoverStalledResult =
 	| { kind: "requeued"; attempt: number; enqueue: EnqueueRequest }
 	| {
 			kind: "failed";
+			taskId: string;
+			/** Unchanged (attempts were exhausted); carried so notifiers don't need a `runs.get`. */
+			attempt: number;
 			updatedAt: Date;
 			parent: WaitpointResolution | null;
 			expireJobsToRemove: string[];

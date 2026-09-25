@@ -21,6 +21,7 @@ import { claimKey } from "./idempotency.js";
 import {
 	applyResumeRule,
 	cancelDescendants,
+	canceledError,
 	type Exec,
 	enqueueOf,
 	hasBlockingWaitpoint,
@@ -389,9 +390,12 @@ export function createRunStore(exec: Exec): RunStore {
 				const canceled: CanceledRun[] = [
 					{
 						runId: id,
+						taskId: root.taskId,
 						queue: root.queue,
 						enqueueSeq: root.enqueueSeq,
 						previousStatus: root.status as CanceledRun["previousStatus"],
+						attempt: root.attempt,
+						error: canceledError(reason),
 						updatedAt: toDate(tx.now),
 					},
 				];
@@ -561,6 +565,8 @@ export function createRunStore(exec: Exec): RunStore {
 				const wp = row.parentWaitpointId;
 				return {
 					kind: "failed",
+					taskId: row.taskId,
+					attempt: row.attempt,
 					updatedAt: toDate(tx.now),
 					parent: wp ? resolveChildWaitpoint(tx, wp) : null,
 					expireJobsToRemove,

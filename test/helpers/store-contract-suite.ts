@@ -306,9 +306,12 @@ export function defineStoreContractSuite(get: () => StoreHarness): void {
 				canceled: [
 					{
 						runId: owner.runId,
+						taskId: "task-a",
 						queue: "default",
 						previousStatus: "running",
 						enqueueSeq: 1,
+						attempt: 1,
+						error: { name: "Canceled", message: "user asked", retryable: false },
 						updatedAt: run?.updatedAt,
 					},
 				],
@@ -687,6 +690,8 @@ export function defineStoreContractSuite(get: () => StoreHarness): void {
 			const exhaustedRun = await s().runs.get(exhausted.owner.runId);
 			expect(r2).toEqual({
 				kind: "failed",
+				taskId: "task-a",
+				attempt: 1,
 				updatedAt: exhaustedRun?.updatedAt,
 				parent: null,
 				expireJobsToRemove: [],

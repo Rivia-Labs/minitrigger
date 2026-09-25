@@ -8,6 +8,7 @@ import { runJobId, systemQueueName, waitpointExpireJobId } from "../../src/queue
 import { createTransport, type Transport } from "../../src/queue/transport.js";
 import { createReconciler } from "../../src/reconciler.js";
 import { createSqlStore } from "../../src/store/sql/index.js";
+import type { CanceledRun } from "../../src/store/types.js";
 import { deleteKeysByPrefix, useTestNamespace } from "../helpers/namespace.js";
 import { useRunFixtures } from "../helpers/run-fixtures.js";
 
@@ -370,7 +371,7 @@ describe("createReconciler: case 5 (expired waitpoints)", () => {
 			[waitpointId]
 		);
 
-		const canceled: string[][] = [];
+		const canceled: CanceledRun[][] = [];
 		const { logger } = makeLogger();
 		const report = await createReconciler({
 			store: store(),
@@ -379,16 +380,30 @@ describe("createReconciler: case 5 (expired waitpoints)", () => {
 			graceMs: 1_000,
 			stallTimeoutMs: 60_000,
 			batchSize: 50,
-			onCanceled: runIds => {
-				canceled.push([...runIds]);
+			onCanceled: items => {
+				canceled.push([...items]);
 			},
 		}).runOnce();
 
 		expect(report.expiredWaitpoints).toBe(1);
 		expect(report.errors).toBe(0);
-		expect((await store().runs.get(childId))?.status).toBe("canceled");
+		const childRun = await store().runs.get(childId);
+		expect(childRun?.status).toBe("canceled");
 		expect(await rawQueue(QUEUE).getJob(runJobId(childId, childJob.seq))).toBeUndefined();
-		expect(canceled).toEqual([[childId]]);
+		expect(canceled).toEqual([
+			[
+				{
+					runId: childId,
+					taskId: "child-task",
+					queue: QUEUE,
+					enqueueSeq: childJob.seq,
+					previousStatus: "queued",
+					attempt: 1,
+					error: { name: "Canceled", message: "Parent waitpoint timed out", retryable: false },
+					updatedAt: childRun?.updatedAt,
+				},
+			],
+		]);
 	});
 
 	it("leaves a not-yet-due waitpoint alone", async () => {

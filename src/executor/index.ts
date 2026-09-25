@@ -13,6 +13,7 @@ export { type AbortKind, ActiveExecutions, ExecutionState } from "./execution.js
 export {
 	noopNotifier,
 	type RunNotifier,
+	type RunStatusInfo,
 	type RunTransition,
 	transitionOfStatus,
 } from "./notify.js";

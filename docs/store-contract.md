@@ -33,12 +33,23 @@ the SQL shape it must use. `$schema` is always `escapeIdentifier(schema)`.
   `EnqueueRequest` (used by `create`'s `enqueue`, `triggerChildren`'s per-child `enqueue`, `retry`,
   `release`, `suspend`'s `sleeping`/`requeued`, `recoverStalled`'s `requeued`,
   `listStaleQueued`/`listStaleWaiting`/`repairOrphanWaiting`, and `WaitpointResolution.resume`) now
-  has `status`/`updatedAt`; `CanceledRun` (one per canceled run in `CancelRunResult`) has
-  `updatedAt` (status is always `canceled`); `CompleteRunResult`/`FailRunResult`/
-  `RecoverStalledResult`'s `failed` variant have a top-level `updatedAt` (`kind` is already the new
-  status: `completed`/`failed`); `SuspendResult`'s `waiting_on_waitpoints` variant has both `status:
-  "waiting"` and `updatedAt` (its `kind` string is not a `RunStatus`, unlike `sleeping`/`requeued`
-  whose status lives on `enqueue`).
+  has `status`/`updatedAt`; `CanceledRun` (one per canceled run in `CancelRunResult`, and per
+  canceled child in `ExpireWaitpointResult`'s `canceledChildren`) also has `taskId`/`attempt`
+  (unchanged by cancel) and `error` (always `{ name: "Canceled", message: reason, retryable:
+  false }` for that cancel call, computed once and reused for every row it cancels) alongside
+  `updatedAt` (status is always `canceled`); `CompleteRunResult`/`FailRunResult` have a top-level
+  `updatedAt` (`kind` is already the new status: `completed`/`failed`); `RecoverStalledResult`'s
+  `failed` variant has `updatedAt` plus `taskId`/`attempt` (attempts were exhausted, so `attempt` is
+  unchanged -- read once under the same lock as `max_attempts`); `SuspendResult`'s
+  `waiting_on_waitpoints` variant has both `status: "waiting"` and `updatedAt` (its `kind` string is
+  not a `RunStatus`, unlike `sleeping`/`requeued` whose status lives on `enqueue`). None of this
+  needs a store change for `taskId`/`attempt` beyond what the same locked row already carries
+  (`task_id`/`attempt` added to the `SELECT`/`RETURNING` lists that lacked them); `error` is built
+  from the `reason`/error argument the caller already passed in, not re-read from the row.
+  `RunNotifier.status` (`src/executor/notify.ts`) takes exactly this: a `RunStatusInfo` (`runId`,
+  `taskId`, `status`, `attempt`, `error`, `updatedAt`) built from the store result plus whatever the
+  caller's own `ExecutionState`/`RunRecord` already holds (unchanged fields), never from a fresh
+  `runs.get`.
 - **Ownership guard** (dec. 5): `EXISTS (SELECT 1 FROM runs WHERE id=$1 AND execution_id=$2 AND
   status='running' FOR SHARE)` for writes to other tables; for writes to the run row itself, the
   same predicate in the `UPDATE ... WHERE`. rowCount 0 → return `{ kind: "lost" }` / `"lost"`.

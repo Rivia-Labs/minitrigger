@@ -239,9 +239,11 @@ export async function resolveChildWaitpoint(
 
 interface LockedChildRow {
 	id: string;
+	task_id: string;
 	status: RunStatus;
 	queue: string;
 	enqueue_seq: number;
+	attempt: number;
 }
 
 /**
@@ -280,12 +282,13 @@ export async function cancelDescendants(
 	reason: string
 ): Promise<CanceledRun[]> {
 	const canceled: CanceledRun[] = [];
+	const error = canceledError(reason);
 	const visited = new Set<string>();
 	let level: LockedChildRow[];
 	if ("waitpointId" in start) {
 		level = (
 			await db.query<LockedChildRow>(
-				`SELECT id, status, queue, enqueue_seq FROM ${ctx.t("runs")}
+				`SELECT id, task_id, status, queue, enqueue_seq, attempt FROM ${ctx.t("runs")}
 				 WHERE parent_waitpoint_id = $1 ORDER BY id FOR UPDATE`,
 				[start.waitpointId]
 			)
@@ -309,9 +312,12 @@ export async function cancelDescendants(
 			if (!at) throw new Error(`cancelDescendants: run ${row.id} was not updated`);
 			canceled.push({
 				runId: row.id,
+				taskId: row.task_id,
 				queue: row.queue,
 				enqueueSeq: row.enqueue_seq,
 				previousStatus: row.status as CanceledRun["previousStatus"],
+				attempt: row.attempt,
+				error,
 				updatedAt: at,
 			});
 		}
@@ -357,7 +363,7 @@ async function lockChildLevel(
 ): Promise<LockedChildRow[]> {
 	if (parentIds.length === 0) return [];
 	const { rows } = await db.query<LockedChildRow>(
-		`SELECT id, status, queue, enqueue_seq FROM ${ctx.t("runs")}
+		`SELECT id, task_id, status, queue, enqueue_seq, attempt FROM ${ctx.t("runs")}
 		 WHERE parent_run_id = ANY($1::uuid[]) ORDER BY id FOR UPDATE`,
 		[parentIds]
 	);

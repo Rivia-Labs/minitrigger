@@ -559,6 +559,8 @@ describe("RunStore: reconciler queries", () => {
 		const exhaustedRun = await f.runs.get(exhausted.owner.runId);
 		expect(r2).toEqual({
 			kind: "failed",
+			taskId: "task-a",
+			attempt: 1,
 			updatedAt: exhaustedRun?.updatedAt,
 			parent: null,
 			expireJobsToRemove: [],

@@ -17,8 +17,29 @@
 import type { EngineLogger } from "./config.js";
 import { waitpointExpireJobId } from "./queue/ids.js";
 import type { EnqueueRunInput, Transport } from "./queue/transport.js";
-import type { EnqueueRequest, Store, WaitpointResolution } from "./store/types.js";
+import type {
+	CanceledRun,
+	EnqueueRequest,
+	RunStatus,
+	SerializedError,
+	Store,
+	WaitpointResolution,
+} from "./store/types.js";
 import { formatError } from "./utils/error-format.js";
+
+/**
+ * What case 4 (stall recovery) hands `onStatusChange`: everything the caller needs to notify
+ * without a `runs.get` (Phase 7 perf). `status` is `"queued"` (requeued, attempt incremented) or
+ * `"failed"` (attempts exhausted); the engine derives the transition (`retrying`/`failed`) from it.
+ */
+export interface StalledStatusChange {
+	runId: string;
+	taskId: string;
+	attempt: number;
+	status: Extract<RunStatus, "queued" | "failed">;
+	error: SerializedError;
+	updatedAt: Date;
+}
 
 export interface ReconcilerOptions {
 	store: Store;
@@ -33,16 +54,16 @@ export interface ReconcilerOptions {
 	/** Phase 8 hook: bidirectional reconciliation of schedules. Called last, isolated like the rest. */
 	reconcileSchedules?: () => Promise<void>;
 	/**
-	 * Called with the ids of the runs canceled by an expiry (case 5), after their pending run jobs
-	 * were removed. The engine aborts local executions and publishes the cancel (Phase 6). A throw
-	 * is logged and counted in `errors`; the parent's resume still happens.
+	 * Called with the runs canceled by an expiry (case 5), after their pending run jobs were
+	 * removed. The engine aborts local executions and publishes the cancel (Phase 6). A throw is
+	 * logged and counted in `errors`; the parent's resume still happens.
 	 */
-	onCanceled?: (runIds: readonly string[]) => void | Promise<void>;
+	onCanceled?: (canceled: readonly CanceledRun[]) => void | Promise<void>;
 	/**
 	 * Called (synchronously, never awaited) after the reconciler changed a run's status (case 4:
 	 * stalled run requeued or failed). Must not throw; the engine publishes the status (best-effort).
 	 */
-	onStatusChange?: (runId: string) => void;
+	onStatusChange?: (info: StalledStatusChange) => void;
 }
 
 export interface StalledReport {
@@ -174,12 +195,27 @@ export function createReconciler(options: ReconcilerOptions): Reconciler {
 		await forEachItem(ids, "stalled", report, async runId => {
 			const result = await store.runs.recoverStalled(runId, stallTimeoutMs, error);
 			if (result.kind === "not_stalled") return; // Recovered/changed concurrently; not an error.
-			onStatusChange?.(runId);
 			if (result.kind === "requeued") {
+				onStatusChange?.({
+					runId,
+					taskId: result.enqueue.taskId,
+					attempt: result.attempt,
+					status: "queued",
+					error,
+					updatedAt: result.enqueue.updatedAt,
+				});
 				await transport.enqueueRun(toEnqueueInput(result.enqueue));
 				report.stalled.requeued++;
 				return;
 			}
+			onStatusChange?.({
+				runId,
+				taskId: result.taskId,
+				attempt: result.attempt,
+				status: "failed",
+				error,
+				updatedAt: result.updatedAt,
+			});
 			report.stalled.failed++;
 			await applyResolution(result.parent);
 			for (const id of result.expireJobsToRemove) {
@@ -209,7 +245,7 @@ export function createReconciler(options: ReconcilerOptions): Reconciler {
 			}
 			if (result.canceledChildren.length > 0 && onCanceled) {
 				try {
-					await onCanceled(result.canceledChildren.map(c => c.runId));
+					await onCanceled(result.canceledChildren);
 				} catch (err) {
 					// Isolated: the parent's resume below must still happen.
 					report.errors++;

@@ -27,6 +27,7 @@ import {
 	enqueue,
 	executeRun,
 	type RunNotifier,
+	type RunStatusInfo,
 	type RunTransition,
 	taskQueueName,
 	transitionOfStatus,
@@ -363,21 +364,21 @@ export function createEngine(config: EngineConfig): Engine {
 	}
 	// --- Local events (Phase 7): emitted where this process made the transition. ---
 	const eventHandlers = new Map<RunEventName, Set<RunEventHandler>>();
-	function emitEvent(transition: RunTransition, row: RunRecord): void {
+	function emitEvent(transition: RunTransition, info: RunStatusInfo): void {
 		const name: RunEventName = `run:${transition}`;
 		const handlers = eventHandlers.get(name);
 		if (!handlers || handlers.size === 0) return;
 		const event: RunEvent = {
 			name,
-			runId: row.id,
-			taskId: row.taskId,
+			runId: info.runId,
+			taskId: info.taskId,
 			status: statusOfTransition(transition),
-			attempt: row.attempt,
-			error: row.error,
-			updatedAt: row.updatedAt,
+			attempt: info.attempt,
+			error: info.error,
+			updatedAt: info.updatedAt,
 		};
 		const onError = (error: unknown) =>
-			logger.error({ err: error, event: name, runId: row.id }, "engine.events handler failed");
+			logger.error({ err: error, event: name, runId: info.runId }, "engine.events handler failed");
 		for (const handler of Array.from(handlers)) {
 			try {
 				const result = handler(event);
@@ -411,36 +412,25 @@ export function createEngine(config: EngineConfig): Engine {
 
 	/**
 	 * Publishes the status for `runs.subscribe` (other processes included) and emits the local
-	 * event. `updatedAt` comes from the row (decision 17); without `known` it costs a
-	 * `runs.get` per transition (open item: have the store return `updatedAt`).
+	 * event, entirely from `info` (Phase 7 perf: no `runs.get` per transition; `updatedAt` comes
+	 * from the store result, decision 17).
 	 */
-	function notifyStatus(
-		runId: string,
-		known: RunRecord | undefined,
-		transition: RunTransition | ((row: RunRecord) => RunTransition) | undefined
-	): void {
+	function notifyStatus(info: RunStatusInfo): void {
 		trackNotification(
 			(async () => {
-				const row = known ?? (await store.runs.get(runId));
-				if (!row) return;
-				emitEvent(
-					typeof transition === "function"
-						? transition(row)
-						: (transition ?? transitionOfStatus(row.status)),
-					row
-				);
+				emitEvent(info.transition ?? transitionOfStatus(info.status), info);
 				await publisher.publishStatus({
-					runId,
-					status: row.status,
-					updatedAt: row.updatedAt.toISOString(),
+					runId: info.runId,
+					status: info.status,
+					updatedAt: info.updatedAt.toISOString(),
 				});
 			})(),
 			"run status"
 		);
 	}
 	const notifier: RunNotifier = {
-		status(runId, known, transition) {
-			notifyStatus(runId, known, transition);
+		status(info) {
+			notifyStatus(info);
 		},
 		canceled(runIds) {
 			if (runIds.length === 0) return;
@@ -498,16 +488,33 @@ export function createEngine(config: EngineConfig): Engine {
 		graceMs: resolved.reconciler.graceMs,
 		stallTimeoutMs: resolved.stallTimeoutMs,
 		batchSize: resolved.reconciler.batchSize,
-		onCanceled: runIds => {
+		onCanceled: canceled => {
+			const runIds = canceled.map(c => c.runId);
 			abortLocal(runIds);
-			for (const runId of runIds) notifier.status(runId, undefined, "canceled");
+			for (const c of canceled) {
+				notifyStatus({
+					runId: c.runId,
+					taskId: c.taskId,
+					status: "canceled",
+					attempt: c.attempt,
+					error: c.error,
+					updatedAt: c.updatedAt,
+					transition: "canceled",
+				});
+			}
 			notifier.canceled(runIds);
 		},
 		// Stall recovery: back to `queued` means a retry (attempt + 1), otherwise it failed.
-		onStatusChange: runId =>
-			notifyStatus(runId, undefined, row =>
-				row.status === "queued" ? "retrying" : transitionOfStatus(row.status)
-			),
+		onStatusChange: info =>
+			notifyStatus({
+				runId: info.runId,
+				taskId: info.taskId,
+				status: info.status,
+				attempt: info.attempt,
+				error: info.error,
+				updatedAt: info.updatedAt,
+				transition: info.status === "queued" ? "retrying" : "failed",
+			}),
 	});
 	const retention = createRetention({
 		store,
@@ -557,7 +564,14 @@ export function createEngine(config: EngineConfig): Engine {
 		});
 		// Decision 9: only a newly created run is enqueued; an existing one is returned as-is.
 		if (result.kind === "created") {
-			notifier.status(result.run.id, result.run);
+			notifier.status({
+				runId: result.run.id,
+				taskId: result.run.taskId,
+				status: result.run.status,
+				attempt: result.run.attempt,
+				error: result.run.error,
+				updatedAt: result.run.updatedAt,
+			});
 			await enqueue(deps, result.enqueue);
 		}
 		return { id: result.run.id, taskId: result.run.taskId };
@@ -780,7 +794,15 @@ export function createEngine(config: EngineConfig): Engine {
 				try {
 					const result = await store.runs.release(execution.owner);
 					if (result.kind === "released") {
-						notifier.status(execution.runId, undefined, "queued");
+						notifier.status({
+							runId: execution.runId,
+							taskId: execution.run.taskId,
+							status: result.enqueue.status,
+							attempt: execution.run.attempt,
+							error: execution.run.error,
+							updatedAt: result.enqueue.updatedAt,
+							transition: "queued",
+						});
 						await enqueue(deps, result.enqueue);
 						logger.info(
 							{ runId: execution.runId, taskId: execution.taskId },

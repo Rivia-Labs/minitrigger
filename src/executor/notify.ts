@@ -1,4 +1,4 @@
-import type { RunRecord, RunStatus } from "../store/types.js";
+import type { RunStatus, SerializedError } from "../store/types.js";
 
 /**
  * Which transition this process just made (Phase 7 local events, `engine.events.on`):
@@ -16,6 +16,25 @@ export type RunTransition =
 	| "retrying";
 
 /**
+ * Everything {@link RunNotifier.status} needs, taken from the store result (or the caller's own
+ * `ExecutionState`/`RunRecord`) the caller already holds: no `runs.get` (Phase 7 perf). `updatedAt`
+ * always comes from the database clock (decision 17), never `new Date()`.
+ */
+export interface RunStatusInfo {
+	runId: string;
+	taskId: string;
+	status: RunStatus;
+	/** Current attempt (unchanged by most transitions; incremented by retry/stall recovery). */
+	attempt: number;
+	/** Last attempt's error (kept while retrying), the final error, or the cancel reason. */
+	error: SerializedError | null;
+	/** The run row's `updated_at` at the moment this was computed (same DB write, no `runs.get`). */
+	updatedAt: Date;
+	/** Names the transition this process made; when omitted it is derived from `status`. */
+	transition?: RunTransition;
+}
+
+/**
  * Cross-process notifications of what an executor/engine did to a run (Phase 6/7). Every method is
  * best-effort: it never throws and is never awaited on the run's critical path, so a Redis or
  * Postgres hiccup here can never fail, delay or retry a run.
@@ -23,13 +42,10 @@ export type RunTransition =
 export interface RunNotifier {
 	/**
 	 * Publishes the run's status change (`publishStatus`, consumed by `runs.subscribe`) and emits
-	 * the local `engine.events` event. `known` is the row just written (status + `updated_at`
-	 * straight from the DB); without it the current row is read back, so the published `updatedAt`
-	 * always comes from the database clock (decision 17). A duplicate publish is harmless:
-	 * subscribers order by `updatedAt`. `transition` names the transition this process made; when
-	 * omitted it is derived from the row's status.
+	 * the local `engine.events` event, entirely from `info` (Phase 7 perf: no `runs.get`). A
+	 * duplicate publish is harmless: subscribers order by `updatedAt`.
 	 */
-	status(runId: string, known?: RunRecord, transition?: RunTransition): void;
+	status(info: RunStatusInfo): void;
 	/** Aborts the executions of these (already canceled) runs in every process (pub/sub). */
 	canceled(runIds: readonly string[]): void;
 }

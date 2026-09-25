@@ -23,6 +23,7 @@ import {
 	applyResumeRule,
 	blockingWaitpointExistsSql,
 	cancelDescendants,
+	canceledError,
 	DELAY_MS_SQL,
 	ENQUEUE_RETURNING,
 	type EnqueueRow,
@@ -419,12 +420,14 @@ export function createRunStore(exec: SqlExecutor, ctx: SqlContext): RunStore {
 				const parent = await lockParentOf(db, ctx, runId);
 				if (!parent) return { kind: "not_found" };
 				const { rows } = await db.query<{
+					task_id: string;
 					status: RunStatus;
 					queue: string;
 					enqueue_seq: number;
+					attempt: number;
 					parent_waitpoint_id: string | null;
 				}>(
-					`SELECT status, queue, enqueue_seq, parent_waitpoint_id FROM ${runs}
+					`SELECT task_id, status, queue, enqueue_seq, attempt, parent_waitpoint_id FROM ${runs}
 					 WHERE id = $1 FOR UPDATE`,
 					[runId]
 				);
@@ -439,9 +442,12 @@ export function createRunStore(exec: SqlExecutor, ctx: SqlContext): RunStore {
 				const canceled: CanceledRun[] = [
 					{
 						runId,
+						taskId: root.task_id,
 						queue: root.queue,
 						enqueueSeq: root.enqueue_seq,
 						previousStatus: root.status as CanceledRun["previousStatus"],
+						attempt: root.attempt,
+						error: canceledError(reason),
 						updatedAt: rootAt,
 					},
 				];
@@ -581,11 +587,12 @@ export function createRunStore(exec: SqlExecutor, ctx: SqlContext): RunStore {
 				const parent = await lockParentOf(db, ctx, runId);
 				if (!parent) return { kind: "not_stalled" };
 				const { rows } = await db.query<{
+					task_id: string;
 					attempt: number;
 					max_attempts: number;
 					parent_waitpoint_id: string | null;
 				}>(
-					`SELECT attempt, max_attempts, parent_waitpoint_id FROM ${runs}
+					`SELECT task_id, attempt, max_attempts, parent_waitpoint_id FROM ${runs}
 					 WHERE id = $1 AND status = 'running'
 					   AND heartbeat_at < now() - $2::float8 * interval '1 millisecond'
 					 FOR UPDATE`,
@@ -621,6 +628,8 @@ export function createRunStore(exec: SqlExecutor, ctx: SqlContext): RunStore {
 				const wp = run.parent_waitpoint_id;
 				return {
 					kind: "failed",
+					taskId: run.task_id,
+					attempt: run.attempt,
 					updatedAt,
 					parent: wp ? await resolveChildWaitpoint(db, ctx, wp) : null,
 					expireJobsToRemove,

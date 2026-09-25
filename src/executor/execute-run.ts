@@ -109,7 +109,15 @@ export async function executeRun(deps: ExecutorDeps, job: RunJob): Promise<void>
 
 	const state = new ExecutionState(run, executionId);
 	deps.active.add(state);
-	deps.notify?.status(run.id, run, "started");
+	deps.notify?.status({
+		runId: run.id,
+		taskId: run.taskId,
+		status: run.status,
+		attempt: run.attempt,
+		error: run.error,
+		updatedAt: run.updatedAt,
+		transition: "started",
+	});
 	try {
 		await runAcquired(deps, state);
 	} catch (error) {
@@ -132,7 +140,15 @@ async function handBackLateAcquire(
 	try {
 		const result = await deps.store.runs.release({ runId: run.id, executionId });
 		if (result.kind === "released") {
-			deps.notify?.status(run.id, undefined, "queued");
+			deps.notify?.status({
+				runId: run.id,
+				taskId: run.taskId,
+				status: result.enqueue.status,
+				attempt: run.attempt,
+				error: run.error,
+				updatedAt: result.enqueue.updatedAt,
+				transition: "queued",
+			});
 			await enqueue(deps, result.enqueue);
 			deps.config.logger.info(fields, "run acquired during shutdown handed back to the queue");
 		}
@@ -224,9 +240,19 @@ async function execute(
 				waitpoints: deps.store.waitpoints,
 				maxPayloadBytes: limits.maxPayloadBytes,
 				resolveTask: child => childTaskSpec(getTask(deps.registry, child)),
-				// Only used for the children `triggerChildren` just created (all `queued`).
+				// Only used for the children `triggerChildren` just created: fresh runs, always
+				// `attempt: 1` with no error yet (`triggerChildren`'s SQL/memory insert), so no
+				// `runs.get` is needed to notify them.
 				enqueueRun: request => {
-					deps.notify?.status(request.runId, undefined, "queued");
+					deps.notify?.status({
+						runId: request.runId,
+						taskId: request.taskId,
+						status: request.status,
+						attempt: 1,
+						error: null,
+						updatedAt: request.updatedAt,
+						transition: "queued",
+					});
 					return enqueue(deps, request);
 				},
 				scheduleExpire: (waitpointId, delayMs) => scheduleExpire(deps, waitpointId, delayMs),
@@ -416,7 +442,15 @@ async function settle(
 			}
 			const result = await deps.store.runs.complete(state.owner, output);
 			if (result.kind === "lost") return onLost(deps, state);
-			deps.notify?.status(state.runId, undefined, "completed");
+			deps.notify?.status({
+				runId: state.runId,
+				taskId: state.taskId,
+				status: "completed",
+				attempt: state.run.attempt,
+				error: null,
+				updatedAt: result.updatedAt,
+				transition: "completed",
+			});
 			return afterResolution(deps, result.parent, result.expireJobsToRemove);
 		}
 	}
@@ -430,7 +464,19 @@ async function suspendRun(deps: ExecutorDeps, state: ExecutionState): Promise<vo
 	const fields = { runId: state.runId, taskId: state.taskId, attempt: state.run.attempt };
 	const result = await deps.store.runs.suspend(state.owner);
 	if (result.kind !== "lost") {
-		deps.notify?.status(state.runId, undefined, result.kind === "requeued" ? "queued" : "waiting");
+		// `suspend` never touches `error`; unchanged since acquisition.
+		const status = result.kind === "waiting_on_waitpoints" ? "waiting" : result.enqueue.status;
+		const updatedAt =
+			result.kind === "waiting_on_waitpoints" ? result.updatedAt : result.enqueue.updatedAt;
+		deps.notify?.status({
+			runId: state.runId,
+			taskId: state.taskId,
+			status,
+			attempt: state.run.attempt,
+			error: state.run.error,
+			updatedAt,
+			transition: result.kind === "requeued" ? "queued" : "waiting",
+		});
 	}
 	switch (result.kind) {
 		case "lost":
@@ -475,7 +521,15 @@ async function failAttempt(
 	if (!retryable || run.attempt >= run.maxAttempts) {
 		const result = await deps.store.runs.fail(state.owner, serialized);
 		if (result.kind === "lost") return onLost(deps, state);
-		deps.notify?.status(run.id, undefined, "failed");
+		deps.notify?.status({
+			runId: run.id,
+			taskId: run.taskId,
+			status: "failed",
+			attempt: run.attempt,
+			error: serialized,
+			updatedAt: result.updatedAt,
+			transition: "failed",
+		});
 		log.warn({ ...fields, error: serialized }, "run failed");
 		return afterResolution(deps, result.parent, result.expireJobsToRemove);
 	}
@@ -484,7 +538,15 @@ async function failAttempt(
 	const backoffMs = backoff ? computeBackoffMs(backoff, run.attempt) : 0;
 	const result = await deps.store.runs.retry(state.owner, serialized, backoffMs);
 	if (result.kind === "lost") return onLost(deps, state);
-	deps.notify?.status(run.id, undefined, "retrying");
+	deps.notify?.status({
+		runId: run.id,
+		taskId: result.enqueue.taskId,
+		status: result.enqueue.status,
+		attempt: result.attempt,
+		error: serialized,
+		updatedAt: result.enqueue.updatedAt,
+		transition: "retrying",
+	});
 	log.info({ ...fields, error: serialized, delayMs: result.enqueue.delayMs }, "run will retry");
 	await enqueue(deps, result.enqueue);
 }

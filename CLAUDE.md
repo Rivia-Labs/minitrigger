@@ -105,7 +105,7 @@ Env de teste: `TEST_DATABASE_URL`, `TEST_REDIS_URL` (padrões apontam para o doc
 - `runs.subscribe(runId, { signal })`: generator; ordem obrigatória (assina o canal e bufferiza → lê o Postgres e emite → só emite mensagens com `updatedAt` maior, ou igual com status diferente, porque o `Date` do JS perde os microssegundos → termina depois de status terminal). Run inexistente termina sem emitir. Rede de segurança: 15 s sem mensagem → relê o Postgres (pub/sub é at-most-once). Subscriber criado sob demanda (`getPubSub()`, conexão `dedicated("subscriber")`), também numa engine só de disparo; `stop()` encerra as assinaturas abertas antes de `pubsub.close()`.
 - `runs.readStream`: um `shared().duplicate({ maxRetriesPerRequest: null })` por leitor (não `connections.dedicated`, que guardaria cada conexão até o `stop()`), desconectado no fim da iteração ou no `stop()`. `ctx.stream` = `streams.pipe` (não é step: não é memoizado, replay transmite de novo).
 - `runs.logs(run, { afterId?, limit? })` → `{ items, nextAfterId }` (padrão 100, máx. 1 000); `runs.steps(run)` → `{ name, seq, kind, status, output, wakeAt, createdAt }` (waits só com `{ waitpointId }`). `runs.list` mantém `createdFrom` (inclusivo)/`createdTo` (exclusivo), nomes da store. Id que não é UUID → vazio.
-- **Em aberto (performance):** o `RunNotifier` faz um `store.runs.get` extra por transição (exceto create/acquire) só para obter `updatedAt` (e `taskId`/`attempt`/`error` dos eventos). Trocar para os valores devolvidos pela store quando os resultados trouxerem `updatedAt` (mudança de store em andamento por outro agente em `src/store/types.ts`; os eventos ainda precisam de `taskId`/`attempt`, que o executor tem no `ExecutionState`).
+- **Performance resolvida:** `RunNotifier.status` (`src/executor/notify.ts`) não faz mais `store.runs.get` por transição. Assinatura nova: `status(info: RunStatusInfo)` com `runId`/`taskId`/`status`/`attempt`/`error`/`updatedAt`/`transition?` — todo call site (`src/engine.ts`, `src/executor/execute-run.ts`, `src/executor/system.ts`) monta esse objeto a partir do resultado da store (que já carregava `status`/`updatedAt`, decisão da fase 7 anterior) mais o que o chamador já tem em mãos (`ExecutionState.run`/`RunRecord` para `taskId`/`attempt`/`error` não alterados pela transição). Isso exigiu adicionar `taskId`/`attempt`/`error` a `CanceledRun` e `taskId`/`attempt` à variante `failed` de `RecoverStalledResult` (`src/store/types.ts`, espelhado em `src/store/sql` e `src/store/memory`; `error` é sempre `canceledError(reason)`, computado uma vez por chamada de cancel, não lido de volta). O reconciler (`src/reconciler.ts`) também parou de expor só `runId`s: `onCanceled` recebe `readonly CanceledRun[]` e `onStatusChange` recebe um `StalledStatusChange` (`runId`/`taskId`/`attempt`/`status`/`error`/`updatedAt`). Teste de regressão: `test/integration/notify-perf.test.ts` (conta `SELECT ${RUN_COLUMNS} FROM runs WHERE id = $1` num pool injetado ao longo de trigger/retry/sleep/cancel/stall-recovery, e confere `taskId`/`attempt`/`updatedAt`/`error` em `engine.events` e `runs.subscribe`).
 
 ## Status das fases
 
@@ -120,4 +120,61 @@ Env de teste: `TEST_DATABASE_URL`, `TEST_REDIS_URL` (padrões apontam para o doc
 | 7 — Logs/eventos/consulta | ✅ concluída — `ctx.logger` em lote no `run_logs` (flush antes da escrita terminal/suspensão), config `logging`, `runs.list/logs/steps`, `engine.events.on`, `runs.subscribe` (ordem obrigatória, engine só de disparo), `ctx.stream`/`runs.readStream`; testes `logs`/`subscribe`/`events`/`stream`/`query` |
 | 8 — Schedules | em andamento (migration 002 + `ScheduleStore` prontos; falta BullMQ/engine) |
 | 9 — Modo de teste/DX | em andamento (9.1 store em memória pronta: `src/store/memory`, suíte de contrato compartilhada; falta `createTestEngine`, checagens de ambiente) |
-| 10 — Exemplo/docs/empacotamento | pendente |
+| 10 — Exemplo/docs/empacotamento | em andamento (`pnpm bench` e `pnpm check:pack` prontos; falta `examples/basic` completo e README final) |
+
+## Benchmark
+
+`pnpm bench` (`bench/run.ts`) roda contra a infra docker (`pnpm infra:up`) num schema/prefix
+Postgres/Redis novo por execução (`mt_bench_<timestamp><random>`), depois derruba o schema
+(`DROP SCHEMA ... CASCADE`) e faz `obliterate` de cada fila BullMQ que criou (as três filas de
+task e `${prefix}-system`) — verificado sem sobra em `pg_namespace`/`redis-cli keys` após a
+execução. Importa de `../dist/index.js` (saída buildada), não de `../src`: rodar `.ts` puro
+funciona com o Node nativo (>=23.6 já tira tipos sem flag), mas todo import interno de `src/`
+usa especificador `.js` (convenção NodeNext do projeto) que aponta para um arquivo `.ts`
+adjacente — Node só faz esse remapeamento para especificadores sem extensão/`.ts`, não para um
+`.js` literal — então `../src/index.js` não resolveria; o `dist/` buildado tem arquivos `.js`
+reais batendo com cada especificador. O script `bench` roda `pnpm build` primeiro.
+
+Três fases medidas, cada uma limpa (não se sobrepõem):
+
+1. **Throughput fim-a-fim**: 1.000 `trigger()` de uma task de 3 steps (`step.run` × 3, fila com
+   `concurrency: 20`), relógio de parede do processo do disparo do primeiro `trigger()` até o
+   último `run:completed` (via `engine.events.on`).
+2. **Latência de retomada por sleep**: 30 runs de uma task com `step.sleep("1s")` + 1 step; tempo
+   entre `runAfter` (o `wake_at`, lido do Postgres logo que a run suspende, evento `run:waiting`)
+   e `updatedAt` do evento `run:completed` (Postgres também) — inclui o disparo do job atrasado do
+   BullMQ, reaquisição da run e o step final trivial.
+3. **Latência de retomada por token**: 30 runs de uma task suspensa em `waitForToken`; tempo entre
+   a chamada `engine.tokens.complete(tokenId)` retornar (relógio do processo) e o evento
+   `run:completed` chegar (mesmo processo, sem rede) — id do token lido de `runs.steps()` (o step
+   `kind: "wait"` carrega `{ waitpointId }`).
+
+### Resultado (2026-09-25)
+
+Máquina: Apple M5 Pro (15 cores), 24 GiB RAM, macOS 27.0 (Darwin 27.0.0, arm64). Node v24.19.0.
+Postgres 16-alpine e Redis 7-alpine via `docker-compose.yml` (`pnpm infra:up`), portas locais
+54329/63799 — não é uma máquina dedicada de benchmark (laptop do dono, outros processos rodando
+em paralelo), então tratar os números abaixo como ordem de grandeza, não um SLA. Quatro execuções
+consecutivas do mesmo `pnpm bench`/`node bench/run.ts`, sem infra reiniciada entre elas:
+
+| Métrica | Execução 1 | Execução 2 | Execução 3 | Execução 4 |
+|---|---|---|---|---|
+| Throughput (1.000 runs, 3 steps) | 1411.7 runs/s | 1436.0 runs/s | 1402.4 runs/s | 1322.3 runs/s |
+| Sleep resume p50 (due → completed) | 101.0 ms | 61.0 ms | 75.0 ms | 49.0 ms |
+| Sleep resume p99 | 103.0 ms | 64.0 ms | 80.0 ms | 54.0 ms |
+| Token resume p50 (complete() → completed) | 3.4 ms | 3.8 ms | 3.5 ms | 5.4 ms |
+| Token resume p99 | 4.9 ms | 5.7 ms | 5.9 ms | 12.0 ms |
+
+Leitura: ~1.3k–1.4k runs/s fim-a-fim para uma task de 3 steps triviais com concorrência de fila 20
+(pool Postgres `max: 60`) numa única run do engine em processo local — dominado pelos round-trips
+por step (leitura do snapshot + 3 escritas de step + transições de run), não pelo Redis/BullMQ. A
+retomada por sleep tem uma cauda maior e mais variável (~50–100 ms) que a retomada por token
+(~3–12 ms): sleep depende do `moveToDelayed`/disparo atrasado do BullMQ (checado periodicamente
+pelo Redis), enquanto a retomada por token é o próprio processo lendo e re-acordando a run assim
+que `tokens.complete()` grava o resultado, sem esperar um tick de fila.
+
+`pnpm check:pack` (`scripts/check-pack.mjs`): `pnpm build && pnpm pack`, instala o `.tgz` gerado
+mais `bullmq`/`ioredis`/`pg` via `npm install` num diretório `mktemp -d`, e confirma
+`import("minitrigger")`, `require("minitrigger")` e um `tsc --strict --module NodeNext` de uma
+linha contra o `.d.ts` instalado — todos passando (`PASS`, ver `docs/research/github-install.md`
+para o caminho via GitHub, que precisa de `allowBuilds` no `pnpm-workspace.yaml` do consumidor).
