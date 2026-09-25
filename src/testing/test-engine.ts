@@ -231,7 +231,7 @@ export function createTestEngine(config: TestEngineConfig): TestEngine {
 	async function processJob(job: MemoryJob): Promise<void> {
 		if (job.kind === "run") {
 			try {
-				await executeRun(core.deps, job.data as RunJobData);
+				await executeRun(core.deps, { ...(job.data as RunJobData), queue: job.queue });
 			} finally {
 				transport.finish(job);
 			}

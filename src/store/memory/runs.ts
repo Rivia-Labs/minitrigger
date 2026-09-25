@@ -1,4 +1,5 @@
 import type {
+	AcquireWithLimitResult,
 	CanceledRun,
 	CancelRunResult,
 	ChildResult,
@@ -6,6 +7,7 @@ import type {
 	EnqueueRequest,
 	Json,
 	NewRun,
+	NewRunDebounce,
 	Ownership,
 	RecoverStalledResult,
 	RunStore,
@@ -18,7 +20,7 @@ import type {
 	TriggerChildrenResult,
 	WaitpointResolution,
 } from "../types.js";
-import { MAX_LIST_LIMIT } from "../types.js";
+import { concurrencyLimitedDelayMs, MAX_LIST_LIMIT } from "../types.js";
 import { claimKey } from "./idempotency.js";
 import {
 	applyResumeRule,
@@ -72,6 +74,8 @@ interface InsertRun {
 	parentWaitpointId: string | null;
 	parentStepName: string | null;
 	batchIndex: number | null;
+	concurrencyKey?: string | undefined;
+	debounce?: { key: string; deadline: number | null } | undefined;
 }
 
 function insertRun(tx: MemTx, input: InsertRun): RunRow {
@@ -100,9 +104,68 @@ function insertRun(tx: MemTx, input: InsertRun): RunRow {
 		createdAt: truncMs(tx.now),
 		updatedAt: tx.now,
 		progress: null,
+		debounceKey: input.debounce ? pgText(input.debounce.key) : null,
+		debounceDeadline: input.debounce ? input.debounce.deadline : null,
+		concurrencyKey: input.concurrencyKey === undefined ? null : pgText(input.concurrencyKey),
+		concurrencyWaits: 0,
 	};
+	if (row.debounceKey !== null) {
+		for (const other of tx.db.runs.values()) {
+			if (
+				other.status === "queued" &&
+				other.taskId === row.taskId &&
+				other.debounceKey === row.debounceKey
+			) {
+				throw uniqueViolation("idx_runs_debounce");
+			}
+		}
+	}
 	tx.set(tx.db.runs, id, row);
 	return row;
+}
+
+/** Decision 24 (see the SQL store): collapse into the pending run of the key, or insert. */
+function createDebounced(tx: MemTx, input: NewRun, debounce: NewRunDebounce): CreateRunResult {
+	const taskId = pgText(input.taskId);
+	const key = pgText(debounce.key);
+	let existing: RunRow | undefined;
+	for (const r of tx.db.runs.values()) {
+		if (r.status === "queued" && r.taskId === taskId && r.debounceKey === key) existing = r;
+	}
+	if (existing) {
+		const nextAfter = tx.now + debounce.delayMs;
+		const runAfter =
+			existing.debounceDeadline === null
+				? nextAfter
+				: Math.min(nextAfter, existing.debounceDeadline);
+		const row = updateRun(tx, existing, {
+			runAfter,
+			payload: debounce.payload === "last" ? toJsonb(input.payload) : existing.payload,
+			enqueueSeq: existing.enqueueSeq + 1,
+			updatedAt: tx.now,
+		});
+		return {
+			kind: "debounced",
+			run: mapRun(row),
+			enqueue: enqueueOf(row, tx.now),
+			staleSeq: existing.enqueueSeq,
+		};
+	}
+	const deadline = debounce.maxDelayMs === null ? null : tx.now + debounce.maxDelayMs;
+	const delay =
+		debounce.maxDelayMs === null
+			? debounce.delayMs
+			: Math.min(debounce.delayMs, debounce.maxDelayMs);
+	const row = insertRun(tx, {
+		...input,
+		delayMs: delay,
+		parentRunId: null,
+		parentWaitpointId: null,
+		parentStepName: null,
+		batchIndex: null,
+		debounce: { key, deadline },
+	});
+	return { kind: "created", run: mapRun(row), enqueue: enqueueOf(row, tx.now) };
 }
 
 function createOnce(tx: MemTx, input: NewRun): CreateOnce {
@@ -113,6 +176,7 @@ function createOnce(tx: MemTx, input: NewRun): CreateOnce {
 		parentWaitpointId: null,
 		parentStepName: null,
 		batchIndex: null,
+		debounce: undefined,
 	});
 	if (input.idempotency) {
 		const claim = claimKey(tx, {
@@ -199,9 +263,38 @@ function listStale(
 	};
 }
 
+/**
+ * Decision 5's acquisition (+ decision 24: the debounce key is released; decision 25:
+ * `concurrencyWaits` resets to 0).
+ */
+function acquireRow(tx: MemTx, runId: string, executionId: string, seq: number) {
+	const row = tx.db.runs.get(uuid(runId));
+	const execId = uuid(executionId);
+	if (!row || (row.status !== "queued" && row.status !== "waiting")) return null;
+	if (row.enqueueSeq !== seq) return null;
+	return mapRun(
+		updateRun(tx, row, {
+			status: "running",
+			executionId: execId,
+			heartbeatAt: tx.now,
+			startedAt: row.startedAt ?? tx.now,
+			updatedAt: tx.now,
+			debounceKey: null,
+			concurrencyWaits: 0,
+		})
+	);
+}
+
 export function createRunStore(exec: Exec): RunStore {
 	return {
 		async create(input) {
+			const debounce = input.debounce;
+			if (debounce) {
+				if (input.idempotency) {
+					throw new Error("runs.create: debounce and idempotency are mutually exclusive");
+				}
+				return exec.run(tx => createDebounced(tx, input, debounce));
+			}
 			for (let i = 0; i < 2; i++) {
 				const result = await exec.run(tx => createOnce(tx, input));
 				if (result !== "retry") return result;
@@ -298,20 +391,42 @@ export function createRunStore(exec: Exec): RunStore {
 		},
 
 		acquire(runId, executionId, seq) {
-			return exec.run(tx => {
+			return exec.run(tx => acquireRow(tx, runId, executionId, seq));
+		},
+
+		acquireWithConcurrencyLimit(runId, executionId, seq, options) {
+			return exec.run((tx): AcquireWithLimitResult => {
 				const row = tx.db.runs.get(uuid(runId));
-				const execId = uuid(executionId);
-				if (!row || (row.status !== "queued" && row.status !== "waiting")) return null;
-				if (row.enqueueSeq !== seq) return null;
-				return mapRun(
-					updateRun(tx, row, {
-						status: "running",
-						executionId: execId,
-						heartbeatAt: tx.now,
-						startedAt: row.startedAt ?? tx.now,
-						updatedAt: tx.now,
-					})
-				);
+				uuid(executionId);
+				if (!row || (row.status !== "queued" && row.status !== "waiting")) return { kind: "stale" };
+				if (row.enqueueSeq !== seq) return { kind: "stale" };
+				if (row.concurrencyKey !== null) {
+					let running = 0;
+					for (const r of tx.db.runs.values()) {
+						if (
+							r.status === "running" &&
+							r.queue === row.queue &&
+							r.concurrencyKey === row.concurrencyKey
+						) {
+							running++;
+						}
+					}
+					if (running >= options.limit) {
+						// Decision 25: growing backoff per consecutive `limited` result of this run,
+						// computed from the PRE-increment `concurrencyWaits` (time itself from the clock).
+						const delayMs = concurrencyLimitedDelayMs(row.concurrencyWaits);
+						const next = updateRun(tx, row, {
+							enqueueSeq: row.enqueueSeq + 1,
+							runAfter: tx.now + delayMs,
+							updatedAt: tx.now,
+							concurrencyWaits: row.concurrencyWaits + 1,
+						});
+						return { kind: "limited", enqueue: enqueueOf(next, tx.now) };
+					}
+				}
+				const run = acquireRow(tx, runId, executionId, seq);
+				if (!run) throw new Error("acquireWithConcurrencyLimit: run was not acquired");
+				return { kind: "acquired", run };
 			});
 		},
 

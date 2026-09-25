@@ -149,6 +149,9 @@ describe("buildRegistry: numeric queue settings", () => {
 		["rateLimit.max", { name: "llm", rateLimit: { max: 2.5, durationMs: 1_000 } }],
 		["rateLimit.durationMs", { name: "llm", rateLimit: { max: 1, durationMs: 0 } }],
 		["rateLimit.durationMs", { name: "llm", rateLimit: { max: 1, durationMs: Infinity } }],
+		["concurrencyKey.limit", { name: "llm", concurrencyKey: { limit: 0 } }],
+		["concurrencyKey.limit", { name: "llm", concurrencyKey: { limit: 1.5 } }],
+		["concurrencyKey", { name: "llm", concurrencyKey: 3 as unknown as { limit: number } }],
 	] as Array<[string, TaskQueueOptions]>)(
 		"rejects a non-integer or < 1 %s, naming the queue and the task",
 		(field, queue) => {
@@ -168,6 +171,26 @@ describe("buildRegistry: numeric queue settings", () => {
 			rateLimit: { max: 1, durationMs: 1 },
 		});
 		expect(() => buildRegistry([a])).not.toThrow();
+	});
+});
+
+describe("buildRegistry: concurrencyKey (decision 25)", () => {
+	it("resolves the limit; referencing tasks inherit it", () => {
+		const a = task("a", { name: "classification", concurrencyKey: { limit: 1 } });
+		const b = task("b", { name: "classification" });
+		const { queues } = buildRegistry([a, b]);
+		expect(queues.get("classification")?.concurrencyKey).toEqual({ limit: 1 });
+	});
+
+	it("is absent when nobody declares it", () => {
+		const { queues } = buildRegistry([task("a", { name: "llm", concurrency: 2 })]);
+		expect(queues.get("llm")?.concurrencyKey).toBeUndefined();
+	});
+
+	it("errors on conflicting limits, naming both tasks", () => {
+		const a = task("a", { name: "classification", concurrencyKey: { limit: 1 } });
+		const b = task("b", { name: "classification", concurrencyKey: { limit: 2 } });
+		expect(() => buildRegistry([a, b])).toThrow(/concurrencyKey\.limit.*"a".*"b"/);
 	});
 });
 

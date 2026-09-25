@@ -26,6 +26,14 @@ export type TaskQueueOptions = {
 	concurrency?: number;
 	globalConcurrency?: number;
 	rateLimit?: { max: number; durationMs: number };
+	/**
+	 * Decision 25: at most `limit` runs of this queue with the same
+	 * `trigger(..., { concurrencyKey })` execute at once (counted among `running` runs only; a
+	 * run waiting on a sleep/token/child does not hold a slot). A run over the limit goes back to
+	 * the queue for about a second without spending an attempt. Runs triggered without a
+	 * `concurrencyKey` are not limited by it.
+	 */
+	concurrencyKey?: { limit: number };
 };
 
 /**

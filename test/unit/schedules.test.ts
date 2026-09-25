@@ -77,6 +77,8 @@ function runRecord(overrides: Partial<RunRecord> = {}): RunRecord {
 		createdAt: NOW,
 		updatedAt: NOW,
 		progress: null,
+		debounceKey: null,
+		concurrencyKey: null,
 		...overrides,
 	};
 }

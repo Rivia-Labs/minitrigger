@@ -59,6 +59,12 @@ export interface EnqueueDeps {
 export interface RunJob {
 	runId: string;
 	seq: number;
+	/**
+	 * The task queue the job was delivered on. When this process's registry says that queue
+	 * declares `concurrencyKey` (decision 25), acquisition goes through
+	 * `acquireWithConcurrencyLimit`; unknown or omitted => plain `acquire`.
+	 */
+	queue?: string;
 }
 
 /**
@@ -93,7 +99,30 @@ export async function executeRun(deps: ExecutorDeps, job: RunJob): Promise<void>
 
 	let run: RunRecord | null;
 	try {
-		run = await deps.store.runs.acquire(job.runId, executionId, job.seq);
+		const limit =
+			job.queue === undefined
+				? undefined
+				: deps.registry.queues.get(job.queue)?.concurrencyKey?.limit;
+		if (limit === undefined) {
+			run = await deps.store.runs.acquire(job.runId, executionId, job.seq);
+		} else {
+			const acquired = await deps.store.runs.acquireWithConcurrencyLimit(
+				job.runId,
+				executionId,
+				job.seq,
+				{ limit }
+			);
+			if (acquired.kind === "limited") {
+				// Decision 25: not acquired, no attempt spent, no status change to publish.
+				log.debug(
+					{ runId: job.runId, seq: job.seq, nextSeq: acquired.enqueue.seq },
+					"concurrency key at its limit; run re-enqueued"
+				);
+				await enqueue(deps, acquired.enqueue);
+				return;
+			}
+			run = acquired.kind === "acquired" ? acquired.run : null;
+		}
 	} catch (error) {
 		log.error({ runId: job.runId, seq: job.seq, err: error }, "failed to acquire run");
 		return;

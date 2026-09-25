@@ -103,6 +103,35 @@ export function validateIdempotencyKey(value: string): string {
 	return value;
 }
 
+/**
+ * Validates a user-supplied debounce key (decision 24) or concurrency key (decision 25) like an
+ * idempotency key: a non-empty string of at most 512 characters, `__` prefix reserved.
+ */
+export function validateTriggerKey(
+	kind: "debounce key" | "concurrency key",
+	option: string,
+	value: unknown
+): string {
+	if (typeof value !== "string" || value.length === 0) {
+		throw new ConfigError(
+			`${kind} is invalid: must be a non-empty string; pass a non-empty ${option} to trigger()`
+		);
+	}
+	if (value.length > IDEMPOTENCY_KEY_MAX_LENGTH) {
+		throw new ConfigError(
+			`${kind} "${echo(value)}" is invalid: must be at most ` +
+				`${IDEMPOTENCY_KEY_MAX_LENGTH} characters, got ${value.length}`
+		);
+	}
+	if (value.startsWith("__")) {
+		throw new ConfigError(
+			`${kind} "${echo(value)}" is invalid: keys starting with "__" are reserved ` +
+				'for internal use; choose a key that doesn\'t start with "__"'
+		);
+	}
+	return value;
+}
+
 /** Validates a run/task id used as (part of) a BullMQ job id: no `:`, bounded length. */
 export function validateTaskId(value: string): string {
 	if (!TASK_ID_PATTERN.test(value)) {

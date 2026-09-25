@@ -43,6 +43,12 @@ Atualizado em 2026-09-25. Leia junto com `CLAUDE.md` (decisões e notas de imple
 - ✅ `step.trigger*` aceita task filha não registrada (spec sai do próprio objeto); objeto malformado, fila inválida e payload de filha inválido são fatais.
 - `sideEffects: false` só ajuda bundlers; em Node o `dist/index.js` único é carregado inteiro, incluindo o modo de teste. **Avaliado em 2026-09-25 e mantido:** o código do minitrigger inteiro carrega em ~2,3 ms, contra ~44 ms das peers (bullmq/ioredis/pg). Se um dia for necessário: subpath `minitrigger/testing` com `splitting: true` no tsup (chunk compartilhado para não duplicar as classes de erro e quebrar o `instanceof`), o que é uma mudança incompatível de import.
 
+### Parte 2 (2026-09-25, depois do v0.1.0)
+
+- Issue #1 (progresso por run, decisão 23, migration 004) e issue #2 (debounce e concurrency key, decisões 24/25, migration 005) implementadas. Debounce sempre trailing (`mode` removido por decisão do dono); runs limitadas por concurrency key esperam com backoff de 1 s até 30 s, sem ordem FIFO.
+- Bug do BullMQ 6.3.8/6.3.9 contornado (laço sem espera ao fechar o worker); texto de issue upstream redigido e não aberto.
+- Próximo passo opcional: release v0.2.0 (migrations 004 e 005 ficam congeladas depois dele).
+
 ### Auditoria externa (2026-09-25)
 
 - 13 achados + itens baixos, todos confirmados e corrigidos (resumo em `CLAUDE.md`, "Auditoria externa"). Único ajuste de decisão: `:` reservado em nomes de step (decisão 11, autorizado pelo dono).

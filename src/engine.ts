@@ -61,6 +61,7 @@ import { createSqlStore } from "./store/sql/index.js";
 import {
 	type Json,
 	type LogLevel,
+	type NewRunDebounce,
 	type RunCursor,
 	type RunRecord,
 	type RunStatus,
@@ -76,7 +77,7 @@ import type { AnyTask, PayloadArgs, RunHandle, TaskOutput, TaskPayload } from ".
 import { computeBackoffMs } from "./utils/backoff.js";
 import { type Duration, parseDuration } from "./utils/duration.js";
 import { describeOffendingValue } from "./utils/error-format.js";
-import { validateIdempotencyKey } from "./utils/identifiers.js";
+import { validateIdempotencyKey, validateTriggerKey } from "./utils/identifiers.js";
 import { assertSerializable } from "./utils/serialization.js";
 
 const DEFAULT_LIST_LIMIT = 20;
@@ -107,8 +108,42 @@ export interface TriggerOptions {
 	idempotencyKey?: string;
 	/** Overrides `config.idempotencyKeyTtl` (default 7 days) for this key; must not exceed `retention.days`. */
 	idempotencyKeyTtl?: Duration;
-	/** Delays the first execution (`run_after = now() + delay`, DB clock). */
+	/** Delays the first execution (`run_after = now() + delay`, DB clock). Not with `debounce`. */
 	delay?: Duration;
+	/**
+	 * Decision 24: collapse triggers with the same `(task, key)` into one pending run. While a run
+	 * of the key is `queued` and has not started yet, a new trigger returns that run instead of
+	 * creating another, pushing the execution `delay` further out (trailing: the run executes once
+	 * the key has been quiet for `delay`, capped by `maxDelay`). Once the run starts, the next
+	 * trigger creates a new pending run (so there is at most one pending run per key; add
+	 * `concurrencyKey` to also keep two from running at once). Not combinable with `idempotencyKey`
+	 * or `delay`.
+	 */
+	debounce?: DebounceOptions;
+	/**
+	 * Decision 25: at most `queue.concurrencyKey.limit` runs of this queue with the same key
+	 * execute at once. The task's queue must declare `concurrencyKey: { limit }`.
+	 */
+	concurrencyKey?: string;
+}
+
+/** Decision 24: `trigger(task, payload, { debounce })`. */
+export interface DebounceOptions {
+	/** Scoped by task; non-empty, at most 512 characters, must not start with `__`. */
+	key: string;
+	/**
+	 * The debounce window (> 0). Always trailing: each trigger of the key pushes the execution to
+	 * `delay` after it, so the run executes once the key has been quiet for `delay` (capped by
+	 * `maxDelay`).
+	 */
+	delay: Duration;
+	/** `last` (default): a collapsed trigger replaces the pending run's payload. `first`: keeps it. */
+	payload?: "last" | "first";
+	/**
+	 * Upper bound on how long a run can be postponed, from its first trigger (`trailing`).
+	 * Must be >= `delay`. Default: no bound.
+	 */
+	maxDelay?: Duration;
 }
 
 export interface StartOptions {
@@ -139,6 +174,8 @@ export interface Run<O = unknown> {
 	updatedAt: Date;
 	/** Last value written by `ctx.progress.set` (decision 23); `null` until the first `set`. */
 	progress: Json | null;
+	/** `trigger(..., { concurrencyKey })` (decision 25), or null. */
+	concurrencyKey: string | null;
 }
 
 export interface ListRunsOptions {
@@ -574,8 +611,12 @@ export function createEngineCore(
 	async function createRun(
 		task: AnyTask,
 		payload: unknown,
-		delayMs: number,
-		idempotency: { key: string; ttlMs: number } | undefined
+		options: {
+			delayMs: number;
+			idempotency?: { key: string; ttlMs: number } | undefined;
+			debounce?: NewRunDebounce | undefined;
+			concurrencyKey?: string | undefined;
+		}
 	): Promise<RunHandle<never>> {
 		assertSerializable(payload, {
 			label: `payload of task "${task.id}"`,
@@ -587,8 +628,10 @@ export function createEngineCore(
 			queue: taskQueueName(task),
 			payload: payload as Json,
 			maxAttempts: childTaskSpec(task).maxAttempts,
-			delayMs,
-			...(idempotency ? { idempotency } : {}),
+			delayMs: options.delayMs,
+			...(options.idempotency ? { idempotency: options.idempotency } : {}),
+			...(options.debounce ? { debounce: options.debounce } : {}),
+			...(options.concurrencyKey !== undefined ? { concurrencyKey: options.concurrencyKey } : {}),
 		});
 		// Decision 9: only a newly created run is enqueued; an existing one is returned as-is.
 		if (result.kind === "created") {
@@ -601,6 +644,12 @@ export function createEngineCore(
 				updatedAt: result.run.updatedAt,
 			});
 			await enqueue(deps, result.enqueue);
+		} else if (result.kind === "debounced") {
+			// Decision 24: the pending run stays `queued` (nothing is published); its seq was
+			// bumped, so enqueue the new job first, then drop the stale one (best-effort: a
+			// redelivery of it is rejected by `acquire`'s seq check anyway).
+			await enqueue(deps, result.enqueue);
+			await transport.removeRunJob(result.run.queue, result.run.id, result.staleSeq);
 		}
 		return { id: result.run.id, taskId: result.run.taskId };
 	}
@@ -633,8 +682,14 @@ export function createEngineCore(
 			throw new ConfigError("idempotencyKeyTtl was given without an idempotencyKey");
 		}
 		const delayMs = options.delay === undefined ? 0 : parseDuration(options.delay);
+		const debounce =
+			options.debounce === undefined ? undefined : resolveDebounce(options, idempotency);
+		const concurrencyKey =
+			options.concurrencyKey === undefined
+				? undefined
+				: resolveConcurrencyKey(registry, task, options.concurrencyKey);
 
-		return createRun(task, payload, delayMs, idempotency);
+		return createRun(task, payload, { delayMs, idempotency, debounce, concurrencyKey });
 	}
 
 	/** Bounded wait for the best-effort publishes still in flight. */
@@ -690,7 +745,16 @@ export function createEngineCore(
 			const record = isUuid(runId) ? await store.runs.get(runId) : null;
 			if (!record) throw new MinitriggerError(`run ${runId} not found`);
 			const task = getTask(registry, record.taskId);
-			return createRun(task, record.payload, 0, undefined);
+			return createRun(task, record.payload, {
+				delayMs: 0,
+				// Decision 25: the replay keeps the original's concurrency key while the queue still
+				// declares one (never the debounce key: a replay is an explicit extra run).
+				concurrencyKey:
+					record.concurrencyKey !== null &&
+					registry.queues.get(taskQueueName(task))?.concurrencyKey !== undefined
+						? record.concurrencyKey
+						: undefined,
+			});
 		},
 
 		async logs(run, options = {}): Promise<RunLogPage> {
@@ -1162,8 +1226,8 @@ export function createEngine(config: EngineConfig): Engine {
 				// On failure `startWorkers` closes whatever workers it already created.
 				await transport.startWorkers({
 					...(options.queues ? { queues: options.queues } : {}),
-					processRun: async (_queue, data) => {
-						const execution = executeRun(deps, { runId: data.runId, seq: data.seq });
+					processRun: async (queue, data) => {
+						const execution = executeRun(deps, { runId: data.runId, seq: data.seq, queue });
 						inFlight.add(execution);
 						try {
 							await execution;
@@ -1657,7 +1721,69 @@ function toPublicRun<O>(record: RunRecord): Run<O> {
 		createdAt: record.createdAt,
 		updatedAt: record.updatedAt,
 		progress: record.progress,
+		concurrencyKey: record.concurrencyKey,
 	};
+}
+
+/** Decision 24: validates `trigger`'s `debounce` option into the store's shape. @internal */
+export function resolveDebounce(
+	options: TriggerOptions,
+	idempotency: { key: string } | undefined
+): NewRunDebounce {
+	const debounce = options.debounce;
+	if (debounce === null || typeof debounce !== "object") {
+		throw new ConfigError(
+			`trigger options.debounce must be an object like { key, delay }, got ${describeOffendingValue(debounce)}`
+		);
+	}
+	if (idempotency !== undefined) {
+		throw new ConfigError(
+			"trigger options.debounce and options.idempotencyKey cannot be combined: debounce " +
+				"already returns the pending run of its key; drop one of them"
+		);
+	}
+	if (options.delay !== undefined) {
+		throw new ConfigError(
+			"trigger options.delay cannot be combined with options.debounce; the debounce window " +
+				"(options.debounce.delay) already delays the run"
+		);
+	}
+	const key = validateTriggerKey("debounce key", "options.debounce.key", debounce.key);
+	const delayMs = parseDuration(debounce.delay);
+	if (delayMs <= 0) {
+		throw new ConfigError(
+			`trigger options.debounce.delay must resolve to more than 0 ms, got ${describeOffendingValue(debounce.delay)}`
+		);
+	}
+	const payload = debounce.payload ?? "last";
+	if (payload !== "last" && payload !== "first") {
+		throw new ConfigError(
+			`trigger options.debounce.payload must be "last" or "first", got ${describeOffendingValue(payload)}`
+		);
+	}
+	let maxDelayMs: number | null = null;
+	if (debounce.maxDelay !== undefined) {
+		maxDelayMs = parseDuration(debounce.maxDelay);
+		if (maxDelayMs < delayMs) {
+			throw new ConfigError(
+				`trigger options.debounce.maxDelay (${maxDelayMs} ms) must be >= options.debounce.delay (${delayMs} ms)`
+			);
+		}
+	}
+	return { key, delayMs, payload, maxDelayMs };
+}
+
+/** Decision 25: validates `trigger`'s `concurrencyKey` against the task's queue. @internal */
+export function resolveConcurrencyKey(registry: Registry, task: AnyTask, value: unknown): string {
+	const key = validateTriggerKey("concurrency key", "options.concurrencyKey", value);
+	const queue = taskQueueName(task);
+	if (registry.queues.get(queue)?.concurrencyKey === undefined) {
+		throw new ConfigError(
+			`trigger options.concurrencyKey was given for task "${task.id}", but its queue "${queue}" ` +
+				"declares no concurrencyKey; add queue: { name, concurrencyKey: { limit: 1 } } to the task"
+		);
+	}
+	return key;
 }
 
 /** Per-task option checks the registry doesn't do (retry, backoff, maxDurationMs, reserved queue). @internal */

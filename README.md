@@ -219,6 +219,81 @@ exceed `retention.days` (a key can't outlive the run it points to). Keys startin
 supplies one. `engine.runs.replay(runId)` starts a **new** run of the same task/payload — it does
 **not** reuse the original idempotency key.
 
+### Debounce
+
+```ts
+await engine.trigger(recalcClassification, { courseId }, {
+	debounce: { key: `course:${courseId}`, delay: "2s" },
+});
+```
+
+Triggers with the same `(task, debounce.key)` collapse into **one pending run** while that run is
+still `queued` and has not started: the trigger returns the pending run's handle instead of
+creating another (800 grade changes → one recalculation). Once the run starts, the key is released
+and the next trigger creates a new pending run, which later triggers collapse into — at most one
+pending run per key, and it always sees the newest data. The rule lives in Postgres (a unique
+partial index), so it holds across processes and survives a Redis `FLUSHALL`.
+
+- `delay` (required, > 0): the window. Always trailing — each trigger pushes the execution to
+  `delay` after it, so the run executes once the key has been quiet for `delay`.
+- `payload`: `"last"` (default) — a collapsed trigger replaces the pending payload; `"first"` —
+  keeps the original.
+- `maxDelay` (>= `delay`): caps how far a run can be postponed from its first trigger, so a key
+  that never goes quiet still runs periodically.
+- Keys are scoped by task, validated like idempotency keys (non-empty, at most 512 characters,
+  `__` prefix reserved). `debounce` cannot be combined with `idempotencyKey` or `delay`.
+- A collapsed trigger doesn't change the run's status, so it emits no event and no
+  `runs.subscribe` update. A run that already started and went back to `queued` (retry, resume
+  from a sleep, graceful hand-back) never absorbs triggers.
+- A collapsed trigger also doesn't change the pending run's `concurrencyKey`, `maxDelay` deadline
+  or `maxAttempts` — only its `payload` (per the `payload` option) and `run_after` move; those
+  other fields are fixed by whichever trigger created the pending run (first trigger wins).
+
+Debounce keeps one pending run per key; to also keep two runs of the key from executing at the
+same time, add a concurrency key (below) — together they give "one pending + one running".
+
+### Concurrency keys
+
+```ts
+defineTask({
+	id: "recalc-classification",
+	queue: { name: "classification", concurrency: 4, concurrencyKey: { limit: 1 } },
+	run: async (payload: { courseId: string }) => { /* ... */ },
+});
+await engine.trigger(recalcClassification, { courseId }, {
+	concurrencyKey: courseId,
+	debounce: { key: courseId, delay: "2s" },
+});
+```
+
+A queue that declares `concurrencyKey: { limit }` executes at most `limit` runs with the same
+`trigger(..., { concurrencyKey })` at once, across every process (the queue's `concurrency` still
+bounds the total per worker). The check happens at acquisition, in one Postgres transaction
+serialized per key (an advisory lock): a run over the limit is not started — it goes back to the
+queue **without spending an attempt**, and tries again.
+
+- This is polling, not FIFO: a run that has been waiting the longest isn't necessarily the next to
+  acquire the key once a slot frees up. Pair `concurrencyKey` with `debounce` when you want the
+  "one pending + one running" pattern instead of a fair queue per key.
+- Each time a run is found over the limit it retries with a growing backoff (roughly doubling,
+  starting around a second, capped at 30 s, plus jitter); the count resets to 0 once the run
+  acquires. A key that's busy for a long time means the polling cost per waiting run grows to that
+  30 s ceiling, not a tight loop.
+- Only `running` runs count: a run waiting on a sleep, token or child does not hold a slot, so
+  another run of the key may execute while it waits.
+- Runs triggered without a `concurrencyKey` are not limited. Using `concurrencyKey` on a task whose
+  queue doesn't declare one is a `ConfigError`. `limit` is shared by every task of the queue, like
+  the other queue settings.
+- Only `engine.trigger` takes a `concurrencyKey` for now (not `step.trigger*`); `runs.replay()`
+  keeps the original run's key. Children triggered via `step.trigger`/`step.triggerAndWait`/
+  `step.batchTriggerAndWait` on a queue with `concurrencyKey` run **unlimited** — the limit only
+  applies to a run whose own `concurrencyKey` was set by `engine.trigger`.
+- A process that doesn't know the queue's `concurrencyKey` setting (e.g. an old deploy) acquires
+  without the check; keep the setting identical across deploys. The limit is read from each
+  worker's own registry, not shared centrally.
+- A crashed process's `running` run keeps holding its key's slot until stall recovery
+  (`stallTimeoutMs`) notices and requeues it — a hung worker can block a key for up to that long.
+
 ### Queues
 
 ```ts
@@ -348,7 +423,9 @@ interface Engine {
 or `undefined`) — the exact type is `PayloadArgs<TaskPayload<T>, [options?: TriggerOptions]>`, not
 the simplified `payload?` shown above.
 
-`TriggerOptions`: `{ idempotencyKey?: string; idempotencyKeyTtl?: Duration; delay?: Duration }`.
+`TriggerOptions`: `{ idempotencyKey?: string; idempotencyKeyTtl?: Duration; delay?: Duration;
+debounce?: { key: string; delay: Duration; payload?: "last" | "first"; maxDelay?: Duration };
+concurrencyKey?: string }` (see [Debounce](#debounce) and [Concurrency keys](#concurrency-keys)).
 
 An engine that never calls `start()` can still `trigger()` and query — no workers, no queue
 consumption (decision 19 in `docs/SPEC.md`).
@@ -657,6 +734,11 @@ it("approves a document", async () => {
   unknown schedule id, and rejects with whatever error the tick job itself failed with.
 - `EngineClient` (`Pick<Engine, "trigger" | "runs" | "tokens" | "schedules" | "events">`) is the
   surface `Engine` and `TestEngine` share: use it to type a helper that works against either.
+- `debounce` works as in production for triggers issued before the next drain. `concurrencyKey`
+  is checked too, but the test engine runs one job at a time, so two runs of a key never overlap on
+  their own; a run limited by some other `running` run is re-delayed with the same growing backoff
+  as production (~1 s, then ~2 s, ~4 s, ... up to 30 s), which `autoAdvance: true` keeps jumping to
+  until `maxJobsPerDrain` — use `autoAdvance: false` in such a test.
 - `maxDurationMs`, heartbeats and log flushes still use real timers. A drain that processes more
   than `maxJobsPerDrain` jobs (default 10 000) throws, to catch runs that never settle. Of
   `retention`, only `days` is accepted (for the idempotency-key TTL check, exactly as in

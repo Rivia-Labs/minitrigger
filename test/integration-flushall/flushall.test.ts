@@ -137,4 +137,63 @@ describe("FLUSHALL", () => {
 		},
 		30_000
 	);
+
+	(enabled ? it : it.skip)(
+		"a debounced run keeps collapsing triggers and runs once after Redis is wiped (decision 24)",
+		async () => {
+			const seen: number[] = [];
+			const task = defineTask({
+				id: `debounced-${shortId()}`,
+				queue: { name: `q${shortId()}` },
+				run: async (payload: { n: number }) => {
+					seen.push(payload.n);
+					return payload.n;
+				},
+			});
+			const debounced = createEngine({
+				postgres: ns.databaseUrl,
+				redis: ns.redisUrl,
+				schema: ns.schema,
+				prefix: ns.prefix,
+				tasks: [task],
+				shutdownTimeoutMs: 1_000,
+				reconciler: { intervalMs: 200, graceMs: 200, batchSize: 50 },
+				logger: silent,
+			});
+			try {
+				await debounced.start();
+				const opts = { debounce: { key: "course:1", delay: 1_000 } };
+				const first = await debounced.trigger(task, { n: 1 }, opts);
+				await debounced.trigger(task, { n: 2 }, opts);
+
+				const admin = new Redis(TEST_REDIS_URL);
+				try {
+					await admin.flushall();
+				} finally {
+					admin.disconnect();
+				}
+
+				// The pending run and its key live in Postgres: this still collapses into it.
+				const third = await debounced.trigger(task, { n: 3 }, opts);
+				expect(third.id).toBe(first.id);
+				const admin2 = new Redis(TEST_REDIS_URL);
+				try {
+					// Wipe again, so the only job left for the run is the reconciler's re-enqueue.
+					await admin2.flushall();
+				} finally {
+					admin2.disconnect();
+				}
+
+				await waitFor(async () => (await debounced.runs.get(first.id))?.status === "completed", {
+					timeoutMs: 10_000,
+				});
+				expect(seen).toEqual([3]);
+				const runs = await debounced.runs.list({ taskId: task.id, limit: 10 });
+				expect(runs.items).toHaveLength(1);
+			} finally {
+				await debounced.stop();
+			}
+		},
+		30_000
+	);
 });

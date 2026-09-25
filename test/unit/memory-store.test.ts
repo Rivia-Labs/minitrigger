@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { beforeEach, describe, expect, it } from "vitest";
 import { createMemoryStore, memoryStoreTestHooks } from "../../src/store/memory/index.js";
 import type { Json, Ownership, Store } from "../../src/store/types.js";
+import { defineDebounceConcurrencyContractSuite } from "../helpers/store-contract-debounce-suite.js";
 import { defineStoreContractSuite, type StoreHarness } from "../helpers/store-contract-suite.js";
 
 /** Manual clock: the in-memory store's "DB clock". */
@@ -35,6 +36,7 @@ beforeEach(() => {
 });
 
 defineStoreContractSuite(() => harness);
+defineDebounceConcurrencyContractSuite(() => harness);
 
 // ---------------------------------------------------------------------------
 // Memory-only behavior

@@ -20,6 +20,8 @@ export type ResolvedQueue = {
 	concurrency: number;
 	globalConcurrency?: number;
 	rateLimit?: { max: number; durationMs: number };
+	/** Decision 25: max running runs per concurrency key. */
+	concurrencyKey?: { limit: number };
 	/** Ids of every task assigned to this queue, in registration order. */
 	taskIds: string[];
 };
@@ -68,6 +70,7 @@ type QueueAccumulator = {
 	concurrency: FieldEntry<number>[];
 	globalConcurrency: FieldEntry<number>[];
 	rateLimit: FieldEntry<{ max: number; durationMs: number }>[];
+	concurrencyKey: FieldEntry<number>[];
 };
 
 function buildQueueMap(tasks: readonly AnyTask[]): Map<string, ResolvedQueue> {
@@ -80,7 +83,14 @@ function buildQueueMap(tasks: readonly AnyTask[]): Map<string, ResolvedQueue> {
 
 		let acc = accumulators.get(name);
 		if (!acc) {
-			acc = { name, taskIds: [], concurrency: [], globalConcurrency: [], rateLimit: [] };
+			acc = {
+				name,
+				taskIds: [],
+				concurrency: [],
+				globalConcurrency: [],
+				rateLimit: [],
+				concurrencyKey: [],
+			};
 			accumulators.set(name, acc);
 		}
 		acc.taskIds.push(task.id);
@@ -94,6 +104,9 @@ function buildQueueMap(tasks: readonly AnyTask[]): Map<string, ResolvedQueue> {
 		}
 		if (declared?.rateLimit !== undefined) {
 			acc.rateLimit.push({ taskId: task.id, value: declared.rateLimit });
+		}
+		if (declared?.concurrencyKey !== undefined) {
+			acc.concurrencyKey.push({ taskId: task.id, value: declared.concurrencyKey.limit });
 		}
 	}
 
@@ -117,15 +130,26 @@ function buildQueueMap(tasks: readonly AnyTask[]): Map<string, ResolvedQueue> {
 			formatRateLimit
 		);
 
+		const concurrencyKeyLimit = resolveField(
+			acc.name,
+			"concurrencyKey.limit",
+			acc.concurrencyKey,
+			numberEquals,
+			String
+		);
+
 		const resolved: ResolvedQueue = { name: acc.name, concurrency, taskIds: acc.taskIds };
 		if (globalConcurrency !== undefined) resolved.globalConcurrency = globalConcurrency;
 		if (rateLimit !== undefined) resolved.rateLimit = rateLimit;
+		if (concurrencyKeyLimit !== undefined) {
+			resolved.concurrencyKey = { limit: concurrencyKeyLimit };
+		}
 		queues.set(acc.name, resolved);
 	}
 	return queues;
 }
 
-/** `concurrency`, `globalConcurrency` and `rateLimit.{max,durationMs}` must be integers >= 1. */
+/** `concurrency`, `globalConcurrency`, `rateLimit.{max,durationMs}` and `concurrencyKey.limit` must be integers >= 1. */
 function validateQueueNumbers(queueName: string, taskId: string, declared: TaskQueueOptions): void {
 	const check = (field: string, value: unknown) => {
 		if (typeof value !== "number" || !Number.isInteger(value) || value < 1) {
@@ -142,6 +166,15 @@ function validateQueueNumbers(queueName: string, taskId: string, declared: TaskQ
 	if (declared.rateLimit !== undefined) {
 		check("rateLimit.max", declared.rateLimit.max);
 		check("rateLimit.durationMs", declared.rateLimit.durationMs);
+	}
+	if (declared.concurrencyKey !== undefined) {
+		if (declared.concurrencyKey === null || typeof declared.concurrencyKey !== "object") {
+			throw new ConfigError(
+				`queue "${queueName}" (declared by task "${taskId}"): concurrencyKey must be an ` +
+					`object like { limit: 1 }, got ${describeOffendingValue(declared.concurrencyKey)}`
+			);
+		}
+		check("concurrencyKey.limit", declared.concurrencyKey.limit);
 	}
 }
 

@@ -45,6 +45,14 @@ export interface RunRow {
 	readonly updatedAt: number;
 	/** `ctx.progress.set` (decision 23); `null` until the first `set`. */
 	readonly progress: Json | null;
+	/** Decision 24; cleared by `acquire`. */
+	readonly debounceKey: string | null;
+	/** Decision 24: `maxDelay` cap (epoch ms), or null. */
+	readonly debounceDeadline: number | null;
+	/** Decision 25. */
+	readonly concurrencyKey: string | null;
+	/** Decision 25: consecutive `limited` acquisition attempts; reset to 0 once acquired. */
+	readonly concurrencyWaits: number;
 }
 
 export interface StepRow {

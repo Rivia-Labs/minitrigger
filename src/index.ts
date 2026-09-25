@@ -3,6 +3,7 @@ export {
 	type CancelRunOutcome,
 	type CompleteTokenOutcome,
 	createEngine,
+	type DebounceOptions,
 	type Engine,
 	type EngineClient,
 	type EngineEvents,

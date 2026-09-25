@@ -123,6 +123,14 @@ export interface RunRecord {
 	 * retry and resume (never reset by the engine).
 	 */
 	progress: Json | null;
+	/**
+	 * Decision 24: set by a debounced trigger while the run is `queued` and not yet started;
+	 * cleared (`NULL`) by {@link RunStore.acquire}, so a run collapses triggers only before its first
+	 * execution.
+	 */
+	debounceKey: string | null;
+	/** Decision 25: counted among `running` runs of the same queue at acquisition. */
+	concurrencyKey: string | null;
 }
 
 /** One row of `steps` (PK `(run_id, name)`). */
@@ -245,11 +253,81 @@ export interface NewRun {
 	delayMs: number;
 	/** `ttlMs: null` => `expires_at NULL` (internal keys). User keys get the engine default TTL. */
 	idempotency?: { key: string; ttlMs: number | null };
+	/** Decision 24. Mutually exclusive with `idempotency` (the store throws). */
+	debounce?: NewRunDebounce;
+	/** Decision 25: stored in `runs.concurrency_key`; enforced by {@link RunStore.acquireWithConcurrencyLimit}. */
+	concurrencyKey?: string;
+}
+
+/**
+ * Decision 24: collapse triggers of the same `(task_id, key)` into the single `queued` run that
+ * has not started yet. When set, {@link NewRun.delayMs} is ignored: a new run gets
+ * `run_after = now() + least(delayMs, maxDelayMs)` and `debounce_deadline = now() + maxDelayMs`.
+ */
+export interface NewRunDebounce {
+	key: string;
+	/**
+	 * The debounce window (> 0). Always trailing: every collapsed trigger pushes `run_after` to
+	 * `least(now() + delayMs, debounce_deadline)`.
+	 */
+	delayMs: number;
+	/** `last`: a collapsed trigger replaces the pending run's payload. `first`: keeps it. */
+	payload: "last" | "first";
+	/** Cap on how far the run can be postponed from its first trigger; null = no cap. */
+	maxDelayMs: number | null;
 }
 
 export type CreateRunResult =
 	| { kind: "created"; run: RunRecord; enqueue: EnqueueRequest }
-	| { kind: "existing"; run: RunRecord };
+	| { kind: "existing"; run: RunRecord }
+	/**
+	 * Decision 24: collapsed into the pending run of the same debounce key. `enqueue_seq` was
+	 * bumped (the run keeps its status `queued`), so the caller enqueues `enqueue` and removes the
+	 * now stale job `${runId}-${staleSeq}` best-effort (a redelivery of it is rejected by
+	 * `acquire` anyway).
+	 */
+	| { kind: "debounced"; run: RunRecord; enqueue: EnqueueRequest; staleSeq: number };
+
+/** Decision 25: options of {@link RunStore.acquireWithConcurrencyLimit}. */
+export interface ConcurrencyLimitOptions {
+	/** Max `running` runs of the same `(queue, concurrency_key)` (integer >= 1). */
+	limit: number;
+}
+
+/** Decision 25: base of the growing backoff of a `limited` acquisition attempt. */
+export const CONCURRENCY_LIMITED_BASE_MS = 1_000;
+/** Decision 25: cap of the growing backoff. */
+export const CONCURRENCY_LIMITED_MAX_MS = 30_000;
+/** Decision 25: upper bound of the random jitter added on top of the (capped) backoff. */
+export const CONCURRENCY_LIMITED_JITTER_MS = 250;
+
+/**
+ * Decision 25: the retry delay of a `limited` acquisition attempt, given the run's
+ * `concurrency_waits` BEFORE this attempt increments it (so the first `limited` result uses
+ * `waits = 0` => `CONCURRENCY_LIMITED_BASE_MS`, the second `waits = 1` => twice that, and so on,
+ * capped at {@link CONCURRENCY_LIMITED_MAX_MS}), plus jitter. Time itself always comes from the
+ * database (decision 17); this only computes the number of milliseconds added to `now()`.
+ */
+export function concurrencyLimitedDelayMs(waitsBeforeThisAttempt: number): number {
+	const base = Math.min(
+		CONCURRENCY_LIMITED_BASE_MS * 2 ** waitsBeforeThisAttempt,
+		CONCURRENCY_LIMITED_MAX_MS
+	);
+	return base + Math.floor(Math.random() * Math.min(CONCURRENCY_LIMITED_JITTER_MS, base));
+}
+
+export type AcquireWithLimitResult =
+	| { kind: "acquired"; run: RunRecord }
+	/** Stale or duplicate job (wrong seq, not `queued`/`waiting`): no-op, like `acquire` → null. */
+	| { kind: "stale" }
+	/**
+	 * The run's concurrency key already has `limit` running runs: not acquired, attempt
+	 * unchanged, status unchanged, `concurrency_waits + 1`, `enqueue_seq + 1`, `run_after = now() +
+	 * `{@link concurrencyLimitedDelayMs}` of the PRE-increment `concurrency_waits` (a growing
+	 * backoff per consecutive `limited` result of this run, reset to 0 once it acquires). The
+	 * caller enqueues `enqueue`.
+	 */
+	| { kind: "limited"; enqueue: EnqueueRequest };
 
 export interface NewChildRun {
 	id: string;
@@ -396,6 +474,15 @@ export interface RunStore {
 	 * (ROLLBACK, or ROLLBACK TO SAVEPOINT inside a StoreTx) and return the run that
 	 * owns the key, enqueuing nothing. If that run vanished meanwhile (retention),
 	 * retry the whole operation once.
+	 *
+	 * With `debounce` (decision 24), in one transaction: `SELECT ... FOR UPDATE` the `queued` run
+	 * with the same `(task_id, debounce_key)`. Found => collapse into it (`run_after` always
+	 * pushed to `least(now() + delayMs, debounce_deadline)` (trailing),
+	 * payload per `payload`, ALWAYS `enqueue_seq + 1` because `acquire` does not look at
+	 * `run_after` and only the seq fences the old job) and return `debounced`. Not found =>
+	 * insert with `debounce_key`/`debounce_deadline`; a unique violation of the partial index
+	 * (a concurrent trigger inserted first) rolls back to a savepoint and loops, now finding and
+	 * collapsing into that run. Never `xmax`.
 	 */
 	create(input: NewRun): Promise<CreateRunResult>;
 
@@ -414,8 +501,29 @@ export interface RunStore {
 	 * `UPDATE runs SET status='running', execution_id=$2, heartbeat_at=now(),
 	 * started_at=coalesce(started_at, now()) WHERE id=$1 AND status IN
 	 * ('queued','waiting') AND enqueue_seq=$3 RETURNING *`. Null => stale job, no-op.
+	 * Also sets `debounce_key = NULL` (decision 24: the key is released once the run leaves
+	 * `queued`).
 	 */
 	acquire(runId: string, executionId: string, seq: number): Promise<RunRecord | null>;
+
+	/**
+	 * Decision 25: {@link acquire} for a queue that declares `concurrencyKey`. One transaction:
+	 * `SELECT ... FOR UPDATE` the run (same predicate as `acquire`; none → `stale`). Without a
+	 * `concurrency_key` it is acquired exactly like `acquire`. With one:
+	 * `pg_advisory_xact_lock(hashtextextended(schema || ':' || queue || ':' || key, 0))` (a
+	 * single-bigint lock, a key space separate from decision 16's two-int locks) serializes the
+	 * acquirers of that key, then `count(*)` of `running` runs with the same `(queue,
+	 * concurrency_key)`: `>= limit` → `limited` (see {@link AcquireWithLimitResult}; the run's
+	 * `concurrency_waits` grows the retry delay); else the decision-5 UPDATE, which also resets
+	 * `concurrency_waits` to 0. Only `running` counts: a `waiting` run of the key does not hold a
+	 * slot.
+	 */
+	acquireWithConcurrencyLimit(
+		runId: string,
+		executionId: string,
+		seq: number,
+		options: ConcurrencyLimitOptions
+	): Promise<AcquireWithLimitResult>;
 
 	/**
 	 * Decision 6. Own short transaction: `SET LOCAL statement_timeout = timeoutMs`,

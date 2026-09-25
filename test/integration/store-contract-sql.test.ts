@@ -4,6 +4,7 @@ import { createSqlContext, type SqlContext } from "../../src/store/sql/db.js";
 import { createSqlStore } from "../../src/store/sql/index.js";
 import type { Store } from "../../src/store/types.js";
 import { useTestNamespace } from "../helpers/namespace.js";
+import { defineDebounceConcurrencyContractSuite } from "../helpers/store-contract-debounce-suite.js";
 import { defineStoreContractSuite, type StoreHarness } from "../helpers/store-contract-suite.js";
 
 // The shared store contract suite against Postgres (the reference behavior the in-memory store of
@@ -28,7 +29,18 @@ beforeEach(async () => {
 
 /** "Advancing the clock" = shifting every stored timestamp back by `ms`. */
 const SHIFTS: [Parameters<SqlContext["t"]>[0], string[]][] = [
-	["runs", ["heartbeat_at", "run_after", "started_at", "finished_at", "created_at", "updated_at"]],
+	[
+		"runs",
+		[
+			"heartbeat_at",
+			"run_after",
+			"started_at",
+			"finished_at",
+			"created_at",
+			"updated_at",
+			"debounce_deadline",
+		],
+	],
 	["steps", ["wake_at", "created_at"]],
 	["waitpoints", ["expires_at", "created_at", "resolved_at"]],
 	["idempotency_keys", ["expires_at"]],
@@ -67,3 +79,4 @@ const harness: StoreHarness = {
 };
 
 defineStoreContractSuite(() => harness);
+defineDebounceConcurrencyContractSuite(() => harness);

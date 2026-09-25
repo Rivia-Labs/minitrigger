@@ -1,4 +1,6 @@
+import { MinitriggerError } from "../../errors.js";
 import type {
+	AcquireWithLimitResult,
 	CanceledRun,
 	CancelRunResult,
 	ChildResult,
@@ -6,6 +8,7 @@ import type {
 	EnqueueRequest,
 	Json,
 	NewRun,
+	NewRunDebounce,
 	Ownership,
 	RunStatus,
 	RunStore,
@@ -18,7 +21,7 @@ import type {
 	TriggerChildrenResult,
 	WaitpointResolution,
 } from "../types.js";
-import { MAX_LIST_LIMIT } from "../types.js";
+import { concurrencyLimitedDelayMs, MAX_LIST_LIMIT } from "../types.js";
 import { atomic, type Db, direct, type SqlContext, type SqlExecutor } from "./db.js";
 import { claimKey } from "./idempotency.js";
 import {
@@ -62,6 +65,21 @@ const OWNED = "id = $1 AND execution_id = $2 AND status = 'running'";
 
 type CreateOnce = CreateRunResult | "retry";
 
+/** How many times a debounced create re-runs after losing the insert race (decision 24). */
+const DEBOUNCE_CREATE_ATTEMPTS = 5;
+
+function enqueueOfRow(row: RunRow & { delay_ms: number }): EnqueueRequest {
+	return {
+		runId: row.id,
+		taskId: row.task_id,
+		queue: row.queue,
+		seq: row.enqueue_seq,
+		delayMs: row.delay_ms,
+		status: row.status,
+		updatedAt: row.updated_at,
+	};
+}
+
 export function createRunStore(exec: SqlExecutor, ctx: SqlContext): RunStore {
 	const runs = ctx.t("runs");
 
@@ -70,9 +88,9 @@ export function createRunStore(exec: SqlExecutor, ctx: SqlContext): RunStore {
 		if (idem) await db.query("SAVEPOINT mt_create_run");
 		const { rows } = await db.query<RunRow & { delay_ms: number }>(
 			`INSERT INTO ${runs} (id, task_id, queue, payload, status, attempt, max_attempts,
-			   enqueue_seq, run_after, created_at, updated_at)
+			   enqueue_seq, run_after, created_at, updated_at, concurrency_key)
 			 VALUES ($1, $2, $3, $4::jsonb, 'queued', 1, $5, 1, ${nowPlusMs("$6")},
-			   ${CREATED_AT_SQL}, now())
+			   ${CREATED_AT_SQL}, now(), $7)
 			 RETURNING ${RUN_COLUMNS}, ${DELAY_MS_SQL} AS delay_ms`,
 			[
 				input.id,
@@ -81,6 +99,7 @@ export function createRunStore(exec: SqlExecutor, ctx: SqlContext): RunStore {
 				jsonParam(input.payload),
 				input.maxAttempts,
 				input.delayMs,
+				input.concurrencyKey ?? null,
 			]
 		);
 		const row = rows[0];
@@ -101,19 +120,96 @@ export function createRunStore(exec: SqlExecutor, ctx: SqlContext): RunStore {
 			}
 			await db.query("RELEASE SAVEPOINT mt_create_run");
 		}
-		return {
-			kind: "created",
-			run: mapRun(row),
-			enqueue: {
-				runId: row.id,
-				taskId: row.task_id,
-				queue: row.queue,
-				seq: row.enqueue_seq,
-				delayMs: row.delay_ms,
-				status: row.status,
-				updatedAt: row.updated_at,
-			},
-		};
+		return { kind: "created", run: mapRun(row), enqueue: enqueueOfRow(row) };
+	}
+
+	/**
+	 * Decision 24, one attempt inside the caller's transaction: collapse into the pending run of
+	 * the key, or insert a new one. A unique violation of `idx_runs_debounce` (a concurrent
+	 * trigger inserted first and committed) rolls back to the savepoint and reports `"retry"`: the
+	 * next attempt's `FOR UPDATE` finds (and waits for) that run.
+	 */
+	async function createDebouncedOnce(
+		db: Db,
+		input: NewRun,
+		debounce: NewRunDebounce
+	): Promise<CreateOnce> {
+		const { rows: found } = await db.query<{ id: string; enqueue_seq: number }>(
+			`SELECT id, enqueue_seq FROM ${runs}
+			 WHERE task_id = $1 AND debounce_key = $2 AND status = 'queued'
+			 FOR UPDATE`,
+			[input.taskId, debounce.key]
+		);
+		const existing = found[0];
+		if (existing) {
+			const { rows } = await db.query<RunRow & { delay_ms: number }>(
+				`UPDATE ${runs}
+				 SET run_after = least(${nowPlusMs("$2")}, debounce_deadline),
+				     payload = CASE WHEN $3 THEN $4::jsonb ELSE payload END,
+				     enqueue_seq = enqueue_seq + 1, updated_at = now()
+				 WHERE id = $1
+				 RETURNING ${RUN_COLUMNS}, ${DELAY_MS_SQL} AS delay_ms`,
+				[existing.id, debounce.delayMs, debounce.payload === "last", jsonParam(input.payload)]
+			);
+			const row = rows[0];
+			if (!row) throw new Error("debounce: locked run disappeared");
+			return {
+				kind: "debounced",
+				run: mapRun(row),
+				enqueue: enqueueOfRow(row),
+				staleSeq: existing.enqueue_seq,
+			};
+		}
+		await db.query("SAVEPOINT mt_debounce_run");
+		try {
+			const { rows } = await db.query<RunRow & { delay_ms: number }>(
+				`INSERT INTO ${runs} (id, task_id, queue, payload, status, attempt, max_attempts,
+				   enqueue_seq, run_after, created_at, updated_at, concurrency_key, debounce_key,
+				   debounce_deadline)
+				 VALUES ($1, $2, $3, $4::jsonb, 'queued', 1, $5, 1,
+				   least(${nowPlusMs("$6")}, ${nowPlusMs("$9")}),
+				   ${CREATED_AT_SQL}, now(), $7, $8, ${nowPlusMs("$9")})
+				 RETURNING ${RUN_COLUMNS}, ${DELAY_MS_SQL} AS delay_ms`,
+				[
+					input.id,
+					input.taskId,
+					input.queue,
+					jsonParam(input.payload),
+					input.maxAttempts,
+					debounce.delayMs,
+					input.concurrencyKey ?? null,
+					debounce.key,
+					debounce.maxDelayMs,
+				]
+			);
+			await db.query("RELEASE SAVEPOINT mt_debounce_run");
+			const row = rows[0];
+			if (!row) throw new Error("runs insert returned no row");
+			return { kind: "created", run: mapRun(row), enqueue: enqueueOfRow(row) };
+		} catch (error) {
+			if ((error as { constraint?: string }).constraint !== "idx_runs_debounce") throw error;
+			await db.query("ROLLBACK TO SAVEPOINT mt_debounce_run");
+			await db.query("RELEASE SAVEPOINT mt_debounce_run");
+			return "retry";
+		}
+	}
+
+	/**
+	 * Decision 5's acquisition statement (+ decision 24: the debounce key is released; decision 25:
+	 * `concurrency_waits` resets to 0).
+	 */
+	async function acquireRow(db: Db, runId: string, executionId: string, seq: number) {
+		const { rows } = await db.query<RunRow>(
+			`UPDATE ${runs}
+			 SET status = 'running', execution_id = $2, heartbeat_at = now(),
+			     started_at = coalesce(started_at, now()), updated_at = now(), debounce_key = NULL,
+			     concurrency_waits = 0
+			 WHERE id = $1 AND status IN ('queued', 'waiting') AND enqueue_seq = $3
+			 RETURNING ${RUN_COLUMNS}`,
+			[runId, executionId, seq]
+		);
+		const row = rows[0];
+		return row ? mapRun(row) : null;
 	}
 
 	async function getRun(db: Db, runId: string) {
@@ -214,6 +310,23 @@ export function createRunStore(exec: SqlExecutor, ctx: SqlContext): RunStore {
 
 	return {
 		async create(input) {
+			const debounce = input.debounce;
+			if (debounce) {
+				if (input.idempotency) {
+					throw new Error("runs.create: debounce and idempotency are mutually exclusive");
+				}
+				for (let i = 0; i < DEBOUNCE_CREATE_ATTEMPTS; i++) {
+					const result = await atomic(exec, db => createDebouncedOnce(db, input, debounce));
+					if (result !== "retry") return result;
+				}
+				throw new MinitriggerError(
+					`trigger({ debounce: { key: ${JSON.stringify(debounce.key)} } }) of task ` +
+						`"${input.taskId}" lost the insert race ${DEBOUNCE_CREATE_ATTEMPTS} times in a row: ` +
+						"another process keeps winning the pending run of this key under very heavy " +
+						"concurrent triggering. Retry the trigger() call, or trigger less frequently for " +
+						"this key."
+				);
+			}
 			for (let i = 0; i < 2; i++) {
 				const result = await atomic(exec, db => createOnce(db, input));
 				if (result !== "retry") return result;
@@ -324,17 +437,58 @@ export function createRunStore(exec: SqlExecutor, ctx: SqlContext): RunStore {
 			});
 		},
 
-		async acquire(runId, executionId, seq) {
-			const { rows } = await direct(exec).query<RunRow>(
-				`UPDATE ${runs}
-				 SET status = 'running', execution_id = $2, heartbeat_at = now(),
-				     started_at = coalesce(started_at, now()), updated_at = now()
-				 WHERE id = $1 AND status IN ('queued', 'waiting') AND enqueue_seq = $3
-				 RETURNING ${RUN_COLUMNS}`,
-				[runId, executionId, seq]
-			);
-			const row = rows[0];
-			return row ? mapRun(row) : null;
+		acquire(runId, executionId, seq) {
+			return acquireRow(direct(exec), runId, executionId, seq);
+		},
+
+		acquireWithConcurrencyLimit(runId, executionId, seq, options) {
+			return atomic(exec, async (db): Promise<AcquireWithLimitResult> => {
+				const { rows: locked } = await db.query<{
+					queue: string;
+					concurrency_key: string | null;
+					concurrency_waits: number;
+				}>(
+					`SELECT queue, concurrency_key, concurrency_waits FROM ${runs}
+					 WHERE id = $1 AND status IN ('queued', 'waiting') AND enqueue_seq = $2
+					 FOR UPDATE`,
+					[runId, seq]
+				);
+				const target = locked[0];
+				if (!target) return { kind: "stale" };
+				if (target.concurrency_key !== null) {
+					// Serializes every acquirer of this (schema, queue, key): the count below then sees
+					// every `running` row committed by the previous holder (READ COMMITTED takes a new
+					// snapshot per statement). Single-bigint key space, apart from decision 16's
+					// two-int `(hashtext(schema), 1|2)` locks.
+					await db.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [
+						`${ctx.schema}:${target.queue}:${target.concurrency_key}`,
+					]);
+					const { rows: counted } = await db.query<{ n: number }>(
+						`SELECT count(*)::int AS n FROM ${runs}
+						 WHERE queue = $1 AND concurrency_key = $2 AND status = 'running'`,
+						[target.queue, target.concurrency_key]
+					);
+					if ((counted[0]?.n ?? 0) >= options.limit) {
+						// Decision 25: growing backoff per consecutive `limited` result of this run,
+						// computed from the PRE-increment `concurrency_waits` (time itself from the DB).
+						const delayMs = concurrencyLimitedDelayMs(target.concurrency_waits);
+						const { rows } = await db.query<EnqueueRow>(
+							`UPDATE ${runs}
+							 SET enqueue_seq = enqueue_seq + 1, run_after = ${nowPlusMs("$2")},
+							     updated_at = now(), concurrency_waits = concurrency_waits + 1
+							 WHERE id = $1
+							 RETURNING ${ENQUEUE_RETURNING}`,
+							[runId, delayMs]
+						);
+						const row = rows[0];
+						if (!row) throw new Error("acquireWithConcurrencyLimit: locked run disappeared");
+						return { kind: "limited", enqueue: mapEnqueue(row) };
+					}
+				}
+				const run = await acquireRow(db, runId, executionId, seq);
+				if (!run) throw new Error("acquireWithConcurrencyLimit: locked run was not acquired");
+				return { kind: "acquired", run };
+			});
 		},
 
 		async heartbeat(runId, executionId, timeoutMs) {

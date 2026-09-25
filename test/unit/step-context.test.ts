@@ -51,6 +51,8 @@ function runRecord(): RunRecord {
 		createdAt: NOW,
 		updatedAt: NOW,
 		progress: null,
+		debounceKey: null,
+		concurrencyKey: null,
 	};
 }
 

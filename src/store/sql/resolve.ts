@@ -47,7 +47,7 @@ export function canceledError(reason: string): SerializedError {
 export const RUN_COLUMNS =
 	"id, task_id, queue, payload, status, output, error, attempt, max_attempts, execution_id, " +
 	"enqueue_seq, heartbeat_at, run_after, parent_run_id, parent_waitpoint_id, parent_step_name, " +
-	"batch_index, started_at, finished_at, created_at, updated_at, progress";
+	"batch_index, started_at, finished_at, created_at, updated_at, progress, debounce_key, concurrency_key";
 
 export interface RunRow {
 	id: string;
@@ -72,6 +72,8 @@ export interface RunRow {
 	created_at: Date;
 	updated_at: Date;
 	progress: Json | null;
+	debounce_key: string | null;
+	concurrency_key: string | null;
 }
 
 export function mapRun(row: RunRow): RunRecord {
@@ -98,6 +100,8 @@ export function mapRun(row: RunRow): RunRecord {
 		createdAt: row.created_at,
 		updatedAt: row.updated_at,
 		progress: row.progress,
+		debounceKey: row.debounce_key,
+		concurrencyKey: row.concurrency_key,
 	};
 }
 

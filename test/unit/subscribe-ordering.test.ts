@@ -12,6 +12,8 @@ function last(overrides: Partial<{ status: RunStatus; updatedAt: Date; progress:
 		status: "running" as RunStatus,
 		updatedAt: new Date("2026-01-01T00:00:00.000Z"),
 		progress: null,
+		debounceKey: null,
+		concurrencyKey: null,
 		...overrides,
 	};
 }

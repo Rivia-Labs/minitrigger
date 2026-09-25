@@ -61,6 +61,8 @@ export function mapRun(row: RunRow): RunRecord {
 		createdAt: new Date(row.createdAt),
 		updatedAt: new Date(row.updatedAt),
 		progress: cloneJson(row.progress),
+		debounceKey: row.debounceKey,
+		concurrencyKey: row.concurrencyKey,
 	};
 }
 
