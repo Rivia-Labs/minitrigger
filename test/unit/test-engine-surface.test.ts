@@ -295,9 +295,12 @@ describe("memory transport", () => {
 		expect(transport.takeDue()?.id).toBe("late-1");
 	});
 
-	it("rejects unknown queues like the BullMQ transport", async () => {
+	it("accepts undeclared queues and rejects invalid names like the BullMQ transport", async () => {
 		const { transport } = setup();
-		await expect(transport.enqueueRun({ queue: "nope", runId: "r", seq: 1 })).rejects.toThrow(
+		await expect(
+			transport.enqueueRun({ queue: "from-new-deploy", runId: "r", seq: 1 })
+		).resolves.toBeUndefined();
+		await expect(transport.enqueueRun({ queue: "system", runId: "r", seq: 2 })).rejects.toThrow(
 			ConfigError
 		);
 	});

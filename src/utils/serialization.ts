@@ -90,7 +90,21 @@ type SerializableInner<T> = T extends JsonPrimitiveOrUndefined
 								: T extends readonly unknown[]
 									? { [K in keyof T]: Serializable<T[K]> }
 									: T extends object
-										? { [K in keyof T]: Serializable<T[K]> }
+										? // The bare `object` type is too vague to walk: it has no known keys
+											// (`keyof object` is `never`), so the mapped type below would silently
+											// collapse to `{}` -- which then, per TS's structural typing, accepts
+											// *any* value, functions included (see
+											// `test/unit/serializable-types.test.ts`, "rejects the bare `object`
+											// type"). Detected via mutual assignability (`T` is exactly `object`, not
+											// some narrower shape that merely satisfies `T extends object`).
+											// (The equally-vague `{}` doesn't reach this branch: it already satisfies
+											// the `[T] extends [Json]` short-circuit above -- a type with no declared
+											// properties vacuously matches `JsonObject`'s index signature -- so
+											// `Serializable<{}>` stays `{}`. Narrower, lower-priority than `object`
+											// itself: nobody realistically declares a `{}` payload/output.)
+											[object] extends [T]
+											? SerializableError<"object is too broad to check structurally; use a specific interface/type instead">
+											: { [K in keyof T]: Serializable<T[K]> }
 										: SerializableError<"value is not JSON-serializable">;
 
 /**

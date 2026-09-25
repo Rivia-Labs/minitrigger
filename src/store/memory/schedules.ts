@@ -7,7 +7,7 @@ import type {
 	UpsertScheduleResult,
 } from "../types.js";
 import type { Exec } from "./resolve.js";
-import { cloneJson, type MemTx, type ScheduleRow, toJsonb } from "./state.js";
+import { cloneJson, type MemTx, pgText, pgTextOrNull, type ScheduleRow, toJsonb } from "./state.js";
 
 /** Same rule as the SQL store (`^[a-zA-Z0-9_.-]{1,128}$`, no `:`). */
 const SCHEDULE_ID_PATTERN = /^[a-zA-Z0-9_.-]{1,128}$/;
@@ -56,9 +56,9 @@ export function createScheduleStore(exec: Exec): ScheduleStore {
 				}
 				const row: ScheduleRow = {
 					id: input.id,
-					taskId: input.taskId,
-					cron: input.cron,
-					timezone: input.timezone,
+					taskId: pgText(input.taskId),
+					cron: pgText(input.cron),
+					timezone: pgTextOrNull(input.timezone),
 					payload: toJsonb(input.payload),
 					source: input.source,
 					createdAt: prev ? prev.createdAt : tx.now,

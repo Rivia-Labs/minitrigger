@@ -160,6 +160,98 @@ describe("createLogBuffer", () => {
 		expect(entries.map(entry => entry.message)).toEqual(["oops"]);
 	});
 
+	it("never throws for a circular reference in data (dropped-in for [Circular])", async () => {
+		const { insertBatch, calls } = fakeInsertBatch();
+		const logger = createLogBuffer({ runId: "run-1", insertBatch, maxLogEntryBytes: 1024 });
+
+		const circular: Record<string, unknown> = { a: 1 };
+		circular.self = circular;
+		expect(() => logger.info("has cycle", circular as never)).not.toThrow();
+		await logger.close();
+
+		expect(insertBatch).toHaveBeenCalledTimes(1);
+		const [entry] = calls.flat();
+		expect(entry?.data).toEqual({ a: 1, self: "[Circular]" });
+		// The stored data must round-trip through JSON (i.e. actually be storable as jsonb).
+		expect(() => JSON.stringify(entry?.data)).not.toThrow();
+	});
+
+	it("never throws for a bigint in data (converted to its decimal string)", async () => {
+		const { insertBatch, calls } = fakeInsertBatch();
+		const logger = createLogBuffer({ runId: "run-1", insertBatch, maxLogEntryBytes: 1024 });
+
+		expect(() => logger.info("has bigint", { n: 10n } as never)).not.toThrow();
+		await logger.close();
+
+		const [entry] = calls.flat();
+		expect(entry?.data).toEqual({ n: "10" });
+	});
+
+	it("drops function/symbol values from data instead of throwing", async () => {
+		const { insertBatch, calls } = fakeInsertBatch();
+		const logger = createLogBuffer({ runId: "run-1", insertBatch, maxLogEntryBytes: 1024 });
+
+		expect(() =>
+			logger.info("has fn", { keep: 1, fn: () => 1, sym: Symbol("x") } as never)
+		).not.toThrow();
+		await logger.close();
+
+		const [entry] = calls.flat();
+		expect(entry?.data).toEqual({ keep: 1 });
+	});
+
+	it("a bare (top-level) circular reference or bigint never throws either", async () => {
+		const { insertBatch } = fakeInsertBatch();
+		const logger = createLogBuffer({ runId: "run-1", insertBatch, maxLogEntryBytes: 1024 });
+
+		const circular: Record<string, unknown> = {};
+		circular.self = circular;
+		expect(() => logger.info("bare cycle", circular as never)).not.toThrow();
+		expect(() => logger.info("bare bigint", 10n as never)).not.toThrow();
+		await logger.close();
+	});
+
+	it("coerces a non-string message instead of throwing", async () => {
+		const { insertBatch, calls } = fakeInsertBatch();
+		const logger = createLogBuffer({ runId: "run-1", insertBatch, maxLogEntryBytes: 1024 });
+
+		expect(() => logger.info(42 as unknown as string)).not.toThrow();
+		expect(() => logger.info({ oops: true } as unknown as string)).not.toThrow();
+		await logger.close();
+
+		const messages = calls.flat().map(entry => entry.message);
+		expect(messages).toEqual(["42", "an object"]);
+	});
+
+	it("sanitizes a NUL byte / lone surrogate in the message so the whole batch doesn't fail", async () => {
+		const { insertBatch, calls } = fakeInsertBatch();
+		const logger = createLogBuffer({ runId: "run-1", insertBatch, maxLogEntryBytes: 1024 });
+
+		logger.info("a\u0000b\uD800c");
+		await logger.close();
+
+		const [entry] = calls.flat();
+		expect(entry?.message.includes("\u0000")).toBe(false);
+		expect(entry?.message.isWellFormed()).toBe(true);
+	});
+
+	it("sanitizes a NUL byte / lone surrogate in data (string leaves and keys)", async () => {
+		const { insertBatch, calls } = fakeInsertBatch();
+		const logger = createLogBuffer({ runId: "run-1", insertBatch, maxLogEntryBytes: 1024 });
+
+		logger.info("msg", { "bad\u0000key": "val\uD800ue" });
+		await logger.close();
+
+		const [entry] = calls.flat();
+		const data = entry?.data as Record<string, string>;
+		const [key] = Object.keys(data);
+		expect(key).toBeDefined();
+		expect(key?.includes("\u0000")).toBe(false);
+		const value = key !== undefined ? data[key] : undefined;
+		expect(value?.isWellFormed()).toBe(true);
+		expect(() => JSON.stringify(entry?.data)).not.toThrow();
+	});
+
 	it("flushes a single batch as soon as maxBuffered is reached", async () => {
 		const { insertBatch, calls } = fakeInsertBatch();
 		const logger = createLogBuffer({

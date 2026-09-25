@@ -31,8 +31,12 @@ export interface RetentionOptions {
 }
 
 export interface Retention {
-	/** Loops `deleteFinishedBatch` until a batch is short (or the iteration cap is hit); returns the total deleted. */
-	runOnce(): Promise<number>;
+	/**
+	 * Loops `deleteFinishedBatch` until a batch is short (or the iteration cap is hit); returns the
+	 * total deleted. `signal` (e.g. `engine.stop()`) ends the loop between batches: the batch in
+	 * progress finishes, the rest is left for the next sweep.
+	 */
+	runOnce(signal?: AbortSignal): Promise<number>;
 }
 
 export function createRetention(options: RetentionOptions): Retention {
@@ -40,10 +44,14 @@ export function createRetention(options: RetentionOptions): Retention {
 	const maxIterations = options.maxIterations ?? DEFAULT_MAX_ITERATIONS;
 	const olderThanMs = days * DAY_MS;
 
-	async function runOnce(): Promise<number> {
+	async function runOnce(signal?: AbortSignal): Promise<number> {
 		let total = 0;
 		let iterations = 0;
 		for (; iterations < maxIterations; iterations++) {
+			if (signal?.aborted) {
+				logger.info({ deleted: total }, "retention: stopped between batches (shutdown)");
+				return total;
+			}
 			const deleted = await store.runs.deleteFinishedBatch(olderThanMs, batchSize);
 			total += deleted;
 			if (deleted < batchSize) {

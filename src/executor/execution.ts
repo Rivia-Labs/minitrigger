@@ -11,9 +11,12 @@ import type { Ownership, RunRecord } from "../store/types.js";
  * - `canceled`: `engine.runs.cancel()` or a waitpoint expiry, in this or any other process (via
  *   pub/sub) -> stop silently (the cancel already cleared ownership);
  * - `suspended`: the execution was suspended (decision 2) and the suspension transaction already
- *   ran; fired only so a task function that swallowed the `SuspendSignal` stops its own work.
+ *   ran; fired only so a task function that swallowed the `SuspendSignal` stops its own work;
+ * - `finished`: the attempt ended (terminal write, retry scheduled, release, or any other exit of
+ *   the executor): fired so work still running (a step left behind by a rejected `Promise.all`,
+ *   an un-awaited promise) stops instead of duplicating side effects alongside the next attempt.
  */
-export type AbortKind = "timeout" | "shutdown" | "lost" | "canceled" | "suspended";
+export type AbortKind = "timeout" | "shutdown" | "lost" | "canceled" | "suspended" | "finished";
 
 /**
  * Mutable state of one execution (one successful `acquire`). Shared by the executor, the
@@ -130,6 +133,11 @@ function abortReason(kind: AbortKind, runId: string, message: string | undefined
 			return new DOMException(message ?? `run ${runId} was canceled`, "AbortError");
 		case "suspended":
 			return new DOMException(message ?? `run ${runId} was suspended`, "AbortError");
+		case "finished":
+			return new DOMException(
+				message ?? `this execution of run ${runId} finished; its attempt is over`,
+				"AbortError"
+			);
 	}
 }
 

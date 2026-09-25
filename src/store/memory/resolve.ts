@@ -18,6 +18,7 @@ import {
 	type RunRow,
 	type StepRow,
 	toDate,
+	toJsonb,
 	type WaitpointRow,
 } from "./state.js";
 
@@ -32,7 +33,8 @@ export function isTerminal(status: RunStatus): boolean {
 }
 
 export function canceledError(reason: string): SerializedError {
-	return { name: CANCELED_ERROR_NAME, message: reason, retryable: false };
+	// Through `toJsonb`: a reason Postgres' jsonb would reject fails the cancel here too.
+	return toJsonb({ name: CANCELED_ERROR_NAME, message: reason, retryable: false });
 }
 
 export function mapRun(row: RunRow): RunRecord {
@@ -192,7 +194,8 @@ function childLevel(tx: MemTx, parentIds: ReadonlySet<string>): RunRow[] {
 
 /**
  * Cancels descendants level by level (ascending id per level), walking through terminal nodes.
- * The first level is the children of `parentRunIds` or those attached to `waitpointId`. No parent
+ * The first level is the children of `parentRunIds` or the non-terminal ones attached to
+ * `waitpointId` (a finished child's tree is left alone). No parent
  * waitpoint resolution for these runs.
  */
 export function cancelDescendants(
@@ -206,7 +209,8 @@ export function cancelDescendants(
 	let level: RunRow[];
 	if ("waitpointId" in start) {
 		level = [...tx.db.runs.values()]
-			.filter(r => r.parentWaitpointId === start.waitpointId)
+			// Only still-pending children seed the walk (audit item 13; mirrors the SQL store).
+			.filter(r => r.parentWaitpointId === start.waitpointId && !isTerminal(r.status))
 			.sort(byId);
 	} else {
 		for (const id of start.parentRunIds) visited.add(id);

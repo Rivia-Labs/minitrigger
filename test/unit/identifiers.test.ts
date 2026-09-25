@@ -74,6 +74,13 @@ describe("validateStepName", () => {
 		);
 	});
 
+	it("rejects ':' (separator of the internal __child:* keys) with an actionable message", () => {
+		expect(() => validateStepName("x:1")).toThrow(ConfigError);
+		expect(() => validateStepName("x:1")).toThrow(
+			/step name "x:1" is invalid: ":" is reserved.*"-" or "\/"/
+		);
+	});
+
 	it("reports the actual and max length for a too-long step name", () => {
 		expect(() => validateStepName("a".repeat(300))).toThrow(/at most 256 characters, got 300/);
 	});

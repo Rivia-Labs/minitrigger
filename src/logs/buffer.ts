@@ -39,7 +39,7 @@
 
 import type { LogLevel, NewLogEntry } from "../store/types.js";
 import type { TaskLogger } from "../task.js";
-import { truncateUtf8 } from "../utils/error-format.js";
+import { describeOffendingValue, sanitizeString, truncateUtf8 } from "../utils/error-format.js";
 import { type Json, truncateLogData } from "../utils/serialization.js";
 
 /** `EngineLogger`-shaped sink (see `src/config.ts`), duplicated here so this module stays standalone. */
@@ -151,9 +151,22 @@ export function createLogBuffer(options: LogBufferOptions): LogBuffer {
 		if (closed) return;
 		if (LEVEL_RANK[level] < minRank) return;
 
+		// `TaskLogger.message` is typed `string`, but nothing stops an untyped/JS caller (or one
+		// using `as any`) from handing a non-string through: coerce it to a short, safe
+		// description instead of letting a downstream `Buffer.from`/string op throw into user code
+		// (low-priority audit fix (a): "logging must never throw").
+		const safeMessage = typeof message === "string" ? message : describeOffendingValue(message);
+		// Deep-sanitize `data` once, up front, so both the mirror and storage paths see the same
+		// safe value: circular references, bigint and functions can't reach `JSON.stringify`
+		// (downstream in `truncateLogData`/`insertBatch`, or inside a `mirror` implementation) and
+		// blow up with a TypeError, and every string leaf/key is NUL-byte/lone-surrogate-safe for
+		// Postgres `jsonb` (same fix as `formatError`, audit item 2 -- otherwise a single bad
+		// character kills the whole batch, up to `maxBatchSize` lines).
+		const safeData = data === undefined ? undefined : sanitizeLogData(data);
+
 		if (mirror) {
 			try {
-				mirror[level](mirrorFields(data), message);
+				mirror[level](mirrorFields(safeData), safeMessage);
 			} catch {
 				// A broken mirror logger must never break buffering.
 			}
@@ -162,8 +175,8 @@ export function createLogBuffer(options: LogBufferOptions): LogBuffer {
 		const entry: NewLogEntry = {
 			runId,
 			level,
-			message: truncateUtf8(message, maxLogEntryBytes),
-			data: normalizeData(truncateLogData(data, maxLogEntryBytes)),
+			message: truncateUtf8(sanitizeString(safeMessage), maxLogEntryBytes),
+			data: normalizeData(truncateLogData(safeData, maxLogEntryBytes)),
 		};
 		buffer.push(entry);
 		if (buffer.length >= maxBuffered) {
@@ -188,6 +201,62 @@ export function createLogBuffer(options: LogBufferOptions): LogBuffer {
 
 function isPlainObject(value: Json): value is Record<string, Json | undefined> {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+/**
+ * Deep-sanitizes an arbitrary value logged as `data` into something safe to `JSON.stringify`
+ * and to store in Postgres `jsonb`, without ever throwing (low-priority audit fix (a)):
+ *
+ * - a circular reference becomes the string `"[Circular]"` (JSON.stringify throws a TypeError
+ *   on a genuine cycle; `Serializable<Json>`-typed data can't have one at the type level, but an
+ *   untyped/`any` caller can hand one in);
+ * - a `bigint` becomes its decimal string form (`JSON.stringify` throws a TypeError on it);
+ * - a function or symbol is dropped, the same way `JSON.stringify` silently drops them from a
+ *   plain object (as opposed to substituting `null`, which is what happens *inside an array*, to
+ *   match);
+ * - every string leaf and object key is run through {@link sanitizeString}, so a NUL byte or a
+ *   lone surrogate anywhere in `data` can't fail the `jsonb` insert for the whole batch.
+ *
+ * `value` is typed `Json` (the `TaskLogger` contract), so this is a defensive net for callers
+ * that bypass the type (`any`/plain JS), not something normal, well-typed usage should ever hit.
+ */
+function sanitizeLogData(value: Json, seen: Set<object> = new Set()): Json {
+	if (value === null) return null;
+	if (typeof value === "string") return sanitizeString(value);
+	if (typeof value === "number" || typeof value === "boolean") return value;
+
+	const obj = value as object;
+	if (seen.has(obj)) return "[Circular]";
+	seen.add(obj);
+	try {
+		if (Array.isArray(obj)) {
+			return (obj as readonly Json[]).map(item => sanitizeLogArrayItem(item, seen));
+		}
+		const result: Record<string, Json | undefined> = {};
+		for (const [key, item] of Object.entries(obj as Record<string, unknown>)) {
+			const sanitizedItem = sanitizeLogValue(item, seen);
+			if (sanitizedItem === undefined) continue; // dropped: function/symbol, like JSON.stringify
+			result[sanitizeString(key)] = sanitizedItem;
+		}
+		return result;
+	} finally {
+		seen.delete(obj);
+	}
+}
+
+/** Any value reachable inside logged `data`, not just what `Json` itself allows (see above). */
+function sanitizeLogValue(value: unknown, seen: Set<object>): Json | undefined {
+	if (value === undefined || typeof value === "function" || typeof value === "symbol") {
+		return undefined;
+	}
+	if (typeof value === "bigint") return value.toString();
+	return sanitizeLogData(value as Json, seen);
+}
+
+/** Same as {@link sanitizeLogValue}, but for an array element: `undefined`/dropped -> `null`. */
+function sanitizeLogArrayItem(value: unknown, seen: Set<object>): Json {
+	const sanitized = sanitizeLogValue(value, seen);
+	return sanitized === undefined ? null : sanitized;
 }
 
 /** `NewLogEntry.data` is `Json | null` (no `undefined`); `truncateLogData` may return `undefined`. */

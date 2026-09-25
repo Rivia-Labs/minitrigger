@@ -272,7 +272,8 @@ export async function markCanceled(
 /**
  * Locks and cancels descendants level by level (ORDER BY id FOR UPDATE per level), walking
  * through terminal nodes too. The first level is either the children of `rootIds`
- * (`parent_run_id`) or the children attached to a waitpoint (`parent_waitpoint_id`). Parent
+ * (`parent_run_id`) or the NON-TERMINAL children attached to a waitpoint (`parent_waitpoint_id`;
+ * a finished child's tree is left alone). Parent
  * waitpoint resolution is NOT done for these runs: their parents are being canceled/expired.
  */
 export async function cancelDescendants(
@@ -286,13 +287,16 @@ export async function cancelDescendants(
 	const visited = new Set<string>();
 	let level: LockedChildRow[];
 	if ("waitpointId" in start) {
+		// Only the children the expiry actually cancels (still non-terminal) seed the walk: the
+		// descendants of a child that already finished outlive it (audit item 13), as they would
+		// without the timeout. Below that level the walk goes through terminal nodes as usual.
 		level = (
 			await db.query<LockedChildRow>(
 				`SELECT id, task_id, status, queue, enqueue_seq, attempt FROM ${ctx.t("runs")}
 				 WHERE parent_waitpoint_id = $1 ORDER BY id FOR UPDATE`,
 				[start.waitpointId]
 			)
-		).rows;
+		).rows.filter(row => !isTerminal(row.status));
 	} else {
 		start.parentRunIds.forEach(id => visited.add(id));
 		level = await lockChildLevel(db, ctx, start.parentRunIds);

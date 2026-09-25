@@ -30,9 +30,34 @@
  * the lock query, not `connect()`) is the alternative; this module deliberately does not do that.
  */
 
-import { Client } from "pg";
+import { Client, type ClientConfig } from "pg";
 import { ConfigError } from "./errors.js";
 import { validateSqlIdentifier } from "./utils/identifiers.js";
+
+/**
+ * TCP keepalive of the dedicated leader client (audit item c): without it, a half-open socket
+ * (peer gone, no FIN/RST: NAT/firewall drop, VM freeze) is never noticed by an idle client, so the
+ * process keeps believing it is leader while Postgres may still hold the session (and the lock)
+ * until its own `tcp_keepalives_*` fire. First probe after this delay; the OS settings decide the
+ * probe interval/count.
+ */
+export const LEADER_KEEPALIVE_INITIAL_DELAY_MS = 10_000;
+
+/** Default bound of {@link LeaderElector.release}/{@link LeaderElector.close}. */
+export const DEFAULT_LEADER_RELEASE_TIMEOUT_MS = 5_000;
+
+/**
+ * `base` with TCP keepalive on, for the dedicated leader client. The engine should build its
+ * `clientFactory` client from it (e.g. `() => new Client(leaderClientConfig(pool.options))`) or
+ * pass `clientConfig` instead; the `connectionString`/`clientConfig` forms use it already.
+ */
+export function leaderClientConfig(base: ClientConfig): ClientConfig {
+	return {
+		...base,
+		keepAlive: true,
+		keepAliveInitialDelayMillis: LEADER_KEEPALIVE_INITIAL_DELAY_MS,
+	};
+}
 
 /** Minimal logger shape (pino- and console-compatible), structurally the same as `EngineLogger`. */
 export interface LeaderElectorLogger {
@@ -42,18 +67,32 @@ export interface LeaderElectorLogger {
 
 export interface LeaderElectorConfig {
 	/**
-	 * Connection string used to build a dedicated `pg.Client` (`new Client({ connectionString })`).
-	 * Mutually exclusive with `clientFactory` -- give exactly one.
+	 * Connection string used to build a dedicated `pg.Client` (`new Client({ connectionString })`,
+	 * with TCP keepalive, see {@link leaderClientConfig}). Give exactly one of `connectionString`,
+	 * `clientConfig` and `clientFactory`.
 	 */
 	connectionString?: string;
+	/**
+	 * Client config used to build each dedicated client, e.g. `pool.options` when the engine only
+	 * has an injected `pg.Pool`; TCP keepalive is forced on ({@link leaderClientConfig}).
+	 */
+	clientConfig?: ClientConfig;
 	/**
 	 * For callers that only have a `pg.Pool` (e.g. the engine, when `config.postgres` is
 	 * `{ pool }`): a factory that *constructs* (does not connect) a fresh dedicated `Client`, e.g.
 	 * `() => new Client(pool.options)`. This module calls `.connect()` on whatever it returns, and
-	 * calls it again to build a replacement client after a loss. Mutually exclusive with
-	 * `connectionString` -- give exactly one.
+	 * calls it again to build a replacement client after a loss. The factory owns the client's
+	 * config: build it with {@link leaderClientConfig} to get TCP keepalive (prefer `clientConfig`).
 	 */
 	clientFactory?: () => Client;
+	/**
+	 * Bound of {@link LeaderElector.release}/{@link LeaderElector.close} (default
+	 * {@link DEFAULT_LEADER_RELEASE_TIMEOUT_MS}). Past it, the client's socket is destroyed: the
+	 * server then ends the session, which frees the session-level advisory lock.
+	 */
+	releaseTimeoutMs?: number;
+	/** Diagnostics/test hook: called with every dedicated client right after it is built. */
+	onClientCreated?: (client: Client) => void;
 	/** Postgres schema this elector contends leadership of (lock key `(hashtext(schema), 2)`). */
 	schema: string;
 	logger?: LeaderElectorLogger;
@@ -105,17 +144,20 @@ export function createLeaderElector(config: LeaderElectorConfig): LeaderElector 
 	if (config === null || typeof config !== "object") {
 		throw new ConfigError("createLeaderElector: config must be an object");
 	}
-	const { connectionString, clientFactory } = config;
-	if (connectionString === undefined && clientFactory === undefined) {
+	const { connectionString, clientConfig, clientFactory } = config;
+	const sources = [connectionString, clientConfig, clientFactory].filter(v => v !== undefined);
+	if (sources.length === 0) {
 		throw new ConfigError(
 			"createLeaderElector: config must have either connectionString or clientFactory"
 		);
 	}
-	if (connectionString !== undefined && clientFactory !== undefined) {
+	if (sources.length > 1) {
 		throw new ConfigError(
-			"createLeaderElector: config must have only one of connectionString or clientFactory, not both"
+			"createLeaderElector: config must have only one of connectionString, clientConfig or " +
+				"clientFactory, not several"
 		);
 	}
+	const releaseTimeoutMs = config.releaseTimeoutMs ?? DEFAULT_LEADER_RELEASE_TIMEOUT_MS;
 	const schema = validateSqlIdentifier("schema", config.schema);
 	const logger = config.logger;
 	const onAcquire = config.onAcquire;
@@ -126,7 +168,12 @@ export function createLeaderElector(config: LeaderElectorConfig): LeaderElector 
 	let closed = false;
 
 	function makeClient(): Client {
-		return clientFactory ? clientFactory() : new Client({ connectionString });
+		const c = clientFactory
+			? clientFactory()
+			: new Client(leaderClientConfig(clientConfig ?? { connectionString }));
+		const onCreated = config.onClientCreated;
+		if (onCreated) safeCall(() => onCreated(c));
+		return c;
 	}
 
 	function safeCall(fn: (() => void) | undefined): void {
@@ -229,21 +276,52 @@ export function createLeaderElector(config: LeaderElectorConfig): LeaderElector 
 		return leader;
 	}
 
+	/**
+	 * Unlock + end, bounded by `releaseTimeoutMs` (audit item c): on a half-open socket neither
+	 * the unlock query nor `end()` ever completes. Past the bound the socket is destroyed; the
+	 * server then ends the session, which releases the advisory lock anyway.
+	 */
 	async function release(): Promise<void> {
 		if (!client) {
 			leader = false;
 			return;
 		}
 		const c = client;
-		if (leader) {
-			try {
-				await c.query("SELECT pg_advisory_unlock(hashtext($1), 2)", [schema]);
-			} catch (err) {
-				logWarn("failed to unlock during release (client may already be dead)", err);
-			}
-		}
+		const wasLeader = leader;
 		leader = false;
-		await closeClient(c);
+		if (client === c) client = undefined;
+		const graceful = (async () => {
+			if (wasLeader) {
+				try {
+					await c.query("SELECT pg_advisory_unlock(hashtext($1), 2)", [schema]);
+				} catch (err) {
+					logWarn("failed to unlock during release (client may already be dead)", err);
+				}
+			}
+			await closeClient(c);
+		})();
+		let timer: ReturnType<typeof setTimeout> | undefined;
+		const timedOut = await Promise.race([
+			graceful.then(() => false),
+			new Promise<boolean>(resolve => {
+				timer = setTimeout(() => resolve(true), releaseTimeoutMs);
+				timer.unref?.();
+			}),
+		]);
+		clearTimeout(timer);
+		if (timedOut) {
+			logWarn(
+				`leader release did not finish within ${releaseTimeoutMs}ms; destroying the socket`,
+				undefined
+			);
+			try {
+				c.connection.stream.destroy();
+			} catch {
+				// Best-effort: already destroyed.
+			}
+			// The pending query/end settle (rejected/ended) once the socket is gone; nobody awaits.
+			void graceful.catch(() => {});
+		}
 	}
 
 	async function close(): Promise<void> {

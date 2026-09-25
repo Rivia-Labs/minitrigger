@@ -78,6 +78,12 @@ export interface TestClockOptions {
 
 export interface TestEngineConfig
 	extends Pick<EngineConfig, "tasks" | "limits" | "logging" | "logger" | "idempotencyKeyTtl"> {
+	/**
+	 * Only `days` (default 30), for the same idempotency-key TTL check as the real engine
+	 * (`idempotencyKeyTtl` and `trigger({ idempotencyKeyTtl })` must not exceed it). The test
+	 * engine never runs retention sweeps.
+	 */
+	retention?: { days?: number };
 	clock?: TestClockOptions;
 	/**
 	 * Safety net: one drain processing more jobs than this throws (e.g. a task that sleeps in an

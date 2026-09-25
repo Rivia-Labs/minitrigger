@@ -52,21 +52,34 @@ export interface RedisConnections {
 
 const DEDICATED_OPTIONS = { maxRetriesPerRequest: null } as const;
 
-export function createRedisConnections(input: string | { connection: Redis }): RedisConnections {
+export interface RedisConnectionsOptions {
+	/**
+	 * Listener for the `error` events of every connection this lib creates (never attached to an
+	 * injected instance). ioredis reconnects on its own; without a listener it prints each
+	 * connection error to the console ("Unhandled error event").
+	 */
+	onError?: (error: unknown, purpose: DedicatedPurpose | "shared") => void;
+}
+
+export function createRedisConnections(
+	input: string | { connection: Redis },
+	options: RedisConnectionsOptions = {}
+): RedisConnections {
 	const owned: Redis[] = [];
+	const { onError } = options;
+	const track = (conn: Redis, purpose: DedicatedPurpose | "shared"): Redis => {
+		if (onError) conn.on("error", (error: unknown) => onError(error, purpose));
+		owned.push(conn);
+		return conn;
+	};
 
 	if (typeof input === "string") {
 		const url = input;
-		const shared = new Redis(url);
-		owned.push(shared);
+		const shared = track(new Redis(url), "shared");
 
 		return {
 			shared: () => shared,
-			dedicated: () => {
-				const conn = new Redis(url, DEDICATED_OPTIONS);
-				owned.push(conn);
-				return conn;
-			},
+			dedicated: purpose => track(new Redis(url, DEDICATED_OPTIONS), purpose),
 			closeAll: () => closeConnections(owned),
 		};
 	}
@@ -75,24 +88,47 @@ export function createRedisConnections(input: string | { connection: Redis }): R
 
 	return {
 		shared: () => injected,
-		dedicated: () => {
-			const conn = injected.duplicate(DEDICATED_OPTIONS);
-			owned.push(conn);
-			return conn;
-		},
+		dedicated: purpose => track(injected.duplicate(DEDICATED_OPTIONS), purpose),
 		closeAll: () => closeConnections(owned),
 	};
 }
 
+/**
+ * How long a graceful `QUIT` may take before the connection is dropped. With Redis unreachable,
+ * `quit()` would otherwise sit in ioredis' offline queue forever (every dedicated connection has
+ * `maxRetriesPerRequest: null`), and `engine.stop()` with it.
+ */
+export const QUIT_TIMEOUT_MS = 1_000;
+
 /** Best-effort graceful close (falls back to a hard disconnect) of every connection this lib owns. */
 async function closeConnections(connections: Redis[]): Promise<void> {
-	await Promise.all(
-		connections.map(async connection => {
-			try {
-				await connection.quit();
-			} catch {
-				connection.disconnect();
-			}
-		})
-	);
+	await Promise.all(connections.map(connection => closeConnection(connection)));
+}
+
+/**
+ * `QUIT` when the connection is ready, bounded by {@link QUIT_TIMEOUT_MS}; a connection that is
+ * not ready (connecting, reconnecting, already closed) is disconnected at once, since a `QUIT`
+ * would only be queued offline until Redis comes back.
+ */
+export async function closeConnection(
+	connection: Redis,
+	timeoutMs: number = QUIT_TIMEOUT_MS
+): Promise<void> {
+	if (connection.status === "end") return;
+	if (connection.status !== "ready") {
+		connection.disconnect();
+		return;
+	}
+	let timer: ReturnType<typeof setTimeout> | undefined;
+	const timedOut = new Promise<"timeout">(resolve => {
+		timer = setTimeout(() => resolve("timeout"), timeoutMs);
+	});
+	try {
+		const result = await Promise.race([connection.quit(), timedOut]);
+		if (result === "timeout") connection.disconnect();
+	} catch {
+		connection.disconnect();
+	} finally {
+		clearTimeout(timer);
+	}
 }

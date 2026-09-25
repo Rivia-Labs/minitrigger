@@ -267,7 +267,7 @@ export class StepContext {
 		try {
 			validateStepName(userName);
 		} catch (error) {
-			return Promise.reject(this.fatal(error as Error));
+			return rejected(this.fatal(error as Error));
 		}
 		return this.begin(kind, userName, prepare, body);
 	}
@@ -295,7 +295,7 @@ export class StepContext {
 			prepare();
 			reg = this.register(kind, name);
 		} catch (error) {
-			return Promise.reject(error);
+			return rejected(error);
 		}
 		return this.state.trackInFlight(body(reg), name);
 	}
@@ -534,7 +534,7 @@ export class StepContext {
 				typeof tokenOrName.id !== "string" ||
 				typeof tokenOrName.name !== "string"
 			) {
-				return Promise.reject(
+				return rejected(
 					this.fatal(
 						new MinitriggerError(
 							"ctx.step.waitForToken(token): token must be the handle returned by ctx.step.createToken or a token name"
@@ -545,7 +545,7 @@ export class StepContext {
 			try {
 				validateStepName(tokenOrName.name);
 			} catch (error) {
-				return Promise.reject(this.fatal(error as Error));
+				return rejected(this.fatal(error as Error));
 			}
 			name = tokenOrName.name;
 			token = Promise.resolve({ id: tokenOrName.id, name: tokenOrName.name });
@@ -782,6 +782,19 @@ export class StepContext {
 }
 
 function noop(): void {}
+
+/**
+ * A rejected promise already marked handled: a `ctx.step.*` call that fails before starting
+ * (invalid name/arguments, execution suspended/aborted/finished) may never be awaited (e.g.
+ * `void ctx.step.trigger(...)` in a loop that keeps going after a cancel). Without a handler,
+ * Node's default `unhandledRejection` would crash the user's process. Awaiters still see the
+ * rejection; the error itself is already recorded (`fatalError`, suspension or abort).
+ */
+function rejected<T>(error: unknown): Promise<T> {
+	const promise = Promise.reject(error as Error);
+	promise.catch(noop);
+	return promise;
+}
 
 /** `{ id }` output of a `token`/`trigger` step. */
 function idOf(output: Json | null, stepName: string): string {

@@ -77,63 +77,82 @@ export function createScheduleStore(exec: SqlExecutor, ctx: SqlContext): Schedul
 		): Promise<UpsertScheduleResult> {
 			validateScheduleId(input.id);
 			return atomic(exec, async db => {
-				// Lock any existing row first so a concurrent upsert of the same id can't read a
-				// stale "previous" cron/timezone while this one is still in flight.
-				const existing = await db.query<{
-					cron: string;
-					timezone: string | null;
-					source: ScheduleSource;
-				}>(`SELECT cron, timezone, source FROM ${schedules} WHERE id = $1 FOR UPDATE`, [input.id]);
-				const prev = existing.rows[0];
-
-				if (options.requireSourceMatch && prev && prev.source !== input.source) {
-					// Fix 4: a declarative sync must not clobber an `api` row with the same id and
-					// vice-versa. Still holding the row lock from the SELECT above, but writing
-					// nothing: report the conflict and let the caller (`src/schedules.ts`) decide.
-					const { rows: currentRows } = await db.query<ScheduleRow>(
-						`SELECT ${SCHEDULE_COLUMNS} FROM ${schedules} WHERE id = $1`,
+				// Audit item (b): a missing row can't be locked, so two concurrent upserts of a NEW
+				// id both see "no row". The insert is therefore `ON CONFLICT DO NOTHING`: when a
+				// concurrent insert won (this statement waits for it and then inserts nothing), loop
+				// and take the existing-row path under `FOR UPDATE`, where the source guard and the
+				// cron/timezone comparison see the committed row. Never `xmax` (see the contract).
+				for (let attempt = 0; attempt < 3; attempt++) {
+					const existing = await db.query<ScheduleRow>(
+						`SELECT ${SCHEDULE_COLUMNS} FROM ${schedules} WHERE id = $1 FOR UPDATE`,
 						[input.id]
 					);
-					const current = currentRows[0];
-					if (!current) throw new Error("schedules upsert: row disappeared under FOR UPDATE");
+					const prev = existing.rows[0];
+
+					if (!prev) {
+						const { rows } = await db.query<ScheduleRow>(
+							`INSERT INTO ${schedules}
+							   (id, task_id, cron, timezone, payload, source, created_at, updated_at)
+							 VALUES ($1, $2, $3, $4, $5::jsonb, $6, now(), now())
+							 ON CONFLICT (id) DO NOTHING
+							 RETURNING ${SCHEDULE_COLUMNS}`,
+							[
+								input.id,
+								input.taskId,
+								input.cron,
+								input.timezone,
+								jsonParam(input.payload),
+								input.source,
+							]
+						);
+						const row = rows[0];
+						if (!row) continue; // A concurrent upsert created it first: re-read it locked.
+						return {
+							schedule: mapSchedule(row),
+							created: true,
+							cronChanged: true,
+							timezoneChanged: true,
+						};
+					}
+
+					if (options.requireSourceMatch && prev.source !== input.source) {
+						// Fix 4: a declarative sync must not clobber an `api` row with the same id and
+						// vice-versa. Still holding the row lock, writing nothing: report the conflict
+						// and let the caller (`src/schedules.ts`) decide.
+						return {
+							schedule: mapSchedule(prev),
+							created: false,
+							cronChanged: false,
+							timezoneChanged: false,
+							conflict: { existingSource: prev.source },
+						};
+					}
+
+					const { rows } = await db.query<ScheduleRow>(
+						`UPDATE ${schedules}
+						 SET task_id = $2, cron = $3, timezone = $4, payload = $5::jsonb, source = $6,
+						     updated_at = now()
+						 WHERE id = $1
+						 RETURNING ${SCHEDULE_COLUMNS}`,
+						[
+							input.id,
+							input.taskId,
+							input.cron,
+							input.timezone,
+							jsonParam(input.payload),
+							input.source,
+						]
+					);
+					const row = rows[0];
+					if (!row) throw new Error("schedules upsert: row disappeared under FOR UPDATE");
 					return {
-						schedule: mapSchedule(current),
+						schedule: mapSchedule(row),
 						created: false,
-						cronChanged: false,
-						timezoneChanged: false,
-						conflict: { existingSource: prev.source },
+						cronChanged: prev.cron !== input.cron,
+						timezoneChanged: prev.timezone !== input.timezone,
 					};
 				}
-
-				const { rows } = await db.query<ScheduleRow>(
-					`INSERT INTO ${schedules} (id, task_id, cron, timezone, payload, source, created_at, updated_at)
-					 VALUES ($1, $2, $3, $4, $5::jsonb, $6, now(), now())
-					 ON CONFLICT (id) DO UPDATE
-					   SET task_id = EXCLUDED.task_id,
-					       cron = EXCLUDED.cron,
-					       timezone = EXCLUDED.timezone,
-					       payload = EXCLUDED.payload,
-					       source = EXCLUDED.source,
-					       updated_at = now()
-					 RETURNING ${SCHEDULE_COLUMNS}`,
-					[
-						input.id,
-						input.taskId,
-						input.cron,
-						input.timezone,
-						jsonParam(input.payload),
-						input.source,
-					]
-				);
-				const row = rows[0];
-				if (!row) throw new Error("schedules upsert returned no row");
-
-				return {
-					schedule: mapSchedule(row),
-					created: !prev,
-					cronChanged: !prev || prev.cron !== input.cron,
-					timezoneChanged: !prev || prev.timezone !== input.timezone,
-				};
+				throw new Error(`schedules upsert: schedule "${input.id}" kept appearing and vanishing`);
 			});
 		},
 

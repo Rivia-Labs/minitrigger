@@ -30,20 +30,21 @@ describe("EngineClient: shared surface of Engine and TestEngine", () => {
 	});
 });
 
-describe("TestEngineConfig: no retention field (L4)", () => {
+describe("TestEngineConfig: only retention.days (audit low d)", () => {
 	const typed = defineTask({
 		id: "typed-result",
 		run: async (_p: null) => ({ ok: true as const }),
 	});
 
-	it("rejects a retention option", () => {
+	it("accepts retention.days (TTL check like the real engine)", () => {
+		createTestEngine({ tasks: [typed], retention: { days: 90 }, idempotencyKeyTtl: "60d" });
+	});
+
+	it("rejects the sweep options the test engine never uses", () => {
 		createTestEngine({
 			tasks: [typed],
-			// @ts-expect-error retention isn't part of TestEngineConfig: the test engine's `-system`
-			// worker never runs real retention sweeps (CLAUDE.md phase 9.2 notes). `days: 30` matches
-			// `resolveConfig`'s own default, so this call itself does not also fail at runtime for
-			// the unrelated reason of `idempotencyKeyTtl` exceeding retention.
-			retention: { days: 30 },
+			// @ts-expect-error the test engine runs no retention sweeps: no intervalMs/batchSize.
+			retention: { days: 30, intervalMs: 1_000 },
 		});
 	});
 });

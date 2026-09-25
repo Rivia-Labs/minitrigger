@@ -483,7 +483,7 @@ describe("RunStore: reconciler queries", () => {
 			`UPDATE ${f.t("runs")} SET run_after = now() - interval '1 minute', enqueue_seq = 4 WHERE id = $1`,
 			[stale.run.id]
 		);
-		const res = await f.runs.listStaleQueued(30_000, 10);
+		const { items: res } = await f.runs.listStaleQueued(30_000, 10);
 		expect(res).toEqual([
 			{
 				runId: stale.run.id,
@@ -507,9 +507,38 @@ describe("RunStore: reconciler queries", () => {
 			   run_after = now() - interval '1 minute' WHERE id = ANY($1::uuid[])`,
 			[[a.owner.runId, b.owner.runId]]
 		);
-		const res = await f.runs.listStaleWaiting(30_000, 10);
+		const { items: res } = await f.runs.listStaleWaiting(30_000, 10);
 		expect(res.map(r => r.runId)).toEqual([a.owner.runId]);
 		expect(res[0]?.seq).toBe(1);
+	});
+
+	it("listStaleQueued's cursor keeps microsecond precision (no loop, no skip within one ms)", async () => {
+		// Sub-millisecond run_after values in DESCENDING id order: a cursor truncated to a JS Date
+		// (ms) would re-return the first row forever or skip the second.
+		const ids = [randomUUID(), randomUUID(), randomUUID()].sort().reverse();
+		for (const [i, id] of ids.entries()) {
+			await f.runs.create(f.newRun({ id }));
+			await f.sql(
+				`UPDATE ${f.t("runs")}
+				 SET run_after = timestamptz '2020-01-01 00:00:00.000100+00' + $2::int * interval '1 microsecond'
+				 WHERE id = $1`,
+				[id, i * 100]
+			);
+		}
+		const seen: string[] = [];
+		let cursor = null;
+		for (let page = 0; page < 10; page++) {
+			const res: Awaited<ReturnType<typeof f.runs.listStaleQueued>> = await f.runs.listStaleQueued(
+				0,
+				1,
+				cursor
+			);
+			seen.push(...res.items.map(r => r.runId));
+			cursor = res.nextCursor;
+			if (!cursor) break;
+		}
+		// A full page of 1 always yields a cursor; the 4th call returns the empty short page.
+		expect(seen).toEqual(ids);
 	});
 
 	it("repairOrphanWaiting resumes waiting runs with run_after NULL and nothing pending", async () => {

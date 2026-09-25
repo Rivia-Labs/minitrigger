@@ -76,7 +76,7 @@ export function createMemoryTransport(options: MemoryTransportOptions): MemoryTr
 	const prefix = validateSqlIdentifier("prefix", options.prefix);
 	const { now } = options;
 	const sysQueue = systemQueueName(prefix);
-	const queueNames = new Set(options.queues.map(q => validateQueueName(q.name)));
+	for (const q of options.queues) validateQueueName(q.name);
 	/** Keyed by `${queue}\0${jobId}`, so a run queue and the system queue never collide. */
 	const table = new Map<string, MemoryJob>();
 	const schedulers = new Map<string, JobSchedulerInfo>();
@@ -126,11 +126,9 @@ export function createMemoryTransport(options: MemoryTransportOptions): MemoryTr
 
 	return {
 		async enqueueRun(input: EnqueueRunInput): Promise<void> {
-			if (!queueNames.has(input.queue)) {
-				throw new ConfigError(
-					`unknown queue "${input.queue}": it is not one of the queues this engine was configured with`
-				);
-			}
+			// Like the BullMQ transport: any valid queue name is accepted (a run of a queue this
+			// process doesn't declare, e.g. during a rolling deploy); an invalid one is a ConfigError.
+			validateQueueName(input.queue);
 			add(
 				"run",
 				input.queue,

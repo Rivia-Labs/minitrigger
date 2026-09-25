@@ -600,7 +600,8 @@ export function defineStoreContractSuite(get: () => StoreHarness): void {
 			const stale = await s().runs.create(newRun());
 			await get().advance(60_000);
 			const fresh = await s().runs.create(newRun());
-			const res = await s().runs.listStaleQueued(30_000, 10);
+			const { items: res, nextCursor } = await s().runs.listStaleQueued(30_000, 10);
+			expect(nextCursor).toBeNull();
 			// Fetched after `advance()`: the SQL store shifts stored `updated_at` back, the memory
 			// store moves its clock forward instead, so only a fresh read is comparable either way.
 			const staleRow = await s().runs.get(stale.run.id);
@@ -627,7 +628,7 @@ export function defineStoreContractSuite(get: () => StoreHarness): void {
 			await sleepStep(b.owner, "nap", 1, 1_000);
 			expect(await s().runs.suspend(b.owner)).toMatchObject({ kind: "waiting_on_waitpoints" });
 			await get().advance(60_000);
-			const res = await s().runs.listStaleWaiting(30_000, 10);
+			const { items: res } = await s().runs.listStaleWaiting(30_000, 10);
 			const aRow = await s().runs.get(a.owner.runId);
 			expect(res).toEqual([
 				{
@@ -640,6 +641,53 @@ export function defineStoreContractSuite(get: () => StoreHarness): void {
 					updatedAt: aRow?.updatedAt,
 				},
 			]);
+		});
+
+		// Audit item 1 (head-of-line blocking): the reconciler pages through stale runs with a keyset
+		// cursor `(run_after, id)` so legitimately queued runs at the top of the page can't hide a
+		// lost enqueue behind them forever.
+		it("listStaleQueued pages with a (run_after, id) cursor and ends with nextCursor null", async () => {
+			const ids: string[] = [];
+			for (let i = 0; i < 5; i++) {
+				ids.push((await s().runs.create(newRun())).run.id);
+				await get().advance(1); // distinct run_after (the memory clock is manual)
+			}
+			await get().advance(60_000);
+			const fresh = await s().runs.create(newRun());
+
+			const p1 = await s().runs.listStaleQueued(30_000, 2);
+			expect(p1.items).toHaveLength(2);
+			expect(p1.nextCursor).not.toBeNull();
+			const p2 = await s().runs.listStaleQueued(30_000, 2, p1.nextCursor);
+			expect(p2.items).toHaveLength(2);
+			expect(p2.nextCursor).not.toBeNull();
+			const p3 = await s().runs.listStaleQueued(30_000, 2, p2.nextCursor);
+			expect(p3.items).toHaveLength(1);
+			expect(p3.nextCursor).toBeNull();
+
+			const seen = [...p1.items, ...p2.items, ...p3.items].map(r => r.runId);
+			expect(seen).toEqual(ids); // oldest run_after first, no duplicates, nothing skipped
+			expect(seen).not.toContain(fresh.run.id);
+			// From the start again (wrap-around): same first page.
+			const again = await s().runs.listStaleQueued(30_000, 2, null);
+			expect(again.items.map(r => r.runId)).toEqual(ids.slice(0, 2));
+		});
+
+		it("listStaleWaiting pages with a (run_after, id) cursor", async () => {
+			const ids: string[] = [];
+			for (let i = 0; i < 3; i++) {
+				const r = await running();
+				await sleepStep(r.owner, "nap", 0, 1_000);
+				expect((await s().runs.suspend(r.owner)).kind).toBe("sleeping");
+				ids.push(r.owner.runId);
+				await get().advance(1);
+			}
+			await get().advance(60_000);
+			const p1 = await s().runs.listStaleWaiting(30_000, 2);
+			expect(p1.items).toHaveLength(2);
+			const p2 = await s().runs.listStaleWaiting(30_000, 2, p1.nextCursor);
+			expect(p2.nextCursor).toBeNull();
+			expect([...p1.items, ...p2.items].map(r => r.runId)).toEqual(ids);
 		});
 
 		it("repairOrphanWaiting resumes waiting runs with run_after NULL and nothing pending", async () => {
@@ -1186,7 +1234,7 @@ export function defineStoreContractSuite(get: () => StoreHarness): void {
 			});
 			expect(await s().runs.acquire(owner.runId, randomUUID(), run.enqueueSeq)).toBeNull();
 			expect(await s().runs.repairOrphanWaiting(10)).toEqual([]);
-			expect(await s().runs.listStaleWaiting(0, 10)).toEqual([]);
+			expect((await s().runs.listStaleWaiting(0, 10)).items).toEqual([]);
 		});
 
 		it("only a future sleep -> sleeping with max(wake_at)", async () => {
@@ -1372,6 +1420,30 @@ export function defineStoreContractSuite(get: () => StoreHarness): void {
 			const [child] = await s().runs.listChildResults(waitpointId);
 			expect(child?.status).toBe("canceled");
 			expect(child?.error?.message).toBe("Parent waitpoint timed out");
+		});
+
+		// Audit item 13: a batch timeout cancels only the still-pending children (and their trees);
+		// descendants of a child that already COMPLETED (e.g. started with `step.trigger`) outlive
+		// it, exactly as when nothing times out.
+		it("expire does not cancel descendants of children that already finished", async () => {
+			const parent = await running({ taskId: "parent" });
+			const { waitpointId, childIds } = await spawn(parent.owner, "batch", 2, "b", 1_000);
+			const doneOwner = await acquire(childIds[0] ?? "");
+			const survivor = await spawn(doneOwner, "trigger", 1, "g");
+			expect((await s().runs.complete(doneOwner, "ok")).kind).toBe("completed");
+			const pendingOwner = await acquire(childIds[1] ?? "");
+			const doomed = await spawn(pendingOwner, "trigger", 1, "g");
+			await s().runs.suspend(parent.owner);
+			await get().advance(2_000);
+
+			const res = await s().waitpoints.expire(waitpointId);
+			if (res.kind !== "expired") throw new Error("expected expired");
+			expect(res.canceledChildren.map(c => c.runId)).toEqual([
+				pendingOwner.runId,
+				doomed.childIds[0],
+			]);
+			expect((await s().runs.get(survivor.childIds[0] ?? ""))?.status).toBe("queued");
+			expect((await s().runs.get(doneOwner.runId))?.status).toBe("completed");
 		});
 
 		it("expire cancels children and times out their own pending waitpoints", async () => {
@@ -1603,6 +1675,84 @@ export function defineStoreContractSuite(get: () => StoreHarness): void {
 				])
 			).rejects.toThrow(/foreign key/);
 			expect(await s().logs.list(owner.runId, { limit: 10 })).toEqual([]);
+		});
+	});
+
+	// -------------------------------------------------------------------------
+	// Audit item 2 (store part): the memory store must reject exactly what Postgres rejects, so
+	// test mode can't pass where production fails, and keep what Postgres keeps.
+	describe("contract: Postgres jsonb/text value semantics", () => {
+		it("jsonb rejects U+0000 in strings and keys (22P05)", async () => {
+			await expect(s().runs.create(newRun({ payload: { a: "x\u0000y" } }))).rejects.toMatchObject({
+				code: "22P05",
+			});
+			await expect(s().runs.create(newRun({ payload: { "k\u0000": 1 } }))).rejects.toMatchObject({
+				code: "22P05",
+			});
+			const { owner } = await running();
+			await expect(
+				s().steps.insertCompleted(owner, {
+					kind: "run",
+					name: "a",
+					seqIndex: 1,
+					output: ["\u0000"],
+				})
+			).rejects.toMatchObject({ code: "22P05" });
+			await expect(s().runs.complete(owner, { nested: { deep: "\u0000" } })).rejects.toMatchObject({
+				code: "22P05",
+			});
+			// A literal backslash-u sequence is just text.
+			const ok = await s().runs.create(newRun({ payload: { a: "\\u0000" } }));
+			expect(ok.run.payload).toEqual({ a: "\\u0000" });
+		});
+
+		it("jsonb rejects lone UTF-16 surrogates in strings and keys (22P02)", async () => {
+			await expect(s().runs.create(newRun({ payload: "\ud800" }))).rejects.toMatchObject({
+				code: "22P02",
+			});
+			await expect(s().runs.create(newRun({ payload: { "\udc00x": 1 } }))).rejects.toMatchObject({
+				code: "22P02",
+			});
+			const pair = await s().runs.create(newRun({ payload: "😀" }));
+			expect(pair.run.payload).toBe("😀");
+		});
+
+		it("a cancel reason with U+0000 is rejected like any jsonb value", async () => {
+			const { owner } = await running();
+			await expect(s().runs.cancel(owner.runId, "bad\u0000reason")).rejects.toMatchObject({
+				code: "22P05",
+			});
+			expect((await s().runs.get(owner.runId))?.status).toBe("running");
+		});
+
+		it("keeps an own __proto__ key in jsonb as a plain data property", async () => {
+			const payload = JSON.parse('{"__proto__":{"polluted":true},"b":2}') as Json;
+			const created = await s().runs.create(newRun({ payload }));
+			for (const value of [created.run.payload, (await s().runs.get(created.run.id))?.payload]) {
+				expect(Object.keys(value as object).sort()).toEqual(["__proto__", "b"]);
+				expect(Object.getPrototypeOf(value)).toBe(Object.prototype);
+				expect(Object.getOwnPropertyDescriptor(value, "__proto__")?.value).toEqual({
+					polluted: true,
+				});
+			}
+			expect(({} as Record<string, unknown>)["polluted"]).toBeUndefined();
+		});
+
+		it("text rejects U+0000 (22021) and stores lone surrogates as U+FFFD", async () => {
+			const { owner } = await running();
+			await expect(
+				s().logs.insertBatch([
+					{ runId: owner.runId, level: "info", message: "a\u0000", data: null },
+				])
+			).rejects.toMatchObject({ code: "22021" });
+			await expect(
+				s().runs.create(newRun({ idempotency: { key: "k\u0000", ttlMs: null } }))
+			).rejects.toMatchObject({ code: "22021" });
+			await s().logs.insertBatch([
+				{ runId: owner.runId, level: "info", message: "a\ud800b", data: null },
+			]);
+			const [log] = await s().logs.list(owner.runId, { limit: 10 });
+			expect(log?.message).toBe("a�b");
 		});
 	});
 

@@ -13,7 +13,8 @@ describe("resolveConfig", () => {
 		const r = resolveConfig(base);
 		expect(r.schema).toBe("minitrigger");
 		expect(r.prefix).toBe("minitrigger");
-		expect(r.poolMax).toBe(10);
+		expect(r.poolMax).toBeUndefined();
+		expect(r.poolConnectionTimeoutMs).toBe(10_000);
 		expect(r.heartbeatIntervalMs).toBe(10_000);
 		expect(r.heartbeatTimeoutMs).toBe(2_000);
 		expect(r.stallTimeoutMs).toBe(60_000);

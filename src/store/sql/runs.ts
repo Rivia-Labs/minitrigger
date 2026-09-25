@@ -10,6 +10,8 @@ import type {
 	RunStatus,
 	RunStore,
 	SerializedError,
+	StaleCursor,
+	StalePage,
 	StepKind,
 	TerminalRunStatus,
 	TriggerChildrenInput,
@@ -170,6 +172,44 @@ export function createRunStore(exec: SqlExecutor, ctx: SqlContext): RunStore {
 				expireJobsToRemove,
 			};
 		});
+	}
+
+	/**
+	 * Reconciler cases 1/2 (audit item 1): keyset page `ORDER BY run_after, id` after `after`.
+	 * The cursor's `run_after` travels as UTC ISO text with microseconds (a JS `Date` would drop
+	 * them and make the page loop or skip rows sharing a millisecond); the ISO form with `Z` parses
+	 * back exactly whatever the session's DateStyle/TimeZone.
+	 */
+	async function listStale(
+		predicate: string,
+		graceMs: number,
+		limit: number,
+		after: StaleCursor | null
+	): Promise<StalePage> {
+		const params: unknown[] = [graceMs, limit];
+		let keyset = "";
+		if (after) {
+			params.push(after.runAfter, after.id);
+			keyset = `AND (r.run_after, r.id) > ($3::timestamptz, $4::uuid)`;
+		}
+		const { rows } = await direct(exec).query<EnqueueRow & { cursor_run_after: string }>(
+			`SELECT r.id, r.task_id, r.queue, r.enqueue_seq, r.status, r.updated_at,
+			   0::float8 AS delay_ms,
+			   to_char(r.run_after AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"')
+			     AS cursor_run_after
+			 FROM ${runs} r
+			 WHERE ${predicate}
+			   AND r.run_after < now() - $1::float8 * interval '1 millisecond'
+			   ${keyset}
+			 ORDER BY r.run_after, r.id LIMIT $2`,
+			params
+		);
+		const last = rows[rows.length - 1];
+		return {
+			items: rows.map(mapEnqueue),
+			nextCursor:
+				rows.length >= limit && last ? { runAfter: last.cursor_run_after, id: last.id } : null,
+		};
 	}
 
 	return {
@@ -527,29 +567,17 @@ export function createRunStore(exec: SqlExecutor, ctx: SqlContext): RunStore {
 			);
 		},
 
-		async listStaleQueued(graceMs, limit) {
-			const { rows } = await direct(exec).query<EnqueueRow>(
-				`SELECT id, task_id, queue, enqueue_seq, status, updated_at, 0::float8 AS delay_ms
-				 FROM ${runs}
-				 WHERE status = 'queued' AND run_after < now() - $1::float8 * interval '1 millisecond'
-				 ORDER BY run_after LIMIT $2`,
-				[graceMs, limit]
-			);
-			return rows.map(mapEnqueue);
+		listStaleQueued(graceMs, limit, after) {
+			return listStale("r.status = 'queued'", graceMs, limit, after ?? null);
 		},
 
-		async listStaleWaiting(graceMs, limit) {
-			const { rows } = await direct(exec).query<EnqueueRow>(
-				`SELECT r.id, r.task_id, r.queue, r.enqueue_seq, r.status, r.updated_at,
-				   0::float8 AS delay_ms
-				 FROM ${runs} r
-				 WHERE r.status = 'waiting'
-				   AND r.run_after < now() - $1::float8 * interval '1 millisecond'
-				   AND NOT ${blockingWaitpointExistsSql(ctx, "r.id")}
-				 ORDER BY r.run_after LIMIT $2`,
-				[graceMs, limit]
+		listStaleWaiting(graceMs, limit, after) {
+			return listStale(
+				`r.status = 'waiting' AND NOT ${blockingWaitpointExistsSql(ctx, "r.id")}`,
+				graceMs,
+				limit,
+				after ?? null
 			);
-			return rows.map(mapEnqueue);
 		},
 
 		repairOrphanWaiting(limit) {

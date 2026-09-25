@@ -166,6 +166,19 @@ describe("Serializable<T> compile-time checks", () => {
 		expectTypeOf<Serializable<{ data: Json[] }>>().toEqualTypeOf<{ data: Json[] }>();
 	});
 
+	it("rejects the bare `object` type (too vague to check structurally)", () => {
+		// @ts-expect-error `object` has no known keys to walk; it used to silently collapse to
+		// `{}`, which structurally accepts anything (see src/utils/serialization.ts).
+		acceptSerializable<object>({ anything: () => {} });
+	});
+
+	it("still accepts a specific interface even though it structurally satisfies `object`", () => {
+		interface Specific {
+			a: string;
+		}
+		acceptSerializable<Specific>({ a: "x" });
+	});
+
 	it("still rejects a Date field on an otherwise Json-shaped object", () => {
 		interface WithDateField {
 			d: Date;

@@ -47,7 +47,12 @@ export function validateQueueName(value: string): string {
 	return value;
 }
 
-/** Validates a `step.*` name (decision 11): non-empty, bounded length, and `#` is reserved. */
+/**
+ * Validates a `step.*` name (decision 11): non-empty, bounded length, and `#` and `:` are
+ * reserved (`#` for internal step names such as `${name}#wait`; `:` separates the components of
+ * the internal `__child:${runId}:${name}[:${i}]` idempotency keys, decision 9, so a name with `:`
+ * could collide with another step's batch child key).
+ */
 export function validateStepName(value: string): string {
 	if (value.length === 0) {
 		throw new ConfigError(
@@ -64,6 +69,12 @@ export function validateStepName(value: string): string {
 		throw new ConfigError(
 			`step name "${echo(value)}" is invalid: "#" is reserved for internal step names ` +
 				'(e.g. "name#wait"); remove it from your step name'
+		);
+	}
+	if (value.includes(":")) {
+		throw new ConfigError(
+			`step name "${echo(value)}" is invalid: ":" is reserved (it separates the parts of ` +
+				'internal child-run keys); use "-" or "/" instead, e.g. "fetch-1" or "fetch/1"'
 		);
 	}
 	return value;

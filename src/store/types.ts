@@ -486,11 +486,19 @@ export interface RunStore {
 
 	// --- Reconciler (Phase 6). `graceMs`/timeouts are compared against DB now(). ---
 
-	/** Case 1: `queued` AND `run_after < now() - grace` => re-enqueue with the CURRENT seq (read-only). */
-	listStaleQueued(graceMs: number, limit: number): Promise<EnqueueRequest[]>;
+	/**
+	 * Case 1: `queued` AND `run_after < now() - grace` => re-enqueue with the CURRENT seq
+	 * (read-only). Keyset pagination `ORDER BY run_after, id` after `after` (exclusive): runs whose
+	 * jobs legitimately exist stay stale, so the reconciler walks past them instead of re-reading
+	 * the first page every tick (head-of-line blocking). `nextCursor` is null on a short page.
+	 */
+	listStaleQueued(graceMs: number, limit: number, after?: StaleCursor | null): Promise<StalePage>;
 
-	/** Case 2: `waiting`, no pending waitpoint, `run_after < now() - grace` => SAME seq (read-only). */
-	listStaleWaiting(graceMs: number, limit: number): Promise<EnqueueRequest[]>;
+	/**
+	 * Case 2: `waiting`, no pending waitpoint, `run_after < now() - grace` => SAME seq (read-only).
+	 * Paginated like {@link listStaleQueued}.
+	 */
+	listStaleWaiting(graceMs: number, limit: number, after?: StaleCursor | null): Promise<StalePage>;
 
 	/**
 	 * Case 3: `waiting`, `run_after IS NULL`, no pending waitpoint. Locks candidates
@@ -521,6 +529,23 @@ export interface RunStore {
 	 * get `parent_*` SET NULL. Returns the number deleted (0 => done).
 	 */
 	deleteFinishedBatch(olderThanMs: number, limit: number): Promise<number>;
+}
+
+/**
+ * Opaque keyset cursor of {@link RunStore.listStaleQueued}/{@link RunStore.listStaleWaiting}: the
+ * last row's `(run_after, id)`. `runAfter` keeps the store's full precision (Postgres
+ * microseconds, as UTC ISO text), which a JS `Date` would truncate. Only pass it back to the store
+ * that produced it.
+ */
+export interface StaleCursor {
+	readonly runAfter: string;
+	readonly id: string;
+}
+
+/** One page of stale runs; `nextCursor` is null when the page was short (the end was reached). */
+export interface StalePage {
+	items: EnqueueRequest[];
+	nextCursor: StaleCursor | null;
 }
 
 /** {@link RunStore} as exposed inside a transaction (no heartbeat: its SET LOCAL would leak). */
@@ -682,7 +707,8 @@ export interface WaitpointStore {
 	 * act only if `status='pending' AND expires_at <= now()`: set `timed_out`; for
 	 * `child_run`/`batch` cancel non-terminal children recursively (as
 	 * {@link RunStore.cancel}, without resolving this waitpoint again, and timing out the
-	 * canceled children's own pending waitpoints); apply the resume rule. Pending with
+	 * canceled children's own pending waitpoints; a child that already finished is left alone
+	 * together with its descendants); apply the resume rule. Pending with
 	 * `expires_at > now()` => `not_due` with the DB-computed remaining delay.
 	 */
 	expire(waitpointId: string): Promise<ExpireWaitpointResult>;

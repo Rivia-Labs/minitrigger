@@ -41,6 +41,10 @@ Atualizado em 2026-09-25. Leia junto com `CLAUDE.md` (decisões e notas de imple
 - Payload de filha não serializável e task filha não registrada continuam retryable (os demais argumentos inválidos de step são fatais).
 - `sideEffects: false` só ajuda bundlers: em Node o `dist/index.js` único é carregado inteiro (inclui o modo de teste).
 
+### Auditoria externa (2026-09-25)
+- 13 achados + itens baixos, todos confirmados e corrigidos (resumo em `CLAUDE.md`, "Auditoria externa"). Único ajuste de decisão: `:` reservado em nomes de step (decisão 11, autorizado pelo dono).
+- Conhecido e não tratado: `{}` como tipo de payload/output passa no `Serializable` (atalho `[T] extends [Json]` evita TS2589).
+
 ### Concluído nesta sessão (2026-09-25)
 - Notificador sem `runs.get` extra por transição (`test/integration/notify-perf.test.ts`).
 - Fase 8: `src/schedules.ts` (API, tick com idempotência por ocorrência e retries, sync declarativo com guarda de `source`, reconciliação bidirecional com tag de schema).

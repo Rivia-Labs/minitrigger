@@ -8,10 +8,11 @@
 
 import { randomUUID } from "node:crypto";
 import type { Redis } from "ioredis";
-import { Client, Pool } from "pg";
+import { Pool } from "pg";
 import {
 	assertTimerMs,
 	assertTtlWithinRetention,
+	DEFAULTS,
 	type EngineConfig,
 	type ResolvedConfig,
 	resolveConfig,
@@ -43,12 +44,14 @@ import {
 	type RunStatusMessage,
 } from "./pubsub.js";
 import { createRedisConnections } from "./queue/connections.js";
-import { systemQueueName } from "./queue/ids.js";
+import { SCHEDULE_TICK_JOB_NAME, systemQueueName } from "./queue/ids.js";
+import { assertRedisReachable } from "./queue/redis-check.js";
 import { createTransport, type Transport } from "./queue/transport.js";
 import { createReconciler } from "./reconciler.js";
-import { buildRegistry, getTask, type Registry } from "./registry.js";
+import { buildRegistry, getTask, type Registry, type ResolvedQueue } from "./registry.js";
 import { createRetention } from "./retention.js";
 import {
+	assertScheduleTickSchema,
 	createReconcileSchedulesHook,
 	createSchedulesApi,
 	type EngineSchedules,
@@ -84,6 +87,10 @@ const DEFAULT_LIST_LIMIT = 20;
  * for the task function right away.
  */
 const IN_FLIGHT_DRAIN_MS = 5_000;
+/** How long `stop()` waits for the re-enqueue of each run it hands back (Redis may be unreachable). */
+const HAND_BACK_ENQUEUE_TIMEOUT_MS = 3_000;
+/** How long `stop()` waits for a running leader tick before releasing leadership. */
+const LEADER_TICK_STOP_TIMEOUT_MS = 5_000;
 /** How long `stop()` waits for pending best-effort status/cancel publishes before closing Redis. */
 const NOTIFY_DRAIN_MS = 2_000;
 const DEFAULT_LOGS_LIMIT = 100;
@@ -613,13 +620,16 @@ export function createEngineCore(
 
 	const runs: EngineRuns = {
 		async get<O>(run: string | RunHandle<O>): Promise<Run<O> | null> {
-			const record = await store.runs.get(runIdOf(run));
+			const runId = runIdOf(run);
+			// Not a UUID: no such run (the SQL cast would throw instead), like logs/steps/tokens.
+			if (!isUuid(runId)) return null;
+			const record = await store.runs.get(runId);
 			return record ? toPublicRun<O>(record) : null;
 		},
 
 		async list(options: ListRunsOptions = {}): Promise<RunList> {
 			const result = await store.runs.list({
-				limit: options.limit ?? DEFAULT_LIST_LIMIT,
+				limit: validLimit("runs.list", options.limit, DEFAULT_LIST_LIMIT),
 				...(options.taskId !== undefined ? { taskId: options.taskId } : {}),
 				...(options.status !== undefined ? { status: options.status } : {}),
 				...(options.createdFrom !== undefined ? { createdFrom: options.createdFrom } : {}),
@@ -630,7 +640,9 @@ export function createEngineCore(
 		},
 
 		async cancel(run: string | RunHandle<unknown>): Promise<CancelRunOutcome> {
-			const result = await store.runs.cancel(runIdOf(run), "canceled via engine.runs.cancel()");
+			const runId = runIdOf(run);
+			if (!isUuid(runId)) return "not_found";
+			const result = await store.runs.cancel(runId, "canceled via engine.runs.cancel()");
 			if (result.kind !== "canceled") return result.kind;
 
 			// Aborts local executions and publishes the cancel for the other processes' (pub/sub).
@@ -643,19 +655,28 @@ export function createEngineCore(
 		async replay<O>(run: string | RunHandle<O>): Promise<RunHandle<O>> {
 			assertNotStopped();
 			const runId = runIdOf(run);
-			const record = await store.runs.get(runId);
+			const record = isUuid(runId) ? await store.runs.get(runId) : null;
 			if (!record) throw new MinitriggerError(`run ${runId} not found`);
 			const task = getTask(registry, record.taskId);
 			return createRun(task, record.payload, 0, undefined);
 		},
 
 		async logs(run, options = {}): Promise<RunLogPage> {
-			const limit = clampLimit(options.limit ?? DEFAULT_LOGS_LIMIT, MAX_LOGS_LIMIT);
+			const limit = clampLimit(
+				validLimit("runs.logs", options.limit, DEFAULT_LOGS_LIMIT),
+				MAX_LOGS_LIMIT
+			);
+			const afterId = options.afterId;
+			if (afterId != null && (typeof afterId !== "string" || !/^\d{1,19}$/.test(afterId))) {
+				throw new ConfigError(
+					`runs.logs options.afterId must be the \`id\` of a previous log entry (a string of digits), got ${describeOffendingValue(afterId)}`
+				);
+			}
 			const runId = runIdOf(run);
-			if (!UUID_PATTERN.test(runId)) return { items: [], nextAfterId: null };
+			if (!isUuid(runId)) return { items: [], nextAfterId: null };
 			const entries = await store.logs.list(runId, {
 				limit,
-				...(options.afterId != null ? { afterId: options.afterId } : {}),
+				...(afterId != null ? { afterId } : {}),
 			});
 			const items = entries.map(
 				(e): RunLogEntry => ({
@@ -839,9 +860,17 @@ export function createEngine(config: EngineConfig): Engine {
 	validateTasks(registry, resolved);
 
 	const ownsPool = typeof resolved.postgres === "string";
+	const allQueues = Array.from(registry.queues.values());
 	const pool =
 		typeof resolved.postgres === "string"
-			? new Pool({ connectionString: resolved.postgres, max: resolved.poolMax })
+			? new Pool({
+					connectionString: resolved.postgres,
+					// Low (b): sized by the README guide unless given, and a bounded wait for a free
+					// connection, so a heartbeat on a saturated pool fails with a warn (decision 6)
+					// instead of waiting forever.
+					max: resolved.poolMax ?? recommendedPoolMax(allQueues),
+					connectionTimeoutMillis: resolved.poolConnectionTimeoutMs,
+				})
 			: resolved.postgres.pool;
 	if (ownsPool) {
 		// An idle client error would otherwise crash the process (unhandled "error" event).
@@ -849,13 +878,17 @@ export function createEngine(config: EngineConfig): Engine {
 	}
 
 	const store: Store = createSqlStore(pool, resolved.schema);
-	const connections = createRedisConnections(resolved.redis);
+	const connections = createRedisConnections(resolved.redis, {
+		onError: (error, purpose) =>
+			logger.debug({ err: error, purpose }, "redis connection error (ioredis reconnects)"),
+	});
 	const transport: Transport = createTransport({
 		prefix: resolved.prefix,
 		connections,
 		queues: Array.from(registry.queues.values()),
 		systemConcurrency: resolved.systemConcurrency,
 		schema: resolved.schema,
+		logger,
 	});
 
 	/** Set synchronously by `stop()`; `executeRun` hands back any run it acquires after that. */
@@ -871,6 +904,8 @@ export function createEngine(config: EngineConfig): Engine {
 	}
 
 	const streams = createStreams({ redis: connections.shared(), prefix: resolved.prefix });
+	/** The pub/sub subscriber connection, once created (disconnected directly by `stop()`). */
+	let subscriberConnection: Redis | undefined;
 	/** Dedicated connections of the open `runs.readStream` iterations (disconnected on `stop()`). */
 	const streamReaders = new Set<Redis>();
 
@@ -910,11 +945,9 @@ export function createEngine(config: EngineConfig): Engine {
 			}),
 			createPubSub() {
 				const subscriber = connections.dedicated("subscriber");
-				// ioredis reconnects (and re-subscribes) on its own; without a listener it prints
-				// every connection error to the console.
-				subscriber.on("error", (error: unknown) =>
-					logger.debug({ err: error }, "pub/sub subscriber connection error")
-				);
+				// Its connection errors go to `logger.debug` (`createRedisConnections`' `onError`);
+				// ioredis reconnects and re-subscribes on its own.
+				subscriberConnection = subscriber;
 				return createPubSub({
 					publisher: connections.shared(),
 					subscriber,
@@ -987,6 +1020,41 @@ export function createEngine(config: EngineConfig): Engine {
 	let lastRetentionWindow: number | undefined;
 	/** Every `executeRun` call still in progress (from the acquire to its last enqueue). */
 	const inFlight = new Set<Promise<void>>();
+	/** Aborted by `stop()`: ends a retention sweep between batches (low item c). */
+	const shutdownController = new AbortController();
+	/** Undoes the `onCancel` registration of a `start()` that failed after it. */
+	let offCancel: (() => void) | undefined;
+
+	const dispatchSystem = createSystemDispatcher({
+		config: resolved,
+		store,
+		transport,
+		active,
+		notify: notifier,
+		runRetention: () => retention.runOnce(shutdownController.signal),
+		registry,
+	});
+	/**
+	 * Audit item 8: a `schedule-tick` tagged with another schema (two schemas sharing this prefix)
+	 * is refused before the tick handler could create a run here or remove the other schema's
+	 * scheduler; the throw lets BullMQ retry it, possibly on the owning engine's worker.
+	 */
+	const processSystem: typeof dispatchSystem = async (name, data, job) => {
+		if (name === SCHEDULE_TICK_JOB_NAME) {
+			const scheduleId =
+				typeof job.repeatJobKey === "string" ? job.repeatJobKey : String(job.id ?? "");
+			try {
+				assertScheduleTickSchema(data, resolved.schema, scheduleId);
+			} catch (error) {
+				logger.error(
+					{ err: error, scheduleId, schema: resolved.schema },
+					"schedule tick of another schema sharing this prefix refused (nothing created or removed)"
+				);
+				throw error;
+			}
+		}
+		return dispatchSystem(name, data, job);
+	};
 
 	function start(options: StartOptions = {}): Promise<void> {
 		try {
@@ -1005,6 +1073,7 @@ export function createEngine(config: EngineConfig): Engine {
 			// `engine.migrate()` first, and the thrown `ConfigError` says so).
 			// `checkEnvironment` itself calls `logger.warn` per warning; nothing else to do with the
 			// returned report here.
+			await assertRedisReachable(connections.shared());
 			await checkEnvironment({
 				pool,
 				redis: connections.shared(),
@@ -1012,30 +1081,12 @@ export function createEngine(config: EngineConfig): Engine {
 				logger,
 				autoMigrate: false,
 			});
+			await claimPrefix();
+			warnPoolSizing(options.queues);
 
-			// On failure `startWorkers` closes whatever workers it already created.
-			await transport.startWorkers({
-				...(options.queues ? { queues: options.queues } : {}),
-				processRun: async (_queue, data) => {
-					const execution = executeRun(deps, { runId: data.runId, seq: data.seq });
-					inFlight.add(execution);
-					try {
-						await execution;
-					} finally {
-						inFlight.delete(execution);
-					}
-				},
-				processSystem: createSystemDispatcher({
-					config: resolved,
-					store,
-					transport,
-					active,
-					notify: notifier,
-					runRetention: () => retention.runOnce(),
-					registry,
-				}),
-			});
-
+			// Item 11: everything that can fail runs BEFORE the workers start, so a failed start()
+			// leaves no worker behind and can be retried. The declarative sync only needs the
+			// `-system` Queue (ticks produced meanwhile wait for the worker).
 			// Phase 8, decision 21: create/update every `defineTask({ schedule })` in Postgres + BullMQ.
 			await syncDeclarativeSchedules({
 				store,
@@ -1046,9 +1097,33 @@ export function createEngine(config: EngineConfig): Engine {
 				pruneDeclarative: resolved.schedules.pruneDeclarative,
 			});
 
+			// Subscribed before the workers, so a cancel published for a run acquired right away is
+			// not missed. `ready` never rejects.
 			const ps = core.getPubSub();
-			ps.onCancel(abortLocal);
+			offCancel?.();
+			offCancel = ps.onCancel(abortLocal);
 			await ps.ready;
+
+			try {
+				// On failure `startWorkers` closes whatever workers it already created.
+				await transport.startWorkers({
+					...(options.queues ? { queues: options.queues } : {}),
+					processRun: async (_queue, data) => {
+						const execution = executeRun(deps, { runId: data.runId, seq: data.seq });
+						inFlight.add(execution);
+						try {
+							await execution;
+						} finally {
+							inFlight.delete(execution);
+						}
+					},
+					processSystem,
+				});
+			} catch (error) {
+				offCancel?.();
+				offCancel = undefined;
+				throw error;
+			}
 
 			startLeaderLoop();
 		})();
@@ -1065,11 +1140,73 @@ export function createEngine(config: EngineConfig): Engine {
 		return startPromise;
 	}
 
+	/**
+	 * Audit item 8: a Redis `prefix` belongs to one schema. The `-system` queue (schedule ticks,
+	 * waitpoint expirations, retention) and the task queues are keyed by prefix only, so a second
+	 * schema on the same prefix would consume the first one's jobs. The first `start()` records its
+	 * schema under `${prefix}:owner-schema` (no TTL); a start() with another schema fails. A Redis
+	 * error here only warns (decision 22).
+	 */
+	async function claimPrefix(): Promise<void> {
+		const key = `${resolved.prefix}:owner-schema`;
+		let owner: string | null;
+		try {
+			const redis = connections.shared();
+			const set = await redis.set(key, resolved.schema, "NX");
+			owner = set === "OK" ? resolved.schema : await redis.get(key);
+		} catch (error) {
+			logger.warn(
+				{ err: error, prefix: resolved.prefix },
+				"could not check which schema owns this Redis prefix; skipping the check"
+			);
+			return;
+		}
+		if (owner !== null && owner !== resolved.schema) {
+			throw new ConfigError(
+				`Redis prefix "${resolved.prefix}" is already used by schema "${owner}", not ` +
+					`"${resolved.schema}": each schema needs its own prefix (they share queues and ` +
+					"schedule ticks otherwise). Use another prefix, or, if schema " +
+					`"${owner}" was retired, delete the Redis key "${key}"`
+			);
+		}
+	}
+
+	/**
+	 * Low item (b): warns when the pool is smaller than the README's sizing guide (total worker
+	 * concurrency of the started queues + 5) and, for an injected pool, when it has no
+	 * `connectionTimeoutMillis` (a heartbeat would then wait for a connection without limit instead
+	 * of failing with a warn, decision 6). The engine-created pool is sized and bounded by default.
+	 */
+	function warnPoolSizing(queueFilter: readonly string[] | undefined): void {
+		const started = queueFilter ? allQueues.filter(q => queueFilter.includes(q.name)) : allQueues;
+		const recommended = recommendedPoolMax(started);
+		const poolOptions = pool.options as { max?: number; connectionTimeoutMillis?: number };
+		const max = ownsPool
+			? (resolved.poolMax ?? recommendedPoolMax(allQueues))
+			: (poolOptions.max ?? DEFAULTS.poolMax);
+		if (max < recommended) {
+			logger.warn(
+				{ poolMax: max, recommended, injected: !ownsPool },
+				`postgres pool.max (${max}) is below the total worker concurrency + ` +
+					`${DEFAULTS.poolHeadroom} (${recommended}): runs will wait for connections and ` +
+					"heartbeats may fail; raise pool.max or lower the queues' concurrency"
+			);
+		}
+		if (!ownsPool && !poolOptions.connectionTimeoutMillis) {
+			logger.warn(
+				{},
+				"the injected pg.Pool has no connectionTimeoutMillis: on a saturated pool, heartbeats " +
+					"wait for a connection without limit instead of failing with a warning; set one " +
+					"(e.g. 10000)"
+			);
+		}
+	}
+
 	function startLeaderLoop(): void {
 		leader = createLeaderElector({
 			...(typeof resolved.postgres === "string"
 				? { connectionString: resolved.postgres }
-				: { clientFactory: () => new Client(pool.options) }),
+				: { clientConfig: pool.options }),
 			schema: resolved.schema,
 			logger,
 			onAcquire: () =>
@@ -1149,8 +1286,22 @@ export function createEngine(config: EngineConfig): Engine {
 	async function stopLeaderLoop(): Promise<void> {
 		leaderLoopStopped = true;
 		clearInterval(leaderTimer);
-		await leaderTick;
+		// Bounded (item 7): a tick stuck on an unreachable Redis must not hold `stop()`. Whatever it
+		// still does afterwards is safe (idempotent enqueues, re-checks under row locks); with Redis
+		// down there is nothing to wait for.
+		if (leaderTick) {
+			const tick = leaderTick;
+			const done = await withTimeout(tick, redisReady() ? LEADER_TICK_STOP_TIMEOUT_MS : 0);
+			if (!done) {
+				logger.warn({}, "stop(): the leader tick is still running; releasing leadership anyway");
+			}
+		}
 		await leader?.close();
+	}
+
+	/** Whether the shared Redis connection is up (`stop()` doesn't wait on Redis work when it isn't). */
+	function redisReady(): boolean {
+		return connections.shared().status === "ready";
 	}
 
 	/** Waits (bounded) for every in-flight `executeRun`, including ones that start meanwhile. */
@@ -1195,11 +1346,25 @@ export function createEngine(config: EngineConfig): Engine {
 							updatedAt: result.enqueue.updatedAt,
 							transition: "queued",
 						});
-						await enqueue(deps, result.enqueue);
-						logger.info(
-							{ runId: execution.runId, taskId: execution.taskId },
-							"run handed back to the queue on shutdown"
+						// Bounded (item 7): with Redis unreachable the enqueue could wait for many
+						// reconnection attempts. The run is already `queued` in Postgres; a lost
+						// enqueue is recovered by the reconciler (decision 1).
+						const enqueued = await withTimeout(
+							enqueue(deps, result.enqueue),
+							redisReady() ? HAND_BACK_ENQUEUE_TIMEOUT_MS : 0
 						);
+						if (enqueued) {
+							logger.info(
+								{ runId: execution.runId, taskId: execution.taskId },
+								"run handed back to the queue on shutdown"
+							);
+						} else {
+							logger.warn(
+								{ runId: execution.runId, taskId: execution.taskId },
+								"run released on shutdown but its re-enqueue did not complete in time; the " +
+									"reconciler will re-enqueue it"
+							);
+						}
 					}
 				} catch (error) {
 					logger.error(
@@ -1222,20 +1387,33 @@ export function createEngine(config: EngineConfig): Engine {
 		if (stopPromise) return stopPromise;
 		lifecycle = "stopping";
 		shuttingDown = true;
+		shutdownController.abort();
+		// No new leader tick from now on; the running one is awaited below.
+		leaderLoopStopped = true;
+		clearInterval(leaderTimer);
 		stopPromise = (async () => {
 			try {
 				// A concurrent start() must finish (or fail) first, or its workers would leak.
 				await startPromise?.catch(() => {});
-				await stopLeaderLoop();
+				// Item 6: the workers stop fetching right away (`closeWorkers` first), BEFORE waiting
+				// for the leader tick: otherwise every job fetched meanwhile is acquired, handed back
+				// (`enqueue_seq + 1`) and re-enqueued at once, over and over. The tick is awaited in
+				// `beforeClose`, while the queues it may enqueue into are still open.
 				await transport.closeWorkers({
 					timeoutMs: resolved.shutdownTimeoutMs,
 					beforeClose: async () => {
+						await stopLeaderLoop().catch((error: unknown) =>
+							logger.warn({ err: error }, "error stopping the leader loop")
+						);
 						await handBackActiveRuns();
 						await drainInFlight(IN_FLIGHT_DRAIN_MS);
 						core.endSubscriptions();
 						for (const reader of Array.from(streamReaders)) reader.disconnect();
 						await core.currentPubSub()?.close();
-						await core.drainNotifications(NOTIFY_DRAIN_MS);
+						// Item 7: the subscriber is dedicated to this engine; dropped at once (a QUIT
+						// would wait in ioredis' offline queue while Redis is unreachable).
+						subscriberConnection?.disconnect();
+						if (redisReady()) await core.drainNotifications(NOTIFY_DRAIN_MS);
 					},
 				});
 			} finally {
@@ -1289,6 +1467,46 @@ function isTerminal(status: RunStatus): boolean {
 function clampLimit(limit: number, max: number): number {
 	if (!Number.isFinite(limit)) return max;
 	return Math.min(max, Math.max(1, Math.floor(limit)));
+}
+
+/** `true` if `promise` fulfilled within `ms`, `false` on timeout; rejections propagate. */
+async function withTimeout(promise: Promise<unknown>, ms: number): Promise<boolean> {
+	if (ms <= 0) {
+		promise.catch(() => {});
+		return false;
+	}
+	let timer: ReturnType<typeof setTimeout> | undefined;
+	try {
+		return await Promise.race([
+			promise.then(() => true),
+			new Promise<boolean>(resolve => {
+				timer = setTimeout(() => resolve(false), ms);
+			}),
+		]);
+	} finally {
+		clearTimeout(timer);
+	}
+}
+
+/** README "Pool sizing": total worker concurrency + 5, never below pg's default 10. */
+function recommendedPoolMax(queues: readonly ResolvedQueue[]): number {
+	const concurrency = queues.reduce((sum, q) => sum + q.concurrency, 0);
+	return Math.max(DEFAULTS.poolMax, concurrency + DEFAULTS.poolHeadroom);
+}
+
+function isUuid(value: unknown): value is string {
+	return typeof value === "string" && UUID_PATTERN.test(value);
+}
+
+/** `limit` of `runs.list`/`runs.logs`: `undefined` -> the default; anything but a finite number throws. */
+function validLimit(method: string, limit: unknown, fallback: number): number {
+	if (limit === undefined) return fallback;
+	if (typeof limit !== "number" || !Number.isFinite(limit)) {
+		throw new ConfigError(
+			`${method} options.limit must be a finite number, got ${describeOffendingValue(limit)}`
+		);
+	}
+	return limit;
 }
 
 function runIdOf(run: string | RunHandle<unknown>): string {

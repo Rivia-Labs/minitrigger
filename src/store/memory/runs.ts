@@ -10,6 +10,8 @@ import type {
 	RecoverStalledResult,
 	RunStore,
 	SerializedError,
+	StaleCursor,
+	StalePage,
 	StepKind,
 	TerminalRunStatus,
 	TriggerChildrenInput,
@@ -39,6 +41,8 @@ import {
 	delayMs,
 	keyOf,
 	type MemTx,
+	pgText,
+	pgTextOrNull,
 	type RunRow,
 	sqlLimit,
 	toDate,
@@ -75,8 +79,8 @@ function insertRun(tx: MemTx, input: InsertRun): RunRow {
 	if (tx.db.runs.has(id)) throw uniqueViolation("runs_pkey");
 	const row: RunRow = {
 		id,
-		taskId: input.taskId,
-		queue: input.queue,
+		taskId: pgText(input.taskId),
+		queue: pgText(input.queue),
 		payload: toJsonb(input.payload),
 		status: "queued",
 		output: null,
@@ -89,7 +93,7 @@ function insertRun(tx: MemTx, input: InsertRun): RunRow {
 		runAfter: tx.now + input.delayMs,
 		parentRunId: input.parentRunId,
 		parentWaitpointId: input.parentWaitpointId,
-		parentStepName: input.parentStepName,
+		parentStepName: pgTextOrNull(input.parentStepName),
 		batchIndex: input.batchIndex,
 		startedAt: null,
 		finishedAt: null,
@@ -163,6 +167,37 @@ function finish(
 	};
 }
 
+/** Reconciler cases 1/2: keyset page `ORDER BY run_after, id` after `after` (see the SQL store). */
+function listStale(
+	tx: MemTx,
+	predicate: (r: RunRow) => boolean,
+	graceMs: number,
+	limit: number,
+	after: StaleCursor | null | undefined
+): StalePage {
+	const n = sqlLimit(limit);
+	const afterRunAfter = after ? Number(after.runAfter) : null;
+	const afterId = after ? uuid(after.id) : null;
+	const rows = [...tx.db.runs.values()]
+		.filter(
+			(r): r is RunRow & { runAfter: number } =>
+				r.runAfter !== null && r.runAfter < tx.now - graceMs && predicate(r)
+		)
+		.filter(
+			r =>
+				afterRunAfter === null ||
+				r.runAfter > afterRunAfter ||
+				(r.runAfter === afterRunAfter && afterId !== null && r.id > afterId)
+		)
+		.sort((a, b) => a.runAfter - b.runAfter || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0))
+		.slice(0, n);
+	const last = rows[rows.length - 1];
+	return {
+		items: rows.map(r => ({ ...enqueueOf(r, tx.now), delayMs: 0 })),
+		nextCursor: rows.length >= n && last ? { runAfter: String(last.runAfter), id: last.id } : null,
+	};
+}
+
 export function createRunStore(exec: Exec): RunStore {
 	return {
 		async create(input) {
@@ -196,7 +231,7 @@ export function createRunStore(exec: Exec): RunStore {
 					tx.set(tx.db.waitpoints, id, {
 						id,
 						runId: parentId,
-						stepName: input.stepName,
+						stepName: pgText(input.stepName),
 						kind: input.mode === "batch" ? "batch" : "child_run",
 						status: "pending",
 						pendingCount: input.mode === "batch" ? n : null,
@@ -470,31 +505,19 @@ export function createRunStore(exec: Exec): RunStore {
 			});
 		},
 
-		listStaleQueued(graceMs, limit) {
-			return exec.run(tx =>
-				[...tx.db.runs.values()]
-					.filter(
-						r => r.status === "queued" && r.runAfter !== null && r.runAfter < tx.now - graceMs
-					)
-					.sort((a, b) => (a.runAfter ?? 0) - (b.runAfter ?? 0))
-					.slice(0, sqlLimit(limit))
-					.map(r => ({ ...enqueueOf(r, tx.now), delayMs: 0 }))
-			);
+		listStaleQueued(graceMs, limit, after) {
+			return exec.run(tx => listStale(tx, r => r.status === "queued", graceMs, limit, after));
 		},
 
-		listStaleWaiting(graceMs, limit) {
+		listStaleWaiting(graceMs, limit, after) {
 			return exec.run(tx =>
-				[...tx.db.runs.values()]
-					.filter(
-						r =>
-							r.status === "waiting" &&
-							r.runAfter !== null &&
-							r.runAfter < tx.now - graceMs &&
-							!hasBlockingWaitpoint(tx, r.id)
-					)
-					.sort((a, b) => (a.runAfter ?? 0) - (b.runAfter ?? 0))
-					.slice(0, sqlLimit(limit))
-					.map(r => ({ ...enqueueOf(r, tx.now), delayMs: 0 }))
+				listStale(
+					tx,
+					r => r.status === "waiting" && !hasBlockingWaitpoint(tx, r.id),
+					graceMs,
+					limit,
+					after
+				)
 			);
 		},
 

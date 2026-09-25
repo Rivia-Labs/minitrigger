@@ -67,3 +67,42 @@ function extractPolicy(reply: unknown): string | undefined {
 	}
 	return undefined;
 }
+
+/** How long `start()` waits for Redis to answer a `PING` before failing. */
+export const REDIS_PING_TIMEOUT_MS = 5_000;
+
+/**
+ * Fails fast when Redis doesn't answer a `PING` within `timeoutMs`. With BullMQ's
+ * `maxRetriesPerRequest: null`, commands to an unreachable Redis wait in ioredis' offline queue
+ * forever, so without this `start()` would hang instead of reporting the problem. Unlike the
+ * decision-22 checks, an unreachable Redis is not "a check that can't run": nothing works without
+ * it, so it throws.
+ */
+export async function assertRedisReachable(
+	client: { ping(): Promise<unknown> },
+	timeoutMs = REDIS_PING_TIMEOUT_MS
+): Promise<void> {
+	let timer: ReturnType<typeof setTimeout> | undefined;
+	const timeout = new Promise<"timeout">(resolve => {
+		timer = setTimeout(() => resolve("timeout"), timeoutMs);
+		timer.unref?.();
+	});
+	try {
+		const result = await Promise.race([
+			client.ping().then(
+				() => "ok" as const,
+				(error: unknown) => (error instanceof Error ? error : new Error(String(error)))
+			),
+			timeout,
+		]);
+		if (result === "ok") return;
+		const reason =
+			result === "timeout" ? `no reply to PING within ${timeoutMs} ms` : result.message;
+		throw new ConfigError(
+			`cannot reach Redis (${reason}); check config.redis (host, port, credentials, TLS) and ` +
+				"that Redis is running, then call start() again"
+		);
+	} finally {
+		clearTimeout(timer);
+	}
+}

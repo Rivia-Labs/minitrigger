@@ -22,6 +22,8 @@ import type {
 	EnqueueRequest,
 	RunStatus,
 	SerializedError,
+	StaleCursor,
+	StalePage,
 	Store,
 	WaitpointResolution,
 } from "./store/types.js";
@@ -49,8 +51,17 @@ export interface ReconcilerOptions {
 	graceMs: number;
 	/** A `running` run whose `heartbeat_at` is older than this is considered stalled (case 4). */
 	stallTimeoutMs: number;
-	/** Max rows fetched/processed per case, per {@link Reconciler.runOnce} call. */
+	/** Max rows fetched per query (page size); cases 1/2 may fetch several pages per tick. */
 	batchSize: number;
+	/**
+	 * Cases 1/2 (stale queued/waiting): max pages of `batchSize` walked per {@link
+	 * Reconciler.runOnce} (default {@link DEFAULT_MAX_PAGES_PER_TICK}). Those rows stay stale after
+	 * a re-enqueue (the job may legitimately exist: rate-limited backlog, queue without a worker),
+	 * so each case keeps a `(run_after, id)` cursor across ticks and wraps around after a short
+	 * page: a lost enqueue behind any number of them is reached within
+	 * `ceil(stale / (batchSize * maxPagesPerTick))` ticks.
+	 */
+	maxPagesPerTick?: number;
 	/** Phase 8 hook: bidirectional reconciliation of schedules. Called last, isolated like the rest. */
 	reconcileSchedules?: () => Promise<void>;
 	/**
@@ -65,6 +76,9 @@ export interface ReconcilerOptions {
 	 */
 	onStatusChange?: (info: StalledStatusChange) => void;
 }
+
+/** Default {@link ReconcilerOptions.maxPagesPerTick}. */
+export const DEFAULT_MAX_PAGES_PER_TICK = 10;
 
 export interface StalledReport {
 	/** Recovered with attempts remaining: requeued (`queued`, `attempt + 1`). */
@@ -100,6 +114,29 @@ export function createReconciler(options: ReconcilerOptions): Reconciler {
 		onCanceled,
 		onStatusChange,
 	} = options;
+	const maxPagesPerTick = Math.max(1, options.maxPagesPerTick ?? DEFAULT_MAX_PAGES_PER_TICK);
+	/** Per-case keyset cursors, kept across ticks (per reconciler instance; no global state). */
+	const cursors: { staleQueued: StaleCursor | null; staleWaiting: StaleCursor | null } = {
+		staleQueued: null,
+		staleWaiting: null,
+	};
+
+	/**
+	 * Walks up to `maxPagesPerTick` pages of a stale listing from the case's saved cursor; a short
+	 * page resets the cursor so the next tick starts from the oldest again (wrap-around).
+	 */
+	async function forEachStalePage(
+		caseName: "staleQueued" | "staleWaiting",
+		list: (after: StaleCursor | null) => Promise<StalePage>,
+		fn: (items: readonly EnqueueRequest[]) => Promise<void>
+	): Promise<void> {
+		for (let page = 0; page < maxPagesPerTick; page++) {
+			const { items, nextCursor } = await list(cursors[caseName]);
+			cursors[caseName] = nextCursor;
+			await fn(items);
+			if (!nextCursor) return;
+		}
+	}
 
 	function toEnqueueInput(req: EnqueueRequest): EnqueueRunInput {
 		return { queue: req.queue, runId: req.runId, seq: req.seq, delayMs: req.delayMs };
@@ -152,20 +189,28 @@ export function createReconciler(options: ReconcilerOptions): Reconciler {
 
 	// --- Case 1: queued, run_after < now() - grace -> re-enqueue with the CURRENT seq. ---
 	async function reconcileStaleQueued(report: ReconcileReport): Promise<void> {
-		const items = await store.runs.listStaleQueued(graceMs, batchSize);
-		await forEachItem(items, "staleQueued", report, async item => {
-			await transport.enqueueRun(toEnqueueInput(item));
-			report.staleQueued++;
-		});
+		await forEachStalePage(
+			"staleQueued",
+			after => store.runs.listStaleQueued(graceMs, batchSize, after),
+			items =>
+				forEachItem(items, "staleQueued", report, async item => {
+					await transport.enqueueRun(toEnqueueInput(item));
+					report.staleQueued++;
+				})
+		);
 	}
 
 	// --- Case 2: waiting, no pending waitpoint, run_after < now() - grace -> re-enqueue, SAME seq. ---
 	async function reconcileStaleWaiting(report: ReconcileReport): Promise<void> {
-		const items = await store.runs.listStaleWaiting(graceMs, batchSize);
-		await forEachItem(items, "staleWaiting", report, async item => {
-			await transport.enqueueRun(toEnqueueInput(item));
-			report.staleWaiting++;
-		});
+		await forEachStalePage(
+			"staleWaiting",
+			after => store.runs.listStaleWaiting(graceMs, batchSize, after),
+			items =>
+				forEachItem(items, "staleWaiting", report, async item => {
+					await transport.enqueueRun(toEnqueueInput(item));
+					report.staleWaiting++;
+				})
+		);
 	}
 
 	// --- Case 3: waiting, run_after IS NULL, no pending waitpoint -> repair (store) + enqueue + warn. ---

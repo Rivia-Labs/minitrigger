@@ -446,6 +446,38 @@ export function createReconcileSchedulesHook(deps: ReconcileSchedulesDeps): () =
 // `schedule-tick` handler (`-system` worker, decisions 8, 9, 17)
 // ---------------------------------------------------------------------------
 
+/**
+ * Thrown for a `schedule-tick` job whose schema tag (the job scheduler template's
+ * `data.schema`, see `Transport.upsertJobScheduler`) is not this engine's schema: the tick belongs
+ * to another engine sharing this Redis `prefix` (a misconfiguration, refused by `start()`'s prefix
+ * ownership check). The tick must neither create a run here nor remove the scheduler (its row
+ * lives in the other schema); throwing lets BullMQ retry it (`attempts: 5`), possibly on a worker
+ * of the engine that owns it.
+ */
+export class ScheduleTickSchemaMismatchError extends ConfigError {
+	override name = "ScheduleTickSchemaMismatchError";
+	constructor(scheduleId: string, tickSchema: string, schema: string) {
+		super(
+			`schedule tick "${scheduleId}" belongs to another schema ("${tickSchema}"), not this ` +
+				`engine's ("${schema}"): two schemas share one Redis prefix. Give each schema its own ` +
+				"prefix; nothing was created or removed for this tick"
+		);
+	}
+}
+
+/**
+ * Audit item 8: rejects a `schedule-tick` job tagged with another schema (see
+ * {@link ScheduleTickSchemaMismatchError}). An untagged tick (scheduler created before the tag
+ * existed) passes. Called by the engine before dispatching the tick.
+ */
+export function assertScheduleTickSchema(data: unknown, schema: string, scheduleId: string): void {
+	const tag =
+		data !== null && typeof data === "object" ? (data as { schema?: unknown }).schema : undefined;
+	if (typeof tag === "string" && tag !== schema) {
+		throw new ScheduleTickSchemaMismatchError(scheduleId, tag, schema);
+	}
+}
+
 export interface ProcessScheduleTickDeps {
 	store: Pick<Store, "schedules" | "runs">;
 	transport: Pick<
@@ -460,6 +492,12 @@ export interface ProcessScheduleTickDeps {
 	logger: EngineLogger;
 	/** Best-effort; publishes the created run's status like `engine.trigger` does. */
 	notify?: RunNotifier;
+	/**
+	 * This engine's schema (audit item 8). When set, a scheduler tagged with another schema is
+	 * never removed by the "no row in postgres" self-heal: the tick throws
+	 * {@link ScheduleTickSchemaMismatchError} instead.
+	 */
+	schema?: string;
 }
 
 /**
@@ -501,6 +539,13 @@ export async function processScheduleTick(
 		schedule = await store.schedules.get(scheduleId);
 	}
 	if (!schedule) {
+		if (deps.schema !== undefined) {
+			// The row may live in another schema sharing this prefix: never remove its scheduler.
+			const scheduler = await transport.getJobScheduler(scheduleId);
+			if (scheduler?.schema !== undefined && scheduler.schema !== deps.schema) {
+				throw new ScheduleTickSchemaMismatchError(scheduleId, scheduler.schema, deps.schema);
+			}
+		}
 		try {
 			await transport.removeJobScheduler(scheduleId);
 		} catch (error) {

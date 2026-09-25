@@ -1,4 +1,5 @@
 import { Job, Queue, Worker } from "bullmq";
+import type { EngineLogger } from "../config.js";
 import { ConfigError } from "../errors.js";
 import { validateQueueName, validateSqlIdentifier } from "../utils/identifiers.js";
 import type { RedisConnections } from "./connections.js";
@@ -40,6 +41,13 @@ export interface CreateTransportOptions {
 	 * schema in practice (documented in `README.md`); this tag is a safety net, not a substitute.
 	 */
 	schema?: string;
+	/**
+	 * Receives BullMQ `Queue`/`Worker` `error` events (connection drops, script failures), which
+	 * would otherwise crash the process as unhandled `error` events: `warn` while running
+	 * (throttled per emitter), `debug` once `closeWorkers` started (expected shutdown noise).
+	 * Omitted => those errors are ignored.
+	 */
+	logger?: EngineLogger;
 }
 
 export interface EnqueueRunInput {
@@ -188,6 +196,27 @@ const STALLED_INTERVAL_MS = 30_000;
  */
 const WORKER_CLOSE_GRACE_MS = 2_000;
 
+/** With Redis unreachable, how long `closeWorkers` waits for the `Queue.close()` calls at most. */
+const REDIS_DOWN_CLOSE_BOUND_MS = 250;
+
+/** Resolves when `promise` settles or after `ms`, whichever comes first (never rejects). */
+async function bounded(promise: Promise<unknown>, ms: number): Promise<void> {
+	let timer: ReturnType<typeof setTimeout> | undefined;
+	await Promise.race([
+		promise.then(
+			() => undefined,
+			() => undefined
+		),
+		new Promise<void>(resolve => {
+			timer = setTimeout(resolve, ms);
+		}),
+	]);
+	clearTimeout(timer);
+}
+
+/** Minimum interval between two `warn`s for errors of the same `Queue`/`Worker`. */
+const ERROR_LOG_INTERVAL_MS = 10_000;
+
 /**
  * `schedule-tick` jobs (Phase 8) are the one deliberate exception to decision 4's `attempts: 1`
  * (which is about *run* jobs, not `-system` jobs -- see `CLAUDE.md`, Phase 8 notes): a tick that
@@ -208,27 +237,71 @@ export function createTransport(options: CreateTransportOptions): Transport {
 	const resolvedQueues = options.queues.map(q => ({ ...q, name: validateQueueName(q.name) }));
 	const sysQueueName = systemQueueName(prefix);
 
-	const taskQueues = new Map<string, Queue<RunJobData>>();
-	for (const q of resolvedQueues) {
-		const queue = new Queue<RunJobData>(q.name, { connection: connections.shared(), prefix });
-		silenceUnhandledErrors(queue);
-		taskQueues.set(q.name, queue);
+	const logger = options.logger;
+	/** Set when `closeWorkers` starts: errors after that are expected shutdown noise. */
+	let closing = false;
+
+	/**
+	 * Every `Queue`/`Worker` gets an `error` listener: Node throws for an `error` event with no
+	 * listener. Logged via `logger` (audit item d) instead of silenced: `warn` at most once per
+	 * {@link ERROR_LOG_INTERVAL_MS} per emitter (a Redis outage makes BullMQ emit on every
+	 * reconnect attempt), with the number of suppressed repeats; `debug` while closing.
+	 */
+	function logErrors(
+		emitter: { on(event: "error", listener: (err: Error) => void): unknown },
+		kind: "queue" | "worker",
+		queue: string
+	): void {
+		let lastLoggedAt = 0;
+		let suppressed = 0;
+		emitter.on("error", err => {
+			if (!logger) return;
+			try {
+				if (closing) {
+					logger.debug({ err, queue, kind }, `BullMQ ${kind} error during shutdown`);
+					return;
+				}
+				const now = Date.now();
+				if (now - lastLoggedAt < ERROR_LOG_INTERVAL_MS) {
+					suppressed++;
+					return;
+				}
+				lastLoggedAt = now;
+				const fields = { err, queue, kind, ...(suppressed > 0 ? { suppressed } : {}) };
+				suppressed = 0;
+				logger.warn(fields, `BullMQ ${kind} error on queue "${queue}"`);
+			} catch {
+				// A broken injected logger must never throw from an EventEmitter listener.
+			}
+		});
 	}
+
+	function openTaskQueue(name: string): Queue<RunJobData> {
+		const queue = new Queue<RunJobData>(name, { connection: connections.shared(), prefix });
+		logErrors(queue, "queue", name);
+		taskQueues.set(name, queue);
+		return queue;
+	}
+
+	const taskQueues = new Map<string, Queue<RunJobData>>();
+	for (const q of resolvedQueues) openTaskQueue(q.name);
 	const systemQueue = new Queue(sysQueueName, { connection: connections.shared(), prefix });
-	silenceUnhandledErrors(systemQueue);
+	logErrors(systemQueue, "queue", sysQueueName);
 
 	const workers: Worker[] = [];
 	// Keyed by `${queueLabel}:${jobId}` so a run queue and the system queue can never collide.
 	const activeJobs = new Map<string, StillActiveJob>();
 
+	/**
+	 * The `Queue` handle of a task queue. A queue this process doesn't declare (audit item 10: a
+	 * rolling deploy where the leader still runs the old code and has to re-enqueue runs of a queue
+	 * only the new code knows) gets a producer-only `Queue` on demand, on the same shared
+	 * connection (decision 14: no new connection, nothing to close beyond the `Queue` itself) and
+	 * prefix. It never gets a worker (decision 19: `startWorkers` only covers declared queues).
+	 * The name is validated like a declared one (`ConfigError` otherwise).
+	 */
 	function getTaskQueue(queue: string): Queue<RunJobData> {
-		const q = taskQueues.get(queue);
-		if (!q) {
-			throw new ConfigError(
-				`unknown queue "${queue}": it is not one of the queues this engine was configured with`
-			);
-		}
-		return q;
+		return taskQueues.get(queue) ?? openTaskQueue(validateQueueName(queue));
 	}
 
 	function trackActive<T>(
@@ -263,9 +336,8 @@ export function createTransport(options: CreateTransportOptions): Transport {
 	}
 
 	async function removeRunJob(queue: string, runId: string, seq: number): Promise<void> {
-		const q = taskQueues.get(queue);
-		if (!q) return; // Unknown queue: nothing to remove.
 		try {
+			const q = getTaskQueue(queue);
 			// `Queue.remove` returns 0 (not a throw) for "locked"/"not found"; the
 			// try/catch below is only a safety net for unexpected connection errors.
 			await q.remove(runJobId(runId, seq));
@@ -397,7 +469,7 @@ export function createTransport(options: CreateTransportOptions): Transport {
 						: {}),
 				}
 			);
-			silenceUnhandledErrors(worker);
+			logErrors(worker, "worker", qc.name);
 			workers.push(worker);
 
 			// Global concurrency lives in Redis and outlives this process: a queue that no longer
@@ -424,11 +496,12 @@ export function createTransport(options: CreateTransportOptions): Transport {
 				stalledInterval: STALLED_INTERVAL_MS,
 			}
 		);
-		silenceUnhandledErrors(systemWorker);
+		logErrors(systemWorker, "worker", sysQueueName);
 		workers.push(systemWorker);
 	}
 
 	async function closeWorkers(opts: CloseWorkersOptions): Promise<CloseWorkersResult> {
+		closing = true;
 		// `Worker.close()` stops fetching new jobs immediately and then waits
 		// (unboundedly -- api-notes.md §1.11) for in-flight jobs. Race it
 		// against the deadline instead of forcing it, per decision 20.
@@ -454,20 +527,23 @@ export function createTransport(options: CreateTransportOptions): Transport {
 		if (opts.beforeClose) {
 			await opts.beforeClose(stillActive).catch(() => {});
 		}
-		if (raceResult === timedOut) {
+		// Redis not reachable (engine stopping during an outage): nothing BullMQ does from here on
+		// can complete, so don't wait the close grace out; force-close the workers and bound the
+		// queue closes instead, so `stop()` stays fast.
+		const redisDown = connections.shared().status !== "ready";
+		if (raceResult === timedOut && !redisDown) {
 			// The processors were just released by `beforeClose`: give the workers a short, bounded
 			// chance to finish closing before their connections go away.
-			let graceTimer: ReturnType<typeof setTimeout> | undefined;
-			await Promise.race([
-				settledQuietly,
-				new Promise<void>(resolve => {
-					graceTimer = setTimeout(resolve, WORKER_CLOSE_GRACE_MS);
-				}),
-			]);
-			clearTimeout(graceTimer);
+			await bounded(settledQuietly, WORKER_CLOSE_GRACE_MS);
+		}
+		if (redisDown) {
+			for (const w of workers) void w.close(true).catch(() => {});
 		}
 
-		await Promise.allSettled([...taskQueues.values(), systemQueue].map(q => q.close()));
+		const queueCloses = Promise.allSettled(
+			[...taskQueues.values(), systemQueue].map(q => q.close())
+		);
+		await (redisDown ? bounded(queueCloses, REDIS_DOWN_CLOSE_BOUND_MS) : queueCloses);
 		await connections.closeAll();
 
 		workers.length = 0;
@@ -491,19 +567,4 @@ export function createTransport(options: CreateTransportOptions): Transport {
 		closeWorkers,
 		checkRedis,
 	};
-}
-
-/**
- * `Queue`/`Worker` are `EventEmitter`s that emit `"error"` for connection-level
- * hiccups (e.g. a command racing an in-progress `closeWorkers`/shutdown). Node
- * throws an unhandled exception for an `"error"` event with zero listeners, so
- * every instance this transport creates gets a no-op listener -- these errors
- * are expected background noise around shutdown, not something the transport
- * itself can act on (the processor's own error handling, decision 4/20, is
- * what actually matters for correctness).
- */
-function silenceUnhandledErrors(emitter: {
-	on(event: "error", listener: (err: Error) => void): unknown;
-}): void {
-	emitter.on("error", () => {});
 }

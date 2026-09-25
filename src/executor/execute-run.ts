@@ -195,6 +195,10 @@ async function runAcquired(deps: ExecutorDeps, state: ExecutionState): Promise<v
 		await logger.close();
 		await settle(deps, state, task, outcome, maxDurationMs);
 	} finally {
+		// The attempt is over (terminal write, retry, suspension, release or an unexpected
+		// error): stop whatever user code is still running, e.g. the other steps of a rejected
+		// `Promise.all`, before the next attempt re-runs them. No-op if already aborted.
+		state.abort("finished");
 		clearTimeout(timer);
 		heartbeat.stop();
 		await logger.close();
@@ -407,6 +411,7 @@ async function settle(
 					log.debug(fields, "run canceled while executing");
 					return;
 				case "suspended":
+				case "finished": // only fired after `settle`; listed for exhaustiveness
 					return;
 			}
 			return;
@@ -564,7 +569,7 @@ function ownershipGone(state: ExecutionState): boolean {
 /**
  * `ctx.stream(name, source)` (Phase 7): appends every item of `source` to the Redis Stream
  * `${prefix}:stream:${runId}:${name}` (`XADD MAXLEN ~`), then writes the end marker and sets the
- * key's TTL. Not a step: it is not memoized, so a replay streams again.
+ * key's TTL (also on error or abort, with an error end marker). Not a step: it is not memoized, so a replay streams again.
  */
 async function streamTo(
 	deps: ExecutorDeps,
@@ -576,7 +581,9 @@ async function streamTo(
 		throw new ConfigError("ctx.stream: name must be a non-empty string");
 	}
 	if (!deps.streams) throw new MinitriggerError("ctx.stream is not available in this engine");
-	await deps.streams.pipe(state.runId, name, source);
+	// `ctx.signal` ends the stream (with an error end marker) if the attempt is aborted or
+	// finishes while the source is still producing, so readers never block forever.
+	await deps.streams.pipe(state.runId, name, source, { signal: state.signal });
 }
 
 function onLost(deps: ExecutorDeps, state: ExecutionState): void {

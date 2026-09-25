@@ -13,6 +13,7 @@ import {
 	delayMs,
 	jsonBytes,
 	type MemTx,
+	pgText,
 	type StepRow,
 	toDate,
 	toJsonb,
@@ -49,7 +50,7 @@ export function insertStep(
 	const output = step.output === undefined ? null : toJsonb(step.output);
 	const row: StepRow = {
 		runId: step.runId,
-		name: step.name,
+		name: pgText(step.name),
 		seqIndex: step.seqIndex,
 		kind: step.kind,
 		status: step.status,

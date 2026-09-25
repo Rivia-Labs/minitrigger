@@ -1,6 +1,6 @@
 import type { LogEntry, LogStore } from "../types.js";
 import type { Exec } from "./resolve.js";
-import { cloneJson, fkViolation, type LogRow, sqlLimit, toJsonb, uuid } from "./state.js";
+import { cloneJson, fkViolation, type LogRow, pgText, sqlLimit, toJsonb, uuid } from "./state.js";
 
 export function createLogStore(exec: Exec): LogStore {
 	return {
@@ -19,7 +19,7 @@ export function createLogStore(exec: Exec): LogStore {
 						id: tx.db.logSeq,
 						runId,
 						level: entry.level,
-						message: entry.message,
+						message: pgText(entry.message),
 						data: entry.data === null ? null : toJsonb(entry.data),
 						ts: entry.ts ? entry.ts.getTime() : tx.now,
 					};

@@ -133,10 +133,17 @@ type NormalizePayload<P> = 0 extends 1 & P ? P : unknown extends P ? NoPayload :
 type NoPayload = ReturnType<() => void>;
 
 /**
- * The `(payload, ...rest)` arguments of a trigger-like call: `payload` is optional when the task
- * takes none (`TaskPayload<T>` is `void`/`undefined`), required otherwise.
+ * The `(payload, ...rest)` arguments of a trigger-like call: `payload` is optional whenever
+ * omitting it would still produce a valid `P` -- either the task takes none at all (`P` is
+ * `void`, `NoPayload`) or its `run` itself declares the payload parameter optional (e.g.
+ * `run: (payload?: X, ctx) => ...`, inferring `P = X | undefined`). The old check
+ * (`[P] extends [NoPayload]`) only covered the first case: a task with `payload?: X` still made
+ * `trigger(task)` a compile error ("Expected 2 arguments, but got 1"), forcing a caller to write
+ * `trigger(task, undefined)` even though `P` itself already allows `undefined`. `[undefined]
+ * extends [P]` covers both (bracketed to avoid naked-`P` union distribution, matching this
+ * file's other conditional-type guards).
  */
-export type PayloadArgs<P, Rest extends unknown[]> = [P] extends [NoPayload]
+export type PayloadArgs<P, Rest extends unknown[]> = [undefined] extends [P]
 	? [payload?: P, ...rest: Rest]
 	: [payload: P, ...rest: Rest];
 
@@ -145,10 +152,12 @@ export type TaskOutput<T extends AnyTask> = T extends Task<any, any, infer O> ? 
 
 /**
  * The `payload` field of a trigger-like *options object* (as opposed to `PayloadArgs`'s positional
- * argument list): absent for a task that takes no payload, required and {@link Serializable}-checked
- * otherwise. Used by `engine.schedules.upsert()`'s `ScheduleUpsertInput` (`src/schedules.ts`, fix 5).
+ * argument list): absent for a task that takes no payload, or whose `run` itself declares the
+ * payload parameter optional (same `[undefined] extends [P]` condition as {@link PayloadArgs},
+ * for the same reason); required and {@link Serializable}-checked otherwise. Used by
+ * `engine.schedules.upsert()`'s `ScheduleUpsertInput` (`src/schedules.ts`, fix 5).
  */
-export type TriggerPayloadField<T extends AnyTask> = [TaskPayload<T>] extends [NoPayload]
+export type TriggerPayloadField<T extends AnyTask> = [undefined] extends [TaskPayload<T>]
 	? { payload?: TaskPayload<T> }
 	: { payload: TaskPayload<T> & Serializable<TaskPayload<T>> };
 
@@ -264,7 +273,24 @@ export type StepApi = {
 	run<T>(name: string, fn: (() => T | Promise<T>) & StepReturnGuard<T>): Promise<T>;
 	sleep(name: string, duration: Duration): Promise<void>;
 	createToken(name: string, opts?: { timeout?: Duration }): Promise<TokenHandle>;
-	waitForToken<T = Json>(tokenOrName: TokenHandle | string): Promise<WaitResult<T>>;
+	/**
+	 * `T` (default `Json`, e.g. `waitForToken(name)` with no generic) must be {@link Serializable}:
+	 * the resolved value only ever came from `engine.tokens.complete(id, output)`'s own
+	 * `Serializable`/runtime-checked `output`, so a `T` that isn't `Serializable` (e.g.
+	 * `waitForToken<Date>(name)`) could never actually be produced and would just be a false
+	 * compile-time promise about the result's shape. `T` only appears in the return position, so
+	 * (unlike `step.run`'s `StepReturnGuard`, which guards `fn`) there's no argument to attach an
+	 * intersection guard to; instead a conditional rest parameter is `[]` when `T` is Serializable
+	 * and a one-tuple of an unsatisfiable {@link SerializableError}-branded type otherwise, turning
+	 * a bad `T` into an "Expected 1 argument, but got 2"-shaped compile error at the call site (a
+	 * plain `T extends Serializable<T>` constraint on the type parameter itself would be more
+	 * direct, but TS rejects that self-referential constraint outright: `TS2313: circular
+	 * constraint`, same as `StepReturnGuard`'s own doc comment explains).
+	 */
+	waitForToken<T = Json>(
+		tokenOrName: TokenHandle | string,
+		...guard: [Serializable<T>] extends [T] ? [] : [reason: Serializable<T>]
+	): Promise<WaitResult<T>>;
 	/** The payload is optional for a task that takes none. */
 	trigger<T extends AnyTask>(
 		name: string,

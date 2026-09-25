@@ -87,6 +87,12 @@ the SQL shape it must use. `$schema` is always `escapeIdentifier(schema)`.
   return the ids that had `expires_at` in `expireJobsToRemove` (caller removes `wp-${id}-expire`).
   A later `completeToken` on them is `run_finished` (not `not_pending`/`timed_out`): the run
   status is read under the same `FOR UPDATE` lock.
+- **Postgres value semantics** (both stores): `jsonb` rejects U+0000 in a string or key (SQLSTATE
+  `22P05`) and a lone UTF-16 surrogate (`22P02`, `JSON.stringify` escapes it as `\udXXX`); `text`
+  rejects U+0000 (`22021`) and stores a lone surrogate as U+FFFD (pg encodes strings as UTF-8). An
+  own `__proto__` key in a jsonb object stays a plain data property. The memory store raises errors
+  with the same `code` (`pgError`) through `toJsonb`/`pgText`, so test mode fails where production
+  fails; sanitizing user input is the callers' job (error-format/logger), not the store's.
 - Callers enqueue/remove jobs only **after commit** (jobId `${runId}-${seq}`,
   `wp-${waitpointId}-expire`).
 
@@ -105,8 +111,8 @@ the SQL shape it must use. `$schema` is always `escapeIdentifier(schema)`.
 | `cancel` | 5, 10, Ph6 | Lock root's parent, root, then iteratively `SELECT id FROM runs WHERE parent_run_id = ANY($ids) ORDER BY id FOR UPDATE` (walk through terminal nodes too); non-terminal → `canceled, execution_id NULL, run_after NULL, finished_at now(), error {name:'Canceled', message, retryable:false}`. Then (waitpoint rows last) `UPDATE waitpoints SET status='timed_out', resolved_at=now() WHERE run_id = ANY(canceled ids) AND status='pending' RETURNING id, expires_at IS NOT NULL` → `expireJobsToRemove` (ids with `expires_at`; caller removes `wp-${id}-expire`). Child resolution for the root only. Return root first. |
 | `get`, `list` | Ph2/7 | `list`: `ORDER BY created_at DESC, id DESC`, cursor `(created_at, id) < ($c, $id)`, limit clamped to 100, optional task_id/status (`= ANY`)/created range. |
 | `listChildResults` | 10 | `SELECT id, batch_index, status, output, error FROM runs WHERE parent_waitpoint_id=$1 ORDER BY batch_index`. |
-| `listStaleQueued` | Ph6 #1 | `status='queued' AND run_after < now() - grace` → current seq, delay 0. Read-only. |
-| `listStaleWaiting` | 3, Ph6 #2 | `status='waiting' AND run_after < now() - grace AND NOT EXISTS blocking wp` → same seq, delay 0. |
+| `listStaleQueued` | Ph6 #1 | `status='queued' AND run_after < now() - grace` → current seq, delay 0. Read-only. Keyset page `ORDER BY run_after, id LIMIT n` after the optional cursor (`(run_after, id) > ($c::timestamptz, $id)`); returns `{ items, nextCursor }`, `nextCursor` null on a short page. The cursor's `runAfter` is UTC ISO text with microseconds (`to_char(run_after AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"')`), never a JS `Date` (ms truncation would loop/skip). The reconciler keeps one cursor per case across ticks (bounded pages per tick, wrap-around on a short page) so stale runs whose jobs legitimately exist can't hide a lost enqueue behind them. |
+| `listStaleWaiting` | 3, Ph6 #2 | `status='waiting' AND run_after < now() - grace AND NOT EXISTS blocking wp` → same seq, delay 0. Paginated like `listStaleQueued`. |
 | `repairOrphanWaiting` | Ph6 #3 | tx: candidates `status='waiting' AND run_after IS NULL AND NOT EXISTS blocking wp ... FOR UPDATE SKIP LOCKED LIMIT n`, re-check, resume rule. |
 | `listStalled` / `recoverStalled` | 6, 4 | List ids `status='running' AND heartbeat_at < now() - stall` (partial index). Per run tx: lock parent, lock run, re-check; `attempt < max_attempts` → `queued, attempt+1, error, run_after now(), seq+1`; else `failed` + finished_at + own pending waitpoints `timed_out` (`expireJobsToRemove`) + child resolution. |
 | `deleteFinishedBatch` | Ph6, 10 | `DELETE FROM runs WHERE id IN (SELECT r.id FROM runs r LEFT JOIN runs p ON p.id = r.parent_run_id WHERE r.status IN terminal AND r.finished_at < now() - $age AND (p.id IS NULL OR p.status IN terminal) LIMIT n FOR UPDATE OF r SKIP LOCKED)`. |
@@ -140,7 +146,7 @@ snapshot by `step_name`: the step name for child/batch, the name without `#wait`
 |---|---|---|
 | `createToken` | 10, 11 | One tx: guard; `INSERT waitpoints (kind 'token', status 'pending', expires_at) ON CONFLICT (run_id, step_name) DO NOTHING RETURNING` (conflict → return the existing token's id, `expireDelayMs` only while `pending`; a non-token waitpoint there throws); `INSERT steps (name, kind 'token', completed, {id}) ON CONFLICT (run_id, name) DO NOTHING`. |
 | `completeToken` | 3, 12 | Read run_id; `SELECT ... FROM runs WHERE id FOR UPDATE`; `UPDATE waitpoints SET status='completed', output WHERE id AND kind='token' AND status='pending'`; resume rule. Not updated: `timed_out` token of a terminal run (completed/failed/canceled; status read by the `FOR UPDATE`) → `run_finished`; otherwise `not_pending` with the token status. |
-| `expire` | 10, Ph6 #5 | Lock run FOR UPDATE; read the waitpoint (`status='pending' AND expires_at IS NOT NULL`, else noop); `expires_at > now()` → `not_due` with DB-computed `delayMs` (handler re-delays the job); else for child/batch cancel non-terminal children recursively (cancel's walk, `error.message = WAITPOINT_TIMEOUT_REASON` so the executor maps exactly those to `Timeout`; their parent-waitpoint resolution is a no-op; the caller removes their run jobs and aborts/publishes them), time out the canceled children's own pending waitpoints (→ `expireJobsToRemove`, as `cancel`), `UPDATE waitpoints SET status='timed_out', resolved_at=now()`; resume rule. |
+| `expire` | 10, Ph6 #5 | Lock run FOR UPDATE; read the waitpoint (`status='pending' AND expires_at IS NOT NULL`, else noop); `expires_at > now()` → `not_due` with DB-computed `delayMs` (handler re-delays the job); else for child/batch cancel non-terminal children recursively (cancel's walk seeded ONLY with the still non-terminal children: a child that already finished keeps its descendants, e.g. ones started by `step.trigger`; `error.message = WAITPOINT_TIMEOUT_REASON` so the executor maps exactly those to `Timeout`; their parent-waitpoint resolution is a no-op; the caller removes their run jobs and aborts/publishes them), time out the canceled children's own pending waitpoints (→ `expireJobsToRemove`, as `cancel`), `UPDATE waitpoints SET status='timed_out', resolved_at=now()`; resume rule. |
 | `listExpired` | Ph6 #5 | `status='pending' AND expires_at <= now()` (partial index). |
 | `getToken` | 10 | `SELECT status, output, run_id FROM waitpoints WHERE id=$1`. |
 
@@ -156,7 +162,7 @@ snapshot by `step_name`: the step name for child/batch, the name without `#wait`
 
 | Method | Decision | SQL shape |
 |---|---|---|
-| `upsert` | 8, 21 | One tx: `SELECT cron, timezone FROM schedules WHERE id=$1 FOR UPDATE` (locks any existing row against a concurrent upsert of the same id), then `INSERT ... ON CONFLICT (id) DO UPDATE SET task_id, cron, timezone, payload, source, updated_at=now() RETURNING *`. `created` = no row found by the SELECT; `cronChanged`/`timezoneChanged` compare the new input against that row (both true when `created`). Never `xmax`. |
+| `upsert` | 8, 21 | One tx, loop: `SELECT ... FROM schedules WHERE id=$1 FOR UPDATE`. No row → `INSERT ... ON CONFLICT (id) DO NOTHING RETURNING *`: a row → `created` (all flags true); nothing (a concurrent upsert of the same NEW id committed first; a missing row can't be locked) → loop, the SELECT now locks the committed row. Row → `requireSourceMatch` guard (conflict, no write) else `UPDATE ... SET task_id, cron, timezone, payload, source, updated_at=now() RETURNING *`; `cronChanged`/`timezoneChanged` compare against the locked row. Never `xmax`. |
 | `delete` | 21 | `DELETE FROM schedules WHERE id=$1`; `rowCount > 0`. |
 | `get` | 8 | Plain lookup by `id`. |
 | `list` | 8 | `[WHERE source=$1] ORDER BY id`; `listDeclarative()` = `list({ source: 'declarative' })`. |

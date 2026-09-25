@@ -70,14 +70,16 @@ describe("createStreams()", () => {
 		expect(received).toEqual(["first", "second"]);
 	});
 
-	it("sets an EXPIRE on the stream key only after end()", async () => {
+	it("keeps an EXPIRE on the stream key from the first append (a dead writer's key expires)", async () => {
 		const ttlSeconds = 123;
 		const streams = createStreams({ redis: ns.redis, prefix: ns.prefix, ttlSeconds });
 		const w = streams.writer("run-3", "out");
 		await w.append("x");
 
 		const key = `${ns.prefix}:stream:run-3:out`;
-		expect(await ns.redis.ttl(key)).toBe(-1); // key exists, no TTL yet
+		const beforeEnd = await ns.redis.ttl(key);
+		expect(beforeEnd).toBeGreaterThan(0);
+		expect(beforeEnd).toBeLessThanOrEqual(ttlSeconds);
 
 		await w.end();
 		const ttl = await ns.redis.ttl(key);
@@ -131,5 +133,95 @@ describe("createStreams()", () => {
 		}
 
 		expect(received).toEqual(["a", "b", "c"]);
+	});
+
+	it("pipe() still ends the stream (with an error) and sets the TTL when the source throws", async () => {
+		const ttlSeconds = 77;
+		const streams = createStreams({ redis: ns.redis, prefix: ns.prefix, ttlSeconds });
+
+		async function* source(): AsyncGenerator<string> {
+			yield "a";
+			throw new Error("upstream broke");
+		}
+
+		await expect(streams.pipe("run-6", "err", source())).rejects.toThrow("upstream broke");
+
+		const key = `${ns.prefix}:stream:run-6:err`;
+		const ttl = await ns.redis.ttl(key);
+		expect(ttl).toBeGreaterThan(0);
+		expect(ttl).toBeLessThanOrEqual(ttlSeconds);
+
+		// The reader gets the chunks before the failure, then surfaces the error (no blocking).
+		const reader = dedicatedReader();
+		const received: (string | Json)[] = [];
+		await expect(
+			(async () => {
+				for await (const chunk of streams.read("run-6", "err", { redis: reader, blockMs: 200 })) {
+					received.push(chunk);
+				}
+			})()
+		).rejects.toThrow(/stream "err" of run run-6 ended with an error: Error: upstream broke/);
+		expect(received).toEqual(["a"]);
+
+		// Wire format: the error rides on the usual end marker, so older readers just see an end.
+		const entries = await ns.redis.xrange(key, "-", "+");
+		expect(entries.at(-1)?.[1]).toEqual(["end", "1", "error", "Error: upstream broke"]);
+	});
+
+	it("pipe() stops a source that ignores the abort and ends the stream when the signal fires", async () => {
+		const streams = createStreams({ redis: ns.redis, prefix: ns.prefix });
+		let returned = false;
+		const hanging: AsyncIterable<string> = {
+			[Symbol.asyncIterator]() {
+				let sent = false;
+				return {
+					next: () => {
+						if (!sent) {
+							sent = true;
+							return Promise.resolve({ done: false, value: "first" });
+						}
+						return new Promise<IteratorResult<string>>(() => {}); // never settles
+					},
+					return: () => {
+						returned = true;
+						return Promise.resolve({ done: true, value: undefined });
+					},
+				};
+			},
+		};
+		const controller = new AbortController();
+		const piping = streams.pipe("run-7", "hang", hanging, { signal: controller.signal });
+		await delay(50);
+		controller.abort(new Error("run canceled"));
+		await expect(piping).rejects.toThrow("run canceled");
+		await delay(10);
+		expect(returned).toBe(true);
+
+		const reader = dedicatedReader();
+		const received: (string | Json)[] = [];
+		await expect(
+			(async () => {
+				for await (const chunk of streams.read("run-7", "hang", { redis: reader, blockMs: 200 })) {
+					received.push(chunk);
+				}
+			})()
+		).rejects.toThrow(/ended with an error: Error: run canceled/);
+		expect(received).toEqual(["first"]);
+		expect(await ns.redis.ttl(`${ns.prefix}:stream:run-7:hang`)).toBeGreaterThan(0);
+	});
+
+	it("an end marker without an error field ends the read normally (older writers)", async () => {
+		const streams = createStreams({ redis: ns.redis, prefix: ns.prefix });
+		const key = `${ns.prefix}:stream:run-8:old`;
+		await ns.redis.xadd(key, "*", "data", JSON.stringify("x"));
+		await ns.redis.xadd(key, "*", "end", "1");
+		const received: (string | Json)[] = [];
+		for await (const chunk of streams.read("run-8", "old", {
+			redis: dedicatedReader(),
+			blockMs: 200,
+		})) {
+			received.push(chunk);
+		}
+		expect(received).toEqual(["x"]);
 	});
 });

@@ -9,9 +9,14 @@
  *
  * - a chunk: field `data` holding `JSON.stringify(chunk)` (`chunk` is `string | Json`, so this
  *   round-trips both a bare string and a structured value uniformly);
- * - the end marker (written once, by {@link StreamWriter.end}): field `end` (value `"1"`), no
- *   `data` field. `end()` also sets the key's `EXPIRE` to `ttlSeconds` so a finished stream's
- *   entries don't outlive `retention.days` worth of Postgres state for no reason.
+ * - the end marker (written by {@link StreamWriter.end}): field `end` (value `"1"`), no `data`
+ *   field. When the stream ended because its source threw or the run was aborted, the marker
+ *   also carries an `error` field (the error's `name: message`, truncated); readers that predate
+ *   it simply see an end, newer ones ({@link Streams.read}) throw.
+ *
+ * Every append and the end marker also (re)set the key's `EXPIRE` to `ttlSeconds` (one pipelined
+ * round trip): Redis runs with `noeviction`, so a stream whose writer died (process crash) must
+ * still go away on its own instead of staying forever.
  *
  * `XADD ... MAXLEN ~ maxLen` (approximate trimming, decision-consistent with the reconciler/queue
  * modules preferring `~` over exact `MAXLEN` for O(1) amortized trimming) bounds how much of a
@@ -27,7 +32,8 @@
  * closes what it's given.
  */
 
-import type { Redis } from "ioredis";
+import type { ChainableCommander, Redis } from "ioredis";
+import { MinitriggerError } from "./errors.js";
 import { validateSqlIdentifier } from "./utils/identifiers.js";
 import type { Json } from "./utils/serialization.js";
 
@@ -37,15 +43,30 @@ export interface StreamsOptions {
 	prefix: string;
 	/** `XADD ... MAXLEN ~` cap. Default 10 000. */
 	maxLen?: number;
-	/** `EXPIRE` set on the stream key once {@link StreamWriter.end} runs. Default 86 400 (1 day). */
+	/**
+	 * `EXPIRE` (re)set on the stream key by every append and by {@link StreamWriter.end}.
+	 * Default 86 400 (1 day).
+	 */
 	ttlSeconds?: number;
 }
 
 export interface StreamWriter {
-	/** One `XADD` per call. */
+	/** One `XADD` (+ `EXPIRE`, pipelined) per call. */
 	append(chunk: string | Json): Promise<void>;
-	/** Writes the end marker, then sets the key's `EXPIRE`. Idempotent to call more than once. */
-	end(): Promise<void>;
+	/**
+	 * Writes the end marker (with an `error` field when `error` is given), then sets the key's
+	 * `EXPIRE`. Readers stop at the first end marker.
+	 */
+	end(error?: unknown): Promise<void>;
+}
+
+export interface PipeOptions {
+	/**
+	 * Stops pulling from `source` as soon as it fires (the run was aborted: canceled, timed out,
+	 * lost, finished...): the end marker is written with an error and `pipe` rejects with the
+	 * signal's reason. `source.return()` is called without waiting for it.
+	 */
+	signal?: AbortSignal;
 }
 
 export interface ReadStreamOptions {
@@ -63,13 +84,23 @@ export interface ReadStreamOptions {
 
 export interface Streams {
 	writer(runId: string, name: string): StreamWriter;
-	/** Appends every item of `source` in order, then calls `end()`. */
-	pipe(runId: string, name: string, source: AsyncIterable<string | Json>): Promise<void>;
+	/**
+	 * Appends every item of `source` in order, then writes the end marker. The end marker and the
+	 * key's `EXPIRE` are ALWAYS written, also when `source` throws or `options.signal` fires (then
+	 * with an `error` field, and `pipe` rejects with that error), so readers never block forever.
+	 */
+	pipe(
+		runId: string,
+		name: string,
+		source: AsyncIterable<string | Json>,
+		options?: PipeOptions
+	): Promise<void>;
 	/**
 	 * Reads from the start (`id 0`) until the end marker, an abort, or the caller stops iterating.
 	 * Already-written chunks are yielded immediately; if the writer hasn't called `end()` yet, the
 	 * generator keeps blocking/polling for new chunks ("concurrent reader receives live chunks
-	 * then ends").
+	 * then ends"). An end marker with an `error` field (the writer's source threw or its run was
+	 * aborted) makes the generator throw a {@link MinitriggerError} after the chunks before it.
 	 */
 	read(runId: string, name: string, options: ReadStreamOptions): AsyncIterable<string | Json>;
 }
@@ -77,6 +108,8 @@ export interface Streams {
 const DEFAULT_MAX_LEN = 10_000;
 const DEFAULT_TTL_SECONDS = 86_400;
 const DEFAULT_BLOCK_MS = 5_000;
+/** Max characters of the error text stored in an end marker. */
+const MAX_END_ERROR_LENGTH = 1_000;
 
 export function createStreams(options: StreamsOptions): Streams {
 	const { redis } = options;
@@ -92,11 +125,21 @@ export function createStreams(options: StreamsOptions): Streams {
 		const streamKey = key(runId, name);
 		return {
 			async append(chunk) {
-				await redis.xadd(streamKey, "MAXLEN", "~", maxLen, "*", "data", JSON.stringify(chunk));
+				await exec(
+					redis
+						.pipeline()
+						.xadd(streamKey, "MAXLEN", "~", maxLen, "*", "data", JSON.stringify(chunk))
+						.expire(streamKey, ttlSeconds)
+				);
 			},
-			async end() {
-				await redis.xadd(streamKey, "MAXLEN", "~", maxLen, "*", "end", "1");
-				await redis.expire(streamKey, ttlSeconds);
+			async end(error?: unknown) {
+				const fields = error === undefined ? ["end", "1"] : ["end", "1", "error", errorText(error)];
+				await exec(
+					redis
+						.pipeline()
+						.xadd(streamKey, "MAXLEN", "~", maxLen, "*", ...fields)
+						.expire(streamKey, ttlSeconds)
+				);
 			},
 		};
 	}
@@ -104,11 +147,29 @@ export function createStreams(options: StreamsOptions): Streams {
 	async function pipe(
 		runId: string,
 		name: string,
-		source: AsyncIterable<string | Json>
+		source: AsyncIterable<string | Json>,
+		pipeOptions?: PipeOptions
 	): Promise<void> {
+		const signal = pipeOptions?.signal;
 		const w = writer(runId, name);
-		for await (const chunk of source) {
-			await w.append(chunk);
+		const iterator = source[Symbol.asyncIterator]();
+		try {
+			while (true) {
+				signal?.throwIfAborted();
+				const next = await nextOrAbort(iterator, signal);
+				if (next.done === true) break;
+				await w.append(next.value);
+			}
+		} catch (error) {
+			// Stop the source (it may ignore this or hang: never awaited), end the stream with the
+			// error so readers stop, and still report the original error to the caller.
+			if (typeof iterator.return === "function") {
+				Promise.resolve()
+					.then(() => iterator.return?.())
+					.catch(() => {});
+			}
+			await w.end(error).catch(() => {});
+			throw error;
 		}
 		await w.end();
 	}
@@ -139,7 +200,12 @@ export function createStreams(options: StreamsOptions): Streams {
 			for (const [id, fields] of entries) {
 				lastId = id;
 				const parsed = parseEntry(fields);
-				if (parsed.kind === "end") return;
+				if (parsed.kind === "end") {
+					if (parsed.error === undefined) return;
+					throw new MinitriggerError(
+						`stream "${name}" of run ${runId} ended with an error: ${parsed.error}`
+					);
+				}
 				if (parsed.kind === "data") yield parsed.value;
 				// "skip": an entry that's neither shape this module writes; ignore defensively.
 			}
@@ -149,7 +215,10 @@ export function createStreams(options: StreamsOptions): Streams {
 	return { writer, pipe, read };
 }
 
-type ParsedEntry = { kind: "end" } | { kind: "data"; value: string | Json } | { kind: "skip" };
+type ParsedEntry =
+	| { kind: "end"; error: string | undefined }
+	| { kind: "data"; value: string | Json }
+	| { kind: "skip" };
 
 function parseEntry(fields: string[]): ParsedEntry {
 	const map = new Map<string, string>();
@@ -158,7 +227,7 @@ function parseEntry(fields: string[]): ParsedEntry {
 		const value = fields[i + 1];
 		if (field !== undefined && value !== undefined) map.set(field, value);
 	}
-	if (map.has("end")) return { kind: "end" };
+	if (map.has("end")) return { kind: "end", error: map.get("error") };
 	const data = map.get("data");
 	if (data === undefined) return { kind: "skip" };
 	try {
@@ -166,6 +235,49 @@ function parseEntry(fields: string[]): ParsedEntry {
 	} catch {
 		return { kind: "skip" };
 	}
+}
+
+/** Runs a pipeline and rethrows the first command error (a pipeline never rejects on its own). */
+async function exec(pipeline: ChainableCommander): Promise<void> {
+	const results = (await pipeline.exec()) ?? [];
+	for (const [error] of results) {
+		if (error) throw error;
+	}
+}
+
+/** `name: message` of what ended a stream, bounded. */
+function errorText(error: unknown): string {
+	const text =
+		error instanceof Error || error instanceof DOMException
+			? `${error.name}: ${error.message}`
+			: String(error);
+	return text.length > MAX_END_ERROR_LENGTH ? `${text.slice(0, MAX_END_ERROR_LENGTH)}…` : text;
+}
+
+/**
+ * `iterator.next()` raced against `signal`: an abort rejects right away with the signal's reason,
+ * without waiting for a source that ignores it.
+ */
+function nextOrAbort<T>(
+	iterator: AsyncIterator<T>,
+	signal: AbortSignal | undefined
+): Promise<IteratorResult<T>> {
+	const next = iterator.next();
+	if (!signal) return next;
+	return new Promise((resolve, reject) => {
+		const onAbort = (): void => reject(signal.reason);
+		signal.addEventListener("abort", onAbort, { once: true });
+		next.then(
+			result => {
+				signal.removeEventListener("abort", onAbort);
+				resolve(result);
+			},
+			(error: unknown) => {
+				signal.removeEventListener("abort", onAbort);
+				reject(error);
+			}
+		);
+	});
 }
 
 type AbortRace<T> = { aborted: true } | { aborted: false; value: T };

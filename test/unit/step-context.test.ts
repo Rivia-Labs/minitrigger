@@ -440,4 +440,64 @@ describe("StepContext", () => {
 		await Promise.resolve();
 		expect(state.inFlight.size).toBe(0);
 	});
+	describe("rejections of calls that are never awaited are marked handled", () => {
+		/** Collects `unhandledRejection`s raised while `fn` runs (and a few ticks after). */
+		async function unhandledDuring(fn: () => void): Promise<unknown[]> {
+			const seen: unknown[] = [];
+			const listener = (reason: unknown) => seen.push(reason);
+			process.on("unhandledRejection", listener);
+			try {
+				fn();
+				await new Promise(r => setTimeout(r, 20));
+			} finally {
+				process.off("unhandledRejection", listener);
+			}
+			return seen;
+		}
+
+		it("invalid name, after abort, after suspension, invalid token handle", async () => {
+			const invalid = setup();
+			expect(
+				await unhandledDuring(() => {
+					void invalid.step.run("bad#name", () => 1);
+					void invalid.step.trigger("bad:name", {} as never, null as never);
+				})
+			).toEqual([]);
+
+			const aborted = setup();
+			aborted.state.abort("canceled");
+			expect(
+				await unhandledDuring(() => {
+					void aborted.step.run("a", () => 1);
+					void aborted.step.sleep("s", "1s");
+					void aborted.step.waitForToken("tok");
+				})
+			).toEqual([]);
+
+			const suspended = setup();
+			await expect(suspended.step.sleep("s", "1s")).rejects.toBeInstanceOf(SuspendSignal);
+			expect(
+				await unhandledDuring(() => {
+					void suspended.step.run("a", () => 1);
+					void suspended.step.createToken("t");
+				})
+			).toEqual([]);
+
+			const badHandle = setup();
+			expect(
+				await unhandledDuring(() => {
+					void badHandle.step.waitForToken({ id: 1, name: "x" } as never);
+					void badHandle.step.waitForToken({ id: "1", name: "x#y" });
+				})
+			).toEqual([]);
+		});
+
+		it("still rejects for callers that await", async () => {
+			const { step, state } = setup();
+			state.abort("canceled");
+			await expect(step.run("a", () => 1)).rejects.toThrow(/canceled/);
+			const other = setup();
+			await expect(other.step.run("a:b", () => 1)).rejects.toBeInstanceOf(ConfigError);
+		});
+	});
 });

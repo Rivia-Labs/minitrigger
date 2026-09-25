@@ -16,6 +16,7 @@ import {
 import {
 	cloneJson,
 	delayMs,
+	pgText,
 	sqlLimit,
 	toDate,
 	toJsonb,
@@ -55,7 +56,7 @@ export function createWaitpointStore(exec: Exec): WaitpointStore {
 					row = {
 						id,
 						runId,
-						stepName: token.name,
+						stepName: pgText(token.name),
 						kind: "token",
 						status: "pending",
 						pendingCount: null,

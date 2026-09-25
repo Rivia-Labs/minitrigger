@@ -101,6 +101,9 @@ export interface PubSub extends PubSubPublisher {
 	close(): Promise<void>;
 }
 
+/** Bound on the `UNSUBSCRIBE` of {@link PubSub.close}. */
+const UNSUBSCRIBE_TIMEOUT_MS = 1_000;
+
 const defaultLogger: PubSubLogger = {
 	warn: (fields, message) => console.warn(`[minitrigger] ${message}`, fields),
 };
@@ -212,10 +215,22 @@ export function createPubSub(options: PubSubOptions): PubSub {
 			subscriber.off("message", onMessage);
 			cancelHandlers.clear();
 			statusHandlers.clear();
+			// Only on a live connection, and bounded: with Redis unreachable the UNSUBSCRIBE would sit
+			// in ioredis' offline queue forever (dedicated connections retry without limit), hanging
+			// `engine.stop()`. The handlers are already detached; the owner disconnects the connection.
+			if (subscriber.status !== "ready") return;
+			let timer: ReturnType<typeof setTimeout> | undefined;
 			try {
-				await subscriber.unsubscribe(runStatusChannel, cancelChannel);
+				await Promise.race([
+					subscriber.unsubscribe(runStatusChannel, cancelChannel),
+					new Promise<void>(resolve => {
+						timer = setTimeout(resolve, UNSUBSCRIBE_TIMEOUT_MS);
+					}),
+				]);
 			} catch (error) {
 				warn("failed to unsubscribe on close (connection may already be closed)", { error });
+			} finally {
+				clearTimeout(timer);
 			}
 		},
 	};

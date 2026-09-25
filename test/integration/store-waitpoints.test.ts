@@ -391,7 +391,7 @@ describe("RunStore.suspend (decision 3)", () => {
 		});
 		// Reconciler case 3 still sees it only once nothing is pending (run_after stays NULL).
 		expect(await f.runs.repairOrphanWaiting(10)).toEqual([]);
-		expect(await f.runs.listStaleWaiting(0, 10)).toEqual([]);
+		expect((await f.runs.listStaleWaiting(0, 10)).items).toEqual([]);
 	});
 
 	it("only a future sleep -> waiting + enqueue with the DB-computed delay", async () => {

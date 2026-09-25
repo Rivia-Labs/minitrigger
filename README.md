@@ -166,6 +166,8 @@ re-running; code that isn't wrapped in `ctx.step.*` runs again every time. This 
   state) must happen **inside** a step.
 - A step is identified by its **name**, in call order (`seq_index`). If the name recorded on
   replay doesn't match what was saved, the run fails with `NonDeterminismError`.
+- Step names must not contain `#` or `:` (both reserved: `#` for internal step names such as
+  `${name}#wait`, `:` for internal child-run keys); an invalid name fails the run without retry.
 
 ### Steps
 
@@ -383,8 +385,14 @@ for await (const token of engine.runs.readStream<string>(runId, "answer")) proce
   canceled the run; stall recoveries on the leader). Handlers run after the commit, off the run's
   critical path; a throwing or rejecting handler is logged with `logger.error`.
 - `runs.readStream` reads from the start of the stream (so a late reader gets every chunk still
-  kept) and ends at the writer's end marker. Each reader uses its own Redis connection, closed when
-  the iteration ends (or on `stop()`).
+  kept) and ends at the writer's end marker. When the stream ended with an error (the `source`
+  given to `ctx.stream` threw, or the attempt was aborted mid-stream), the iteration **throws** a
+  `MinitriggerError` (with the original `Name: message`) after yielding the chunks written before
+  it. Each reader uses its own Redis connection, closed when the iteration ends (or on `stop()`).
+- Readers stop at the **first** end marker. If a run retries after a stream error, the next
+  attempt's `ctx.stream` with the same name appends to the same stream key, after that marker:
+  a reader starting from the beginning never sees the retry's chunks. Use a per-attempt name
+  (e.g. `` `answer-${ctx.run.attempt}` ``) when a stream must survive retries.
 
 ### Schedules (cron)
 
@@ -395,7 +403,7 @@ await engine.schedules.upsert({
 	task: myTask,
 	cron: "0 9 * * *",      // 5-7 whitespace-separated fields; a 6th "seconds" field is allowed
 	timezone: "America/Belem", // optional IANA zone; omitted = BullMQ's default (UTC-based)
-	payload: { url: "..." },   // optional; must match myTask's payload type, defaults to null
+	payload: { url: "..." },   // required (typed as myTask's payload) unless myTask takes none
 });
 await engine.schedules.delete("daily"); // true if a schedule with this id existed
 await engine.schedules.list();          // every schedule (api + declarative), by id
@@ -458,12 +466,19 @@ rule: it's safe here because the `__schedule:${id}:${scheduledAtMs}` idempotency
 that lands on a process that already succeeded a no-op), so another process (or this one, once the
 deploy finishes) gets a chance to pick up the same tick before it's lost for good.
 
-**`prefix` should be unique per schema.** The internal `${prefix}-system` BullMQ queue is scoped by
-`prefix` alone, not `schema` — two engines with the same `prefix` but different `schema`s would
-share one `-system` queue and could see each other's job schedulers. Every `upsertJobScheduler`
-call tags its job template with the creating engine's `schema`, and the reconciler never deletes a
-scheduler tagged with a different schema even if it has no matching row in this one, as a safety
-net — but treat that as a safety net, not a reason to reuse a `prefix` across schemas on purpose.
+**`prefix` must be unique per schema.** Every Redis structure — the task queues, the internal
+`${prefix}-system` queue (schedule ticks, waitpoint expirations, retention), pub/sub channels and
+streams — is keyed by `prefix` alone, not by `schema`. Two engines with the same `prefix` and
+different `schema`s would consume each other's jobs: a run job acquired against the wrong schema
+is lost until the reconciler re-enqueues it, and a schedule tick processed by the other schema's
+engine used to remove the schedule's BullMQ scheduler. Sharing a prefix is therefore refused: the
+first `engine.start()` records its schema under the Redis key `${prefix}:owner-schema`, and a
+`start()` with another schema on that prefix throws a `ConfigError` (delete that key only when the
+schema that owned it was retired). Two further guards remain for deployments that bypass the check
+(e.g. engines started before it existed): each job scheduler is tagged with the creating engine's
+schema, the reconciler never deletes a scheduler tagged with another schema, and a `schedule-tick`
+tagged with another schema is refused (logged as an error, retried by BullMQ, nothing created or
+removed). They limit the damage; they don't make a shared prefix work.
 
 ### `ctx` (second argument of a task's `run`)
 
@@ -471,7 +486,7 @@ net — but treat that as a safety net, not a reason to reuse a `prefix` across 
 type TaskContext = {
 	step: StepApi;
 	logger: TaskLogger;               // debug/info/warn/error(message, data?)
-	signal: AbortSignal;               // cancellation, maxDurationMs, lost ownership, or shutdown
+	signal: AbortSignal;               // cancellation, maxDurationMs, lost ownership, shutdown, or the attempt ending
 	run: { id: string; taskId: string; attempt: number; createdAt: Date };
 	stream(name: string, source: AsyncIterable<Json | string>): Promise<void>;
 };
@@ -486,9 +501,16 @@ still buffered when the execution lost the run (canceled, stalled, handed back o
 dropped with a `warn`. A failed batch is retried once, then dropped with a `warn`: logs never fail
 a run.
 
+`ctx.signal` also aborts once the attempt is over (completed, failed, retry scheduled, released,
+or any other exit of the executor; its reason is a `"finished"` abort), so work the task left
+running (a step left behind by a rejected `Promise.all`, an un-awaited promise, a stream) stops
+instead of duplicating side effects alongside the next attempt. A suspension aborts it too.
+
 `ctx.stream(name, source)` appends every item of `source` (strings or JSON values) to a Redis
-Stream of this run (`XADD MAXLEN ~ 10000`), then writes an end marker; the stream expires 1 day
-later. It is not a step: it is not memoized, so a replay streams again.
+Stream of this run (`XADD MAXLEN ~ 10000`), then writes an end marker — always, also when `source`
+throws or `ctx.signal` aborts (then the marker carries the error and `ctx.stream` rejects with it,
+see `runs.readStream` above). Every append refreshes the key's expiry (1 day), so a stream whose
+writer died still goes away. It is not a step: it is not memoized, so a replay streams again.
 
 ### `StepApi`
 
@@ -513,7 +535,8 @@ interface StepApi {
 | `schema` | `"minitrigger"` | Postgres schema. Must match `^[a-z_][a-z0-9_]{0,62}$`. |
 | `prefix` | `"minitrigger"` | BullMQ key prefix. Same pattern as `schema`. |
 | `tasks` | — | Array of tasks from `defineTask`. |
-| `pool.max` | `10` | Only used when the engine creates its own pool (string `postgres`). See [pool sizing](#pool-sizing). |
+| `pool.max` | total task-queue `concurrency` + 5 (at least 10) | Only used when the engine creates its own pool (string `postgres`). `start()` warns when it is below that for the started queues. See [pool sizing](#pool-sizing). |
+| `pool.connectionTimeoutMs` | `10 000` | `connectionTimeoutMillis` of the engine's own pool: a query waiting longer for a free connection fails (a failed heartbeat only warns). |
 | `heartbeatIntervalMs` | `10 000` | How often a running execution updates `heartbeat_at`. Must be smaller than `stallTimeoutMs`. |
 | `heartbeatTimeoutMs` | `2 000` | `SET LOCAL statement_timeout` applied to each heartbeat query/transaction. |
 | `stallTimeoutMs` | `60 000` | A `running` run whose heartbeat is older than this is considered stalled by the reconciler. |
@@ -591,8 +614,9 @@ it("approves a document", async () => {
 - `EngineClient` (`Pick<Engine, "trigger" | "runs" | "tokens" | "schedules" | "events">`) is the
   surface `Engine` and `TestEngine` share: use it to type a helper that works against either.
 - `maxDurationMs`, heartbeats and log flushes still use real timers. A drain that processes more
-  than `maxJobsPerDrain` jobs (default 10 000) throws, to catch runs that never settle. There is no
-  `retention` option: the test engine's `-system` worker never runs real retention sweeps.
+  than `maxJobsPerDrain` jobs (default 10 000) throws, to catch runs that never settle. Of
+  `retention`, only `days` is accepted (for the idempotency-key TTL check, exactly as in
+  `createEngine`): the test engine never runs retention sweeps.
 
 ## Operation
 
@@ -623,10 +647,18 @@ it("approves a document", async () => {
   (ownership cleared, **no attempt increment**) and re-enqueued — this is an **at-least-once**
   guarantee: if your task's own logic already had a side effect before the timeout, that side
   effect may run again on retry unless it's inside a memoized step.
-- **Pool sizing.** If you inject your own `pg.Pool`, make sure `pool.max >= total worker
-  concurrency + 5` (the engine's own bookkeeping queries need headroom beyond what your workers
-  consume). A separate, dedicated pool for the library is recommended over sharing your
-  application's pool.
+  The workers stop fetching jobs first, before `stop()` waits for the leader's reconciler tick; a
+  retention sweep in progress stops between batches. `stop()` also finishes when Redis is
+  unreachable: Redis connections that are not ready are dropped instead of sent a `QUIT` (which
+  would wait for a reconnection that never comes).
+- **Pool sizing.** The pool needs `max >= total worker concurrency + 5` (the engine's own
+  bookkeeping queries need headroom beyond what your workers consume). A pool the engine creates
+  gets that size by default (at least 10) and a 10 s `connectionTimeoutMillis`
+  (`pool.connectionTimeoutMs`). If you inject your own `pg.Pool`, size it the same way and set a
+  `connectionTimeoutMillis`: `start()` warns when it is smaller than the started queues need or
+  has no acquisition timeout (a heartbeat would then wait for a connection without limit instead of
+  failing with a warning). A separate, dedicated pool for the library is recommended over sharing
+  your application's pool.
 - **Advisory locks.** Migrations use `pg_advisory_xact_lock` inside a transaction; the leader
   (reconciler/retention owner) uses `pg_try_advisory_lock` on a dedicated client kept outside the
   pool for as long as it holds the lock — never on a connection borrowed from a pool, since a
@@ -647,8 +679,7 @@ it("approves a document", async () => {
   worker may process it (a sweep is idempotent). `engine.migrate()` never waits for the leader
   (different advisory lock).
 - **Run status events.** Every status change the engine makes is published (best-effort) on
-  `${prefix}:run-status` with the row's `updated_at` (the feed for `engine.runs.subscribe`, still
-  in progress).
+  `${prefix}:run-status` with the row's `updated_at` (the feed for `engine.runs.subscribe`).
 - **Redis can be wiped.** After a `FLUSHALL` (or any lost job), the reconciler re-enqueues every
   run from Postgres within about `reconciler.graceMs + reconciler.intervalMs`.
 

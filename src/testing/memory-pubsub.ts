@@ -2,7 +2,9 @@
  * In-memory pub/sub and streams of the test mode (Phase 9.2), so `runs.subscribe`,
  * `ctx.stream` and `runs.readStream` work through the same engine code without Redis.
  */
+import { MinitriggerError } from "../errors.js";
 import type { PubSub, PubSubPublisher, RunStatusMessage } from "../pubsub.js";
+import type { PipeOptions } from "../streams.js";
 import type { Json } from "../utils/serialization.js";
 
 /** One process-local "Redis" for status/cancel messages. */
@@ -82,7 +84,12 @@ export function createMemoryPubSubHub(): MemoryPubSubHub {
 	return { publisher, createPubSub };
 }
 
-type StreamEntry = { kind: "data"; value: string | Json } | { kind: "end" };
+type StreamEntry =
+	| { kind: "data"; value: string | Json }
+	| { kind: "end"; error: string | undefined };
+
+/** Same bound as `src/streams.ts` on the error text of an end marker. */
+const MAX_END_ERROR_LENGTH = 1_000;
 
 interface MemoryStream {
 	readonly entries: StreamEntry[];
@@ -91,8 +98,20 @@ interface MemoryStream {
 
 /** `ctx.stream` / `runs.readStream` in memory: an append-only list per `(runId, name)`. */
 export interface MemoryStreams {
-	pipe(runId: string, name: string, source: AsyncIterable<string | Json>): Promise<void>;
-	/** From the start until the first end marker (like the Redis version), or until `signal`. */
+	/**
+	 * Like the Redis version: the end marker is always written, with an error when `source` throws
+	 * or `options.signal` fires (then `pipe` rejects with that error).
+	 */
+	pipe(
+		runId: string,
+		name: string,
+		source: AsyncIterable<string | Json>,
+		options?: PipeOptions
+	): Promise<void>;
+	/**
+	 * From the start until the first end marker (like the Redis version), or until `signal`. An end
+	 * marker with an error throws a `MinitriggerError` after the chunks before it.
+	 */
 	read(runId: string, name: string, signal: AbortSignal | undefined): AsyncIterable<string | Json>;
 	/** Wakes every pending reader so it can notice an abort/stop. */
 	close(): void;
@@ -118,13 +137,28 @@ export function createMemoryStreams(): MemoryStreams {
 	}
 
 	return {
-		async pipe(runId, name, source) {
+		async pipe(runId, name, source, options) {
+			const signal = options?.signal;
 			const stream = get(runId, name);
-			for await (const chunk of source) {
-				// The Redis version stores `JSON.stringify(chunk)`.
-				append(stream, { kind: "data", value: JSON.parse(JSON.stringify(chunk)) });
+			const iterator = source[Symbol.asyncIterator]();
+			try {
+				while (true) {
+					signal?.throwIfAborted();
+					const next = await nextOrAbort(iterator, signal);
+					if (next.done === true) break;
+					// The Redis version stores `JSON.stringify(chunk)`.
+					append(stream, { kind: "data", value: JSON.parse(JSON.stringify(next.value)) });
+				}
+			} catch (error) {
+				if (typeof iterator.return === "function") {
+					Promise.resolve()
+						.then(() => iterator.return?.())
+						.catch(() => {});
+				}
+				append(stream, { kind: "end", error: errorText(error) });
+				throw error;
 			}
-			append(stream, { kind: "end" });
+			append(stream, { kind: "end", error: undefined });
 		},
 
 		async *read(runId, name, signal) {
@@ -134,7 +168,12 @@ export function createMemoryStreams(): MemoryStreams {
 				const entry = stream.entries[index];
 				if (entry) {
 					index++;
-					if (entry.kind === "end") return;
+					if (entry.kind === "end") {
+						if (entry.error === undefined) return;
+						throw new MinitriggerError(
+							`stream "${name}" of run ${runId} ended with an error: ${entry.error}`
+						);
+					}
 					yield entry.value;
 					continue;
 				}
@@ -157,4 +196,36 @@ export function createMemoryStreams(): MemoryStreams {
 			}
 		},
 	};
+}
+
+/** `name: message` of what ended a stream, bounded (same format as `src/streams.ts`). */
+function errorText(error: unknown): string {
+	const text =
+		error instanceof Error || error instanceof DOMException
+			? `${error.name}: ${error.message}`
+			: String(error);
+	return text.length > MAX_END_ERROR_LENGTH ? `${text.slice(0, MAX_END_ERROR_LENGTH)}…` : text;
+}
+
+/** `iterator.next()` raced against `signal` (same as `src/streams.ts`). */
+function nextOrAbort<T>(
+	iterator: AsyncIterator<T>,
+	signal: AbortSignal | undefined
+): Promise<IteratorResult<T>> {
+	const next = iterator.next();
+	if (!signal) return next;
+	return new Promise((resolve, reject) => {
+		const onAbort = (): void => reject(signal.reason);
+		signal.addEventListener("abort", onAbort, { once: true });
+		next.then(
+			result => {
+				signal.removeEventListener("abort", onAbort);
+				resolve(result);
+			},
+			(error: unknown) => {
+				signal.removeEventListener("abort", onAbort);
+				reject(error);
+			}
+		);
+	});
 }

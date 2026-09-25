@@ -1,6 +1,6 @@
 import type { ClaimResult, IdempotencyStore } from "../types.js";
 import type { Exec } from "./resolve.js";
-import { fkViolation, keyOf, type MemTx, toDate, uuid } from "./state.js";
+import { fkViolation, keyOf, type MemTx, pgText, toDate, uuid } from "./state.js";
 
 export interface ClaimInput {
 	taskId: string;
@@ -16,7 +16,9 @@ export interface ClaimInput {
  * keeps the SQL signature.
  */
 export function claimKey(tx: MemTx, input: ClaimInput): ClaimResult | null {
-	const k = keyOf(input.taskId, input.key);
+	const taskId = pgText(input.taskId);
+	const key = pgText(input.key);
+	const k = keyOf(taskId, key);
 	const existing = tx.db.keys.get(k);
 	if (existing && !(existing.expiresAt !== null && existing.expiresAt < tx.now)) {
 		return { claimed: false, existingRunId: existing.runId };
@@ -26,8 +28,8 @@ export function claimKey(tx: MemTx, input: ClaimInput): ClaimResult | null {
 		throw fkViolation("idempotency_keys", "idempotency_keys_run_id_fkey");
 	}
 	tx.set(tx.db.keys, k, {
-		taskId: input.taskId,
-		key: input.key,
+		taskId,
+		key,
 		runId,
 		expiresAt: input.ttlMs === null ? null : tx.now + input.ttlMs,
 	});
@@ -46,7 +48,7 @@ export function createIdempotencyStore(exec: Exec): IdempotencyStore {
 
 		find(taskId, key) {
 			return exec.run(tx => {
-				const row = tx.db.keys.get(keyOf(taskId, key));
+				const row = tx.db.keys.get(keyOf(pgText(taskId), pgText(key)));
 				return row ? { runId: row.runId, expiresAt: toDate(row.expiresAt) } : null;
 			});
 		},

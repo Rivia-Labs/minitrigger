@@ -80,6 +80,21 @@ describe("StepApi: payload constrained to the given task", () => {
 		expectTypeOf(useStep).returns.toBeVoid();
 	});
 
+	it("waitForToken<T>: T must be Serializable (regression: waitForToken<Date> used to compile)", () => {
+		function useStep(step: StepApi) {
+			const ok = step.waitForToken<{ amount: number }>("a");
+			expectTypeOf(ok).toEqualTypeOf<Promise<WaitResult<{ amount: number }>>>();
+
+			step.waitForToken("b"); // defaults to Json, always fine
+
+			// @ts-expect-error Date is not JSON-serializable
+			step.waitForToken<Date>("c");
+			// @ts-expect-error Map is not JSON-serializable
+			step.waitForToken<Map<string, number>>("d");
+		}
+		expectTypeOf(useStep).returns.toBeVoid();
+	});
+
 	it("batchTriggerAndWait rejects a mismatched payload and returns typed per-item results", () => {
 		function useStep(step: StepApi) {
 			// @ts-expect-error wrong payload shape for `child`
@@ -141,6 +156,41 @@ describe("tasks without a payload parameter", () => {
 
 			const batch = step.batchTriggerAndWait("i", noPayload, [undefined, undefined]);
 			expectTypeOf(batch).toEqualTypeOf<Promise<WaitResult<string>[]>>();
+		}
+		expectTypeOf(useStep).returns.toBeVoid();
+	});
+});
+
+describe("tasks whose run declares the payload parameter optional (payload?: X)", () => {
+	const optionalPayload = defineTask({
+		id: "optional-payload",
+		run: async (payload?: { amount: number }) => payload?.amount ?? 0,
+	});
+
+	it("infers the payload as `{ amount: number } | undefined`, not void/unknown", () => {
+		expectTypeOf<TaskPayload<typeof optionalPayload>>().toEqualTypeOf<
+			{ amount: number } | undefined
+		>();
+	});
+
+	it("engine.trigger: the payload argument is optional (regression: used to require it)", () => {
+		function use(engine: Engine) {
+			engine.trigger(optionalPayload);
+			engine.trigger(optionalPayload, undefined);
+			engine.trigger(optionalPayload, { amount: 1 });
+			engine.trigger(optionalPayload, { amount: 1 }, { delay: "1s" });
+			// @ts-expect-error wrong payload shape
+			engine.trigger(optionalPayload, { text: "nope" });
+		}
+		expectTypeOf(use).returns.toBeVoid();
+	});
+
+	it("StepApi.trigger/triggerAndWait: the payload argument is optional too", () => {
+		function useStep(step: StepApi) {
+			step.trigger("a", optionalPayload);
+			step.trigger("a", optionalPayload, { amount: 1 });
+			step.triggerAndWait("b", optionalPayload);
+			step.triggerAndWait("b", optionalPayload, { amount: 1 });
 		}
 		expectTypeOf(useStep).returns.toBeVoid();
 	});

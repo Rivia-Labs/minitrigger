@@ -12,7 +12,12 @@ import type { RunNotifier } from "./notify.js";
 export type SystemJobName = "waitpoint-expire" | "reconcile" | "retention" | "schedule-tick";
 
 export interface SystemDeps {
-	config: Pick<ResolvedConfig, "logger">;
+	/**
+	 * `schema` (optional so unit tests can pass just a logger; the engine passes its whole resolved
+	 * config) reaches `processScheduleTick`: a scheduler tagged with another schema is never removed
+	 * by the tick's self-heal (audit item 8).
+	 */
+	config: Pick<ResolvedConfig, "logger"> & Partial<Pick<ResolvedConfig, "schema">>;
 	store: Store;
 	transport: Pick<
 		Transport,
@@ -55,9 +60,11 @@ export function createSystemDispatcher(deps: SystemDeps): ProcessSystemFn {
 	return async (name, data, job) => {
 		switch (name as SystemJobName) {
 			case "waitpoint-expire":
-				return expireWaitpoint(deps, data, job);
+				return logFailure(logger, "waitpoint-expire", expireFields(data), () =>
+					expireWaitpoint(deps, data, job)
+				);
 			case "retention":
-				return retention(deps);
+				return logFailure(logger, "retention", {}, () => retention(deps));
 			case "schedule-tick":
 				return scheduleTick(deps, data, job);
 			case "reconcile":
@@ -67,6 +74,33 @@ export function createSystemDispatcher(deps: SystemDeps): ProcessSystemFn {
 				logger.warn({ job: name }, "unknown system job ignored");
 		}
 	};
+}
+
+/**
+ * Audit item (d): system jobs use `removeOnFail: true` and nobody listens to the worker's `failed`
+ * event, so an unexpected failure of `waitpoint-expire` or `retention` would vanish silently. Logs
+ * it (`error`, with the job's identifying fields) and rethrows so BullMQ still records the failure.
+ * `DelayedError` is the documented re-delay signal of `not_due`, not a failure.
+ */
+async function logFailure(
+	logger: ResolvedConfig["logger"],
+	job: SystemJobName,
+	fields: Record<string, unknown>,
+	fn: () => Promise<void>
+): Promise<void> {
+	try {
+		await fn();
+	} catch (error) {
+		if (!(error instanceof DelayedError)) {
+			logger.error({ ...fields, err: error, job }, `system job "${job}" failed`);
+		}
+		throw error;
+	}
+}
+
+function expireFields(data: unknown): Record<string, unknown> {
+	const waitpointId = (data as { waitpointId?: unknown } | null)?.waitpointId;
+	return typeof waitpointId === "string" ? { waitpointId } : {};
 }
 
 /**
@@ -116,6 +150,7 @@ async function scheduleTick(deps: SystemDeps, data: unknown, job: Job): Promise<
 				registry: deps.registry,
 				logger,
 				...(deps.notify ? { notify: deps.notify } : {}),
+				...(deps.config.schema !== undefined ? { schema: deps.config.schema } : {}),
 			},
 			scheduleId,
 			scheduledAtMs

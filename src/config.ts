@@ -55,8 +55,19 @@ export interface EngineConfig {
 	/** BullMQ key prefix (decision 15). Default `"minitrigger"`. */
 	prefix?: string;
 	tasks: readonly AnyTask[];
-	/** Only used when the engine creates the pool. */
-	pool?: { max?: number };
+	/** Only used when the engine creates the pool (string `postgres`). */
+	pool?: {
+		/**
+		 * Default: the total `concurrency` of every task queue + 5 (the README's sizing guide), at
+		 * least 10. `start()` warns when an explicit value is below that for the queues it starts.
+		 */
+		max?: number;
+		/**
+		 * `connectionTimeoutMillis` of the pool: how long a query (a heartbeat included) waits for a
+		 * free connection before failing. A failed heartbeat only warns (decision 6). Default 10 000 ms.
+		 */
+		connectionTimeoutMs?: number;
+	};
 	/** Default 10 000 ms. Must be smaller than `stallTimeoutMs`. */
 	heartbeatIntervalMs?: number;
 	/** `SET LOCAL statement_timeout` of each heartbeat query. Default 2 000 ms. */
@@ -120,7 +131,9 @@ export interface ResolvedConfig {
 	schema: string;
 	prefix: string;
 	tasks: readonly AnyTask[];
-	poolMax: number;
+	/** `undefined`: the engine derives it from the task queues' concurrency (see `EngineConfig.pool`). */
+	poolMax: number | undefined;
+	poolConnectionTimeoutMs: number;
 	heartbeatIntervalMs: number;
 	heartbeatTimeoutMs: number;
 	stallTimeoutMs: number;
@@ -149,7 +162,11 @@ export const MAX_TIMER_MS = 2_147_483_647;
 export const DEFAULTS = {
 	schema: "minitrigger",
 	prefix: "minitrigger",
+	/** Floor of the derived pool size (and pg's own default `max`). */
 	poolMax: 10,
+	/** Headroom over the total worker concurrency (README "Pool sizing", decision 14). */
+	poolHeadroom: 5,
+	poolConnectionTimeoutMs: 10_000,
 	heartbeatIntervalMs: 10_000,
 	heartbeatTimeoutMs: 2_000,
 	stallTimeoutMs: 60_000,
@@ -202,7 +219,12 @@ export function resolveConfig(config: EngineConfig): ResolvedConfig {
 	const schema = validateSqlIdentifier("schema", config.schema ?? DEFAULTS.schema);
 	const prefix = validateSqlIdentifier("prefix", config.prefix ?? DEFAULTS.prefix);
 
-	const poolMax = positiveInt("pool.max", config.pool?.max ?? DEFAULTS.poolMax);
+	const poolMax =
+		config.pool?.max === undefined ? undefined : positiveInt("pool.max", config.pool.max);
+	const poolConnectionTimeoutMs = timerMs(
+		"pool.connectionTimeoutMs",
+		config.pool?.connectionTimeoutMs ?? DEFAULTS.poolConnectionTimeoutMs
+	);
 	const heartbeatIntervalMs = timerMs(
 		"heartbeatIntervalMs",
 		config.heartbeatIntervalMs ?? DEFAULTS.heartbeatIntervalMs
@@ -333,6 +355,7 @@ export function resolveConfig(config: EngineConfig): ResolvedConfig {
 		prefix,
 		tasks: config.tasks,
 		poolMax,
+		poolConnectionTimeoutMs,
 		heartbeatIntervalMs,
 		heartbeatTimeoutMs,
 		stallTimeoutMs,

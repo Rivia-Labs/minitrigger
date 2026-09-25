@@ -29,8 +29,17 @@ export async function migrate(pool: Pool, schema: string): Promise<MigrateResult
 		await client.query("SELECT pg_advisory_xact_lock(hashtext($1), 1)", [schema]);
 
 		// CREATE SCHEMA is not affected by search_path (it names the schema directly), so it runs
-		// before search_path is set.
-		await client.query(`CREATE SCHEMA IF NOT EXISTS ${quotedSchema}`);
+		// before search_path is set. Only when the schema is missing: `CREATE SCHEMA IF NOT EXISTS`
+		// still requires CREATE on the database, which a role given a DBA-created schema usually
+		// lacks. Concurrent migrate() calls are serialized by the advisory lock above, so the
+		// check-then-create can't race another migrate() of the same schema.
+		const { rows: schemaRows } = await client.query<{ exists: boolean }>(
+			"SELECT EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = $1) AS exists",
+			[schema]
+		);
+		if (schemaRows[0]?.exists !== true) {
+			await client.query(`CREATE SCHEMA IF NOT EXISTS ${quotedSchema}`);
+		}
 
 		// LOCAL: scoped to this transaction only. Never a session-wide SET, which would leak the
 		// search_path to whatever else later borrows this connection from the pool -- including

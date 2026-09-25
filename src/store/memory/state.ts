@@ -208,11 +208,23 @@ export function uuidOrNull(value: string | null): string | null {
 /**
  * A value as `jsonb` stores it: JSON text round trip (drops `undefined` properties, turns
  * `undefined` into `null` like `jsonParam`, `-0` into `0`) and object keys in jsonb order
- * (shorter keys first, then bytewise).
+ * (shorter keys first, then bytewise). Rejects what Postgres' jsonb input rejects (audit item 2),
+ * with the same SQLSTATE: U+0000 in a string or key (`22P05`, "unsupported Unicode escape
+ * sequence") and a lone UTF-16 surrogate (`JSON.stringify` escapes it as `\udXXX`, which jsonb
+ * refuses: `22P02`). An own `__proto__` key stays a plain data property, as `pg` returns it.
  */
 export function toJsonb<T extends Json | SerializedError | null>(value: T | undefined): T {
 	const text = JSON.stringify(value ?? null) as string | undefined;
 	return normalizeKeys(text === undefined ? null : JSON.parse(text)) as T;
+}
+
+function checkJsonbString(value: string): void {
+	if (value.includes("\u0000")) {
+		throw pgError("22P05", "unsupported Unicode escape sequence");
+	}
+	if (!value.isWellFormed()) {
+		throw pgError("22P02", "invalid input syntax for type json");
+	}
 }
 
 function normalizeKeys(value: unknown): unknown {
@@ -225,12 +237,38 @@ function normalizeKeys(value: unknown): unknown {
 			if (la !== lb) return la - lb;
 			return Buffer.compare(Buffer.from(a), Buffer.from(b));
 		});
-		const out: Record<string, unknown> = {};
-		for (const [k, v] of entries) out[k] = normalizeKeys(v);
-		return out;
+		for (const [k] of entries) checkJsonbString(k);
+		// `Object.fromEntries` defines own data properties: `out[k] = v` with k === "__proto__"
+		// would set the prototype instead and silently drop the key.
+		return Object.fromEntries(entries.map(([k, v]) => [k, normalizeKeys(v)]));
 	}
+	if (typeof value === "string") checkJsonbString(value);
 	if (typeof value === "number" && Object.is(value, -0)) return 0;
 	return value;
+}
+
+/**
+ * A value as a Postgres `text` column stores it: U+0000 is rejected (`22021`, "invalid byte
+ * sequence for encoding UTF8: 0x00"); a lone surrogate can't be encoded as UTF-8, so `pg` sends
+ * U+FFFD in its place (Node's `Buffer` encoding), which is what the row then holds.
+ */
+export function pgText(value: string): string {
+	if (value.includes("\u0000")) {
+		throw pgError("22021", 'invalid byte sequence for encoding "UTF8": 0x00');
+	}
+	return value.toWellFormed();
+}
+
+/** Nullable {@link pgText}. */
+export function pgTextOrNull(value: string | null): string | null {
+	return value === null ? null : pgText(value);
+}
+
+/** An error shaped like the `DatabaseError` pg raises (`code` = SQLSTATE). */
+export function pgError(code: string, message: string): Error {
+	const err = new Error(message);
+	(err as Error & { code: string }).code = code;
+	return err;
 }
 
 /** Approximation of `pg_column_size` for a jsonb value: its JSON byte length. */
