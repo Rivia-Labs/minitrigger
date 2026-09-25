@@ -46,7 +46,7 @@ Atualizado em 2026-09-25. Leia junto com `CLAUDE.md` (decisões e notas de imple
 ### Parte 2 (2026-09-25, depois do v0.1.0)
 
 - Issue #1 (progresso por run, decisão 23, migration 004) e issue #2 (debounce e concurrency key, decisões 24/25, migration 005) implementadas. Debounce sempre trailing (`mode` removido por decisão do dono); runs limitadas por concurrency key esperam com backoff de 1 s até 30 s, sem ordem FIFO.
-- Bug do BullMQ 6.3.8/6.3.9 contornado (laço sem espera ao fechar o worker); texto de issue upstream redigido e não aberto.
+- Bug do BullMQ 6.3.8/6.3.9 contornado (laço sem espera ao fechar o worker); reportado em taskforcesh/bullmq#4831.
 - Próximo passo opcional: release v0.2.0 (migrations 004 e 005 ficam congeladas depois dele).
 
 ### Auditoria externa (2026-09-25)
