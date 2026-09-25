@@ -40,7 +40,9 @@
     "test:flushall": "vitest run --project flushall",
     "test:watch": "vitest",
     "infra:up": "docker compose up -d --wait",
-    "infra:down": "docker compose down"
+    "infra:down": "docker compose down",
+    "bench": "pnpm run build && node bench/run.ts",
+    "check:pack": "node scripts/check-pack.mjs"
   },
   "peerDependencies": {
     "bullmq": "^6.3.0",
