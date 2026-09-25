@@ -63,17 +63,25 @@ Env de teste: `TEST_DATABASE_URL`, `TEST_REDIS_URL` (padrões apontam para o doc
 - Falha definitiva de uma run **não** cancela descendentes (filhas de `step.trigger` podem sobreviver ao pai, como na conclusão). Pendência: os waitpoints pendentes da própria run que falhou continuam `pending` (tratar na fase 5/6: vencer junto com a falha e remover jobs de expiração).
 - Suspensão em `waiting_on_waitpoints` também faz `enqueue_seq + 1` (sem enqueue), para que uma reentrega do job antigo não readquira a run.
 
+- Output de task é limitado por `maxPayloadBytes` (não `maxStepOutputBytes`): vai para `runs.output` e o pai o lê direto (decisão 10). Output inválido ou grande demais falha a run sem retry.
+- Run de task desconhecida pelo processo (ex.: deploy em andamento) conta como tentativa com falha retryable.
+- `stop()` devolve runs cuja função ignora o `signal`: semântica at-least-once (decisão 20); o resultado tardio é descartado pelo ownership.
+- `@types/pg` é peer opcional: os tipos públicos citam `pg.Pool` e `Redis` do ioredis.
+
+- Task sem parâmetro de payload tem payload `void` (opcional em `trigger`); `payload: unknown` explícito conta igual. Payload `undefined` é gravado como `null`.
+- Valores alimentados em `setTimeout` (heartbeat, stall, shutdown, `maxDurationMs`) são limitados a 2^31-1 ms; delays do BullMQ não.
+
 ## Status das fases
 
 | Fase | Status |
 |---|---|
 | 1 — Fundação | ✅ concluída — build ESM/CJS/DTS, 103 testes unitários, infra de integração por arquivo, `examples/basic` (ESM+CJS) |
 | 2 — Schema e store | ✅ concluída — migration 001, `migrate()` com advisory xact lock, contrato `src/store/types.ts` + `docs/store-contract.md`, repositórios SQL, 127 testes de integração (revisão opus aplicada) |
-| 3 — Trigger/fila/execução | em andamento (3.1 tasks/registry pronto; 3.2 BullMQ em implementação) |
+| 3 — Trigger/fila/execução | ✅ concluída — `defineTask`/registry de filas, transporte BullMQ, executor (aquisição, heartbeat, retry, timeout), engine (`trigger`, `start`, `stop` graceful, `runs.*`); revisão opus aplicada |
 | 4 — Steps/replay/sleep | pendente |
 | 5 — Tokens/subtasks | pendente |
-| 6 — Resiliência | pendente |
+| 6 — Resiliência | em andamento (`src/leader.ts` pronto; falta ligar à engine) |
 | 7 — Logs/eventos/consulta | pendente |
-| 8 — Schedules | pendente |
+| 8 — Schedules | em andamento (migration 002 + `ScheduleStore` prontos; falta BullMQ/engine) |
 | 9 — Modo de teste/DX | pendente |
 | 10 — Exemplo/docs/empacotamento | pendente |

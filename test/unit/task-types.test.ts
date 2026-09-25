@@ -1,0 +1,147 @@
+import { describe, expectTypeOf, it } from "vitest";
+import type { Engine } from "../../src/engine.js";
+import type { StepApi, TaskOutput, TaskPayload, WaitResult } from "../../src/task.js";
+import { defineTask } from "../../src/task.js";
+
+/**
+ * Compile-time only assertions for `defineTask`/`StepApi` (Phase 3 task 3.1).
+ * As with `serializable-types.test.ts`, the interesting checks are the type
+ * errors `pnpm typecheck` would raise on a regression, and the
+ * `// @ts-expect-error` cases, which fail typecheck if the constraint stops
+ * rejecting what it should. Nothing here needs to run: functions that take a
+ * `StepApi`/`Task` value are declared but never invoked.
+ */
+
+describe("defineTask: P/O inference and Serializable checks", () => {
+	it("infers P and O from run's parameter and return type", () => {
+		const task = defineTask({
+			id: "infer",
+			run: async (payload: { url: string }) => ({ status: "ok" as const, url: payload.url }),
+		});
+		expectTypeOf<TaskPayload<typeof task>>().toEqualTypeOf<{ url: string }>();
+		expectTypeOf<TaskOutput<typeof task>>().toEqualTypeOf<{ status: "ok"; url: string }>();
+	});
+
+	it("rejects a { d: Date } payload", () => {
+		// @ts-expect-error payload field `d` is a Date, which is not JSON-serializable
+		defineTask({
+			id: "bad-payload",
+			run: async (payload: { d: Date }) => payload.d.toISOString(),
+		});
+	});
+
+	it("rejects a Date output", () => {
+		// @ts-expect-error task output is a Date, which is not JSON-serializable
+		defineTask({ id: "bad-output", run: async () => new Date() });
+	});
+
+	it("allows a void output (stored as null by the engine)", () => {
+		const task = defineTask({ id: "void-ok", run: async () => {} });
+		expectTypeOf<TaskOutput<typeof task>>().toEqualTypeOf<void>();
+	});
+
+	it("allows an interface payload", () => {
+		interface Payload {
+			id: string;
+			count: number;
+			tags: string[];
+		}
+		const task = defineTask({ id: "iface", run: async (payload: Payload) => payload.id });
+		expectTypeOf<TaskPayload<typeof task>>().toEqualTypeOf<Payload>();
+		expectTypeOf<TaskOutput<typeof task>>().toEqualTypeOf<string>();
+	});
+});
+
+describe("StepApi: payload constrained to the given task", () => {
+	const child = defineTask({
+		id: "child",
+		run: async (payload: { amount: number }) => ({ ok: true as const, amount: payload.amount }),
+	});
+
+	it("triggerAndWait rejects a mismatched payload and returns a typed WaitResult", () => {
+		function useStep(step: StepApi) {
+			// @ts-expect-error `text` doesn't exist on the child task's payload
+			step.triggerAndWait("child-step", child, { text: "nope" });
+
+			const result = step.triggerAndWait("child-step", child, { amount: 1 });
+			expectTypeOf(result).toEqualTypeOf<Promise<WaitResult<{ ok: true; amount: number }>>>();
+		}
+		expectTypeOf(useStep).returns.toBeVoid();
+	});
+
+	it("trigger rejects a mismatched payload and returns a handle typed with the task's output", () => {
+		function useStep(step: StepApi) {
+			// @ts-expect-error wrong payload shape for `child`
+			step.trigger("child-step", child, { text: "nope" });
+
+			const handle = step.trigger("child-step", child, { amount: 1 });
+			expectTypeOf(handle).resolves.toHaveProperty("id").toEqualTypeOf<string>();
+		}
+		expectTypeOf(useStep).returns.toBeVoid();
+	});
+
+	it("batchTriggerAndWait rejects a mismatched payload and returns typed per-item results", () => {
+		function useStep(step: StepApi) {
+			// @ts-expect-error wrong payload shape for `child`
+			step.batchTriggerAndWait("child-batch", child, [{ text: "nope" }]);
+
+			const batch = step.batchTriggerAndWait("child-batch", child, [{ amount: 1 }, { amount: 2 }]);
+			expectTypeOf(batch).toEqualTypeOf<Promise<WaitResult<{ ok: true; amount: number }>[]>>();
+		}
+		expectTypeOf(useStep).returns.toBeVoid();
+	});
+});
+
+describe("tasks without a payload parameter", () => {
+	const noPayload = defineTask({ id: "no-payload", run: async () => "done" });
+	const withPayload = defineTask({
+		id: "with-payload",
+		run: async (payload: { amount: number }) => payload.amount,
+	});
+
+	it("infers the payload as void (not unknown)", () => {
+		expectTypeOf<TaskPayload<typeof noPayload>>().toEqualTypeOf<void>();
+	});
+
+	it("engine.trigger: the payload is optional and anything else is rejected", () => {
+		function use(engine: Engine) {
+			engine.trigger(noPayload);
+			engine.trigger(noPayload, undefined, { delay: "1s" });
+			// @ts-expect-error a task without a payload parameter accepts no payload
+			engine.trigger(noPayload, { amount: 1 });
+			// @ts-expect-error a task without a payload parameter accepts no payload
+			engine.trigger(noPayload, "x");
+
+			engine.trigger(withPayload, { amount: 1 });
+			// @ts-expect-error the payload of a task that declares one is required
+			engine.trigger(withPayload);
+			// @ts-expect-error wrong payload shape
+			engine.trigger(withPayload, { text: "nope" });
+		}
+		expectTypeOf(use).returns.toBeVoid();
+	});
+
+	it("StepApi.trigger/triggerAndWait: the payload is optional; batch keeps an array", () => {
+		function useStep(step: StepApi) {
+			step.trigger("a", noPayload);
+			step.trigger("b", noPayload, undefined, { delay: "1s" });
+			// @ts-expect-error a task without a payload parameter accepts no payload
+			step.trigger("c", noPayload, { amount: 1 });
+
+			const result = step.triggerAndWait("d", noPayload);
+			expectTypeOf(result).toEqualTypeOf<Promise<WaitResult<string>>>();
+			step.triggerAndWait("e", noPayload, undefined, { timeout: "1m" });
+			// @ts-expect-error a task without a payload parameter accepts no payload
+			step.triggerAndWait("f", noPayload, { amount: 1 });
+
+			// @ts-expect-error the payload of a task that declares one is required
+			step.trigger("g", withPayload);
+			// @ts-expect-error the payload of a task that declares one is required
+			step.triggerAndWait("h", withPayload);
+
+			const batch = step.batchTriggerAndWait("i", noPayload, [undefined, undefined]);
+			expectTypeOf(batch).toEqualTypeOf<Promise<WaitResult<string>[]>>();
+		}
+		expectTypeOf(useStep).returns.toBeVoid();
+	});
+});
