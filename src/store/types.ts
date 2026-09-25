@@ -7,7 +7,8 @@
  * - Every method is atomic. On a pool-bound {@link Store} a multi-statement
  *   method opens its own transaction (one pg client, BEGIN/COMMIT/ROLLBACK);
  *   on a {@link StoreTx} it runs inside the caller's transaction, using a
- *   SAVEPOINT only where partial rollback is needed ({@link RunStore.create}).
+ *   SAVEPOINT only where partial rollback is needed (debounced
+ *   {@link RunStore.create}).
  * - Isolation is READ COMMITTED; correctness comes from row locks.
  * - Lock order (deadlock avoidance): parent run -> run -> descendants (level by
  *   level, ascending id) -> waitpoint rows. A method that needs a run's parent
@@ -257,6 +258,14 @@ export interface NewRun {
 	debounce?: NewRunDebounce;
 	/** Decision 25: stored in `runs.concurrency_key`; enforced by {@link RunStore.acquireWithConcurrencyLimit}. */
 	concurrencyKey?: string;
+	/**
+	 * Decision 26 (transactional trigger): the run is inserted with `outbox_pending = true` and the
+	 * same statement runs `pg_notify(channel, '')`, so the caller must NOT enqueue `created.enqueue`
+	 * (the transaction is not committed yet); a started engine claims it with
+	 * {@link RunStore.claimOutbox} after the commit. Not combinable with `debounce` (the store
+	 * throws). Only the SQL store supports it (the memory store throws).
+	 */
+	outbox?: { channel: string };
 }
 
 /**
@@ -486,11 +495,11 @@ export interface RunStore {
 	/**
 	 * Trigger (decision 9; also used by `runs.replay()` without `idempotency`,
 	 * and by schedule ticks). Inserts the run (`queued`, attempt 1, enqueue_seq 1,
-	 * `run_after = now() + delayMs`, no parent), then claims the key via
-	 * {@link IdempotencyStore.claim}. Not claimed => roll back the insert
-	 * (ROLLBACK, or ROLLBACK TO SAVEPOINT inside a StoreTx) and return the run that
-	 * owns the key, enqueuing nothing. If that run vanished meanwhile (retention),
-	 * retry the whole operation once.
+	 * `run_after = now() + delayMs`, no parent) and claims the key with
+	 * {@link IdempotencyStore.claim}'s semantics, atomically (SQL: one statement,
+	 * the run inserted only if the key was claimed; no savepoint). Not claimed =>
+	 * no run is inserted; return the run that owns the key, enqueuing nothing. If
+	 * that run vanished meanwhile (retention), retry the whole operation once.
 	 *
 	 * With `debounce` (decision 24), in one transaction: `SELECT ... FOR UPDATE` the `queued` run
 	 * with the same `(task_id, debounce_key)`. Found => collapse into it: `run_after` recomputed
@@ -506,6 +515,16 @@ export interface RunStore {
 	 * collapsing into that run. Never `xmax`.
 	 */
 	create(input: NewRun): Promise<CreateRunResult>;
+
+	/**
+	 * Decision 26: claims up to `limit` committed runs with `outbox_pending` (oldest `created_at`
+	 * first, `FOR UPDATE SKIP LOCKED`, so concurrent sweeps of several engines split the rows and
+	 * never dispatch one twice) and clears the flag in the same statement. `claimed` counts every
+	 * cleared row (the caller sweeps again while `claimed === limit`); `enqueue` holds only those
+	 * still `queued` (a run already acquired through the reconciler's re-enqueue, or canceled, is
+	 * just cleared). `updated_at` is not touched.
+	 */
+	claimOutbox(limit: number): Promise<OutboxClaim>;
 
 	/**
 	 * `step.trigger` / `triggerAndWait` / `batchTriggerAndWait` in ONE transaction
@@ -683,6 +702,12 @@ export interface RunStore {
 	 * get `parent_*` SET NULL. Returns the number deleted (0 => done).
 	 */
 	deleteFinishedBatch(olderThanMs: number, limit: number): Promise<number>;
+}
+
+/** Result of {@link RunStore.claimOutbox}. */
+export interface OutboxClaim {
+	claimed: number;
+	enqueue: Array<EnqueueRequest & { attempt: number; error: SerializedError | null }>;
 }
 
 /**

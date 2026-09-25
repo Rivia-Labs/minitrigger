@@ -308,6 +308,11 @@ function acquireRow(tx: MemTx, runId: string, executionId: string, seq: number) 
 export function createRunStore(exec: Exec): RunStore {
 	return {
 		async create(input) {
+			if (input.outbox) {
+				// Decision 26 needs the caller's Postgres transaction; the test engine rejects
+				// `trigger(..., { tx })` before reaching the store.
+				throw new Error("runs.create: outbox (trigger in the caller's transaction) is SQL-only");
+			}
 			const debounce = input.debounce;
 			if (debounce) {
 				if (input.idempotency) {
@@ -320,6 +325,11 @@ export function createRunStore(exec: Exec): RunStore {
 				if (result !== "retry") return result;
 			}
 			throw new Error(`run owning idempotency key of task ${input.taskId} kept vanishing`);
+		},
+
+		async claimOutbox() {
+			// Nothing is ever flagged: `create` rejects `outbox` above.
+			return { claimed: 0, enqueue: [] };
 		},
 
 		async triggerChildren(input: TriggerChildrenInput): Promise<TriggerChildrenResult> {

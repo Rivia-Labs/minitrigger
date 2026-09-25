@@ -1,7 +1,7 @@
 import type { Pool } from "pg";
 import { validateSqlIdentifier } from "../../utils/identifiers.js";
-import type { Store, StoreTx } from "../types.js";
-import { createSqlContext, type SqlExecutor } from "./db.js";
+import type { RunStore, Store, StoreTx } from "../types.js";
+import { createSqlContext, type SqlExecutor, type SqlQueryable } from "./db.js";
 import { createIdempotencyStore } from "./idempotency.js";
 import { createLogStore } from "./logs.js";
 import { createRunStore } from "./runs.js";
@@ -59,4 +59,14 @@ export function createSqlStore(pool: Pool, schema: string): Store {
 			}
 		},
 	};
+}
+
+/**
+ * Decision 26: a {@link RunStore} bound to a transaction the CALLER opened on its own client
+ * (`trigger(..., { tx })`). Every method runs inside that transaction (`atomic` never opens or
+ * ends one on a tx executor); only `create` is meant to be used. Cheap to build per call.
+ */
+export function createSqlTxRunStore(client: SqlQueryable, schema: string): RunStore {
+	validateSqlIdentifier("schema", schema);
+	return createRunStore({ kind: "tx", client }, createSqlContext(schema));
 }

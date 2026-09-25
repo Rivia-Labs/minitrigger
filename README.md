@@ -41,33 +41,48 @@ is lost — see [Operation](#operation).
 
 ## Install
 
-`minitrigger` isn't published to a registry. Install a `.tgz` from GitHub Releases (recommended) or
-straight from GitHub (works, but needs one opt-in on your side). Either way, `bullmq`, `ioredis` and
-`pg` are **peer dependencies** — never bundled — so install them alongside `minitrigger`.
+`bullmq`, `ioredis` and `pg` are **peer dependencies** — never bundled — so install them alongside
+`@rivia-labs/minitrigger`.
 
-### Recommended: `.tgz` from GitHub Releases
-
-The repository (`igorabreu29/minitrigger`) is **private**, so release assets need GitHub
-authentication. Download the tarball with the GitHub CLI (logged in with access to the repo) and add
-it from disk:
+### Recommended: npm (or any npm-compatible registry client)
 
 ```bash
-gh release download v0.2.0 -R igorabreu29/minitrigger -p "minitrigger-*.tgz"
-pnpm add ./minitrigger-0.2.0.tgz bullmq ioredis pg
+pnpm add @rivia-labs/minitrigger bullmq ioredis pg
+pnpm add -D @types/pg   # optional, only needed if you use TypeScript
+```
+
+(`npm install`/`yarn add` work the same way — nothing pnpm-specific about the published package.)
+
+### Alternative: `.tgz` from GitHub Releases
+
+Useful for pinning to an exact artifact without going through the registry (e.g. vendoring it, or
+installing from a private mirror). If the repository (`igorabreu29/minitrigger`) is private for
+you, release assets need GitHub authentication; download the tarball with the GitHub CLI (logged in
+with access to the repo) and add it from disk:
+
+```bash
+gh release download v0.2.0 -R igorabreu29/minitrigger -p "*.tgz"
+pnpm add ./rivia-labs-minitrigger-0.2.0.tgz bullmq ioredis pg
 pnpm add -D @types/pg   # optional, only needed if you use TypeScript
 ```
 
 Commit the `.tgz` (e.g. under `vendor/`) or fetch it in CI with a token that can read the repo.
 
-A release tarball already contains the built `dist/` (`pnpm pack`'s `files: ["dist"]`), so nothing
-builds on install: no pnpm `allowBuilds` opt-in, and no fresh, possibly-differently-resolved
+A release tarball already contains the built `dist/` (`pnpm pack`'s `files: ["dist", "LICENSE"]`),
+so nothing builds on install: no pnpm `allowBuilds` opt-in, and no fresh, possibly-differently-resolved
 `ioredis`/`msgpackr-extract` pulled in transitively just to run a build script. It's also pinned and
 reproducible — a fixed artifact per version, not "whatever `HEAD` currently contains." `pnpm
 check:pack` (see [Benchmark](#benchmark)) exercises exactly this pack → install → import path in CI.
 
+Releases up to and including `v0.2.0` were published under the unscoped name `minitrigger` (the
+tarball and its `package.json` inside that tag say `minitrigger`, not `@rivia-labs/minitrigger`) —
+that only matters if you pin to one of those older tags; from `v0.3.0` on, everything (npm, the
+release tarball, the GitHub-install fallback below) uses `@rivia-labs/minitrigger`.
+
 ### Fallback: install straight from GitHub
 
-Needs git access to the private repo (SSH key or a credential helper for HTTPS).
+Needs git access to the repo (SSH key or a credential helper for HTTPS) — only relevant while/if the
+repository is private; a public repo needs no auth for this.
 
 ```bash
 pnpm add github:igorabreu29/minitrigger#v0.2.0 bullmq ioredis pg
@@ -80,14 +95,17 @@ blocks a git dependency's lifecycle scripts by default — so a plain `pnpm add 
 ```yaml
 # your project's pnpm-workspace.yaml
 allowBuilds:
-  minitrigger@github.com/igorabreu29/minitrigger#<resolved-commit>: true
+  minitrigger@github.com/igorabreu29/minitrigger#<resolved-commit>: true # tags up to v0.2.0
+  # "@rivia-labs/minitrigger@github.com/igorabreu29/minitrigger#<resolved-commit>": true  # v0.3.0+
   msgpackr-extract: true # ioredis's optional native accelerator; blocked by the same pnpm mechanism
 ```
 
-The `minitrigger@...` key must match the exact resolved git spec pnpm prints in its own
-`ERR_PNPM_GIT_DEP_PREPARE_NOT_ALLOWED` error (package name + normalized git URL + resolved commit) —
-copy it from that error rather than guessing, and expect to update it whenever you bump to a newer
-commit/tag. Full reproduction and reasoning: `docs/research/github-install.md`.
+The `<package-name>@github.com/...` key must match the exact resolved git spec pnpm prints in its
+own `ERR_PNPM_GIT_DEP_PREPARE_NOT_ALLOWED` error (package name + normalized git URL + resolved
+commit) — copy it from that error rather than guessing (the package name in that key is whatever
+`package.json` says **at the tag/commit you're installing**, per the note above), and expect to
+update it whenever you bump to a newer commit/tag. Full reproduction and reasoning:
+`docs/research/github-install.md`.
 
 ### Peer dependencies & requirements
 
@@ -98,7 +116,7 @@ commit/tag. Full reproduction and reasoning: `docs/research/github-install.md`.
 | `pg` | `^8.13.0` |
 | `@types/pg` | `^8.11.0` (optional peer — only needed because the public types reference `pg.Pool`) |
 
-Also requires **Node >= 24**, **Postgres >= 13** (checked by `checkEnvironment`/`engine.start()`),
+Also requires **Node >= 22**, **Postgres >= 13** (checked by `checkEnvironment`/`engine.start()`),
 and **Redis with `maxmemory-policy noeviction`** — see [Infrastructure](#infrastructure) below.
 
 ## Infrastructure
@@ -132,7 +150,7 @@ policy lets Redis silently drop that state under memory pressure; `minitrigger` 
 ## Quick start
 
 ```ts
-import { createEngine, defineTask } from "minitrigger";
+import { createEngine, defineTask } from "@rivia-labs/minitrigger";
 
 const sendWelcomeEmail = defineTask({
 	id: "send-welcome-email",
@@ -296,6 +314,82 @@ queue **without spending an attempt**, and tries again.
   worker's own registry, not shared centrally.
 - A crashed process's `running` run keeps holding its key's slot until stall recovery
   (`stallTimeoutMs`) notices and requeues it — a hung worker can block a key for up to that long.
+
+### Transactional trigger (outbox)
+
+Pass your own transaction as `tx` and the run is inserted **inside it**: your business write and
+the run commit — or roll back — together. No more "order saved but the email job never queued" (or
+the reverse).
+
+```ts
+import { Pool } from "pg";
+
+const pool = new Pool({ connectionString: process.env.DATABASE_URL }); // same database as the engine
+
+const client = await pool.connect();
+try {
+  await client.query("BEGIN");
+  const { rows } = await client.query(
+    "INSERT INTO orders (customer_id, total) VALUES ($1, $2) RETURNING id",
+    [customerId, total],
+  );
+  await engine.trigger(sendReceipt, { orderId: rows[0].id }, {
+    tx: client,
+    idempotencyKey: `receipt-${rows[0].id}`, // optional; works inside the transaction too
+  });
+  await client.query("COMMIT"); // only now can the run execute
+} catch (error) {
+  await client.query("ROLLBACK"); // the run is gone too; nothing ever executes
+  throw error;
+} finally {
+  client.release();
+}
+```
+
+- `tx` is a node-postgres `PoolClient`/`Client` on which you already ran `BEGIN` (or any object
+  with the same `query(text, values)` shape bound to an open transaction — the seam for ORM
+  adapters). Passing the `Pool` itself is rejected: its queries would run outside your transaction.
+- Nothing is enqueued before your `COMMIT`. The insert also queues a `NOTIFY` (delivered only on
+  commit, **one per transaction** however many runs it triggers); every started engine `LISTEN`s
+  on a schema-scoped channel over a dedicated connection and dispatches the committed runs within
+  milliseconds. `trigger` returns the handle right away; the `run:queued` event / status is
+  published by the engine that dispatches the run, after the commit.
+- **If the notification is lost** (listener reconnecting, no started engine at commit time, a
+  pooler that breaks `LISTEN`), each started engine also sweeps every **2 s** and whenever it
+  (re)connects or starts, so the run is still dispatched; an enqueue lost after that is recovered
+  by the reconciler (`reconciler.intervalMs` + `graceMs`, as for any trigger). A trigger-only
+  engine never listens: some engine must be started for the run to execute, as always.
+- **PgBouncer (transaction pooling)** breaks `LISTEN` (the session is not kept): runs are then
+  dispatched by the 2 s sweep. Point the engine's `postgres` at a session-mode pool or directly
+  at Postgres for millisecond dispatch. Your `tx` client itself can come from anywhere that keeps
+  one transaction on one server connection.
+- **Cost.** One extra `NOTIFY` per transaction; Postgres serializes the commits of transactions
+  that notify (a database-wide lock taken at commit), so at very high rates of small transactions
+  that each trigger, batch several triggers per transaction. Every `NOTIFY` wakes **every** started
+  engine of the schema; each runs one claim sweep (bursts are coalesced, and `SKIP LOCKED` makes
+  exactly one of them dispatch each run), so the cost per commit grows with the number of started
+  engines, not with the number of runs.
+- **Connections.** Each started engine holds its `LISTEN` connection outside the pool, in
+  addition to the leader-election one — see [pool sizing](#operation).
+- **A stuck listener can hold back every notifying commit.** Postgres keeps undelivered
+  notifications in one cluster-wide queue (8 GB) until the slowest listening backend consumes
+  them; a `LISTEN` session that stops reading (a frozen process whose socket stays open) pins it,
+  and once it is full, `COMMIT`s that notify fail. The engine's listener uses TCP keepalive and
+  reconnects on error, so a dead peer is dropped; for a hung-but-alive process, monitor
+  `pg_notification_queue_usage()` and terminate the offending backend
+  (`pg_stat_activity` where `query LIKE 'LISTEN %mt_outbox_%'`).
+- With `idempotencyKey`, the key claim and the run insert are **one statement** (no `SAVEPOINT`):
+  a key that belongs to a live run returns that run, inserts nothing and your transaction stays
+  usable. No subtransaction is opened per trigger, so hundreds of keyed triggers in one
+  transaction are fine (no subxid-cache overflow). The key row stays locked until your transaction
+  ends, so a concurrent trigger with the same key waits for it. A client without `BEGIN` works too
+  (each trigger then autocommits on its own — you just lose the atomicity with your writes).
+- `delay` counts from the start of your transaction (Postgres `now()`). Not combinable with
+  `debounce` (it would lock the shared pending run until your transaction ends) and not supported
+  by `createTestEngine` (`ConfigError`). The engine only runs parameterized, schema-qualified
+  statements on your client — never `SET`, `LISTEN` or other session state.
+- Upgrading from 0.2.x: migration `006_outbox` adds a column and a partial index; see
+  [Upgrading to 0.3.0](#upgrading-to-030).
 
 ### Queues
 
@@ -713,12 +807,17 @@ interface StepApi {
 
 ## Testing your tasks
 
-`createTestEngine({ tasks })` runs your real task code with **no Redis and no Postgres**: an
-in-memory store and queue, driven through the same executor as production (replay, memoization,
-suspension, retries, non-determinism checks). Nothing runs in the background; the test drives it.
+`createTestEngine({ tasks })`, imported from the **`@rivia-labs/minitrigger/testing`** subpath (not
+the main entry), runs your real task code with **no Redis and no Postgres**: an in-memory store and
+queue, driven through the same executor as production (replay, memoization, suspension, retries,
+non-determinism checks). Nothing runs in the background; the test drives it. The subpath keeps
+`createTestEngine` and its in-memory backend out of the main entry's bundle/load time for consumers
+who never test this way; error classes (`ConfigError`, `NonDeterminismError`, etc.) still come from
+the main entry, and `instanceof` checks against them work the same for errors thrown by a task
+running under `createTestEngine` — both entries share the same compiled chunk, not separate copies.
 
 ```ts
-import { createTestEngine } from "minitrigger";
+import { createTestEngine } from "@rivia-labs/minitrigger/testing";
 import { expect, it } from "vitest";
 import { approval } from "./tasks.js";
 
@@ -773,6 +872,43 @@ it("approves a document", async () => {
   than `maxJobsPerDrain` jobs (default 10 000) throws, to catch runs that never settle. Of
   `retention`, only `days` is accepted (for the idempotency-key TTL check, exactly as in
   `createEngine`): the test engine never runs retention sweeps.
+
+## Upgrading to 0.3.0
+
+- **Package renamed** to `@rivia-labs/minitrigger`: replace the `minitrigger` dependency and every
+  `from "minitrigger"` import.
+- **`createTestEngine` moved** to the `@rivia-labs/minitrigger/testing` subpath (`import {
+  createTestEngine } from "@rivia-labs/minitrigger/testing"`); it is no longer exported from the
+  main entry. `typesVersions` maps the subpath for `moduleResolution: "node10"` consumers.
+- **Node.js >= 22** is required.
+- **Migration `006_outbox`** (transactional trigger, decision 26) adds
+  `runs.outbox_pending boolean NOT NULL DEFAULT false` (metadata-only, near-instant) and a partial
+  index with a plain `CREATE INDEX`, which holds a `SHARE` lock on `runs` while it scans the table
+  (same trade-off as 005 below). On a large `runs` table, either accept the pause in a
+  maintenance window, or pre-build it `CONCURRENTLY` and mark version 6 applied — outside a
+  transaction, against the target schema, before `engine.migrate()`:
+
+  ```sql
+  SET search_path TO "<schema>";
+  SET lock_timeout = '5s';
+
+  ALTER TABLE runs ADD COLUMN IF NOT EXISTS outbox_pending boolean NOT NULL DEFAULT false;
+
+  CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_runs_outbox_pending
+    ON runs (created_at) WHERE outbox_pending;
+
+  -- Must return indisvalid = t; if f (interrupted build), DROP INDEX CONCURRENTLY and rebuild.
+  SELECT indisvalid FROM pg_index
+  WHERE indexrelid = '"<schema>".idx_runs_outbox_pending'::regclass;
+
+  -- Only once indisvalid = t:
+  INSERT INTO "<schema>".schema_migrations (version, name)
+  VALUES (6, 'outbox')
+  ON CONFLICT (version) DO NOTHING;
+  ```
+
+  Check the definitions against `src/migrations/006_outbox.sql` of the version you install. Coming
+  from 0.1.x, apply the 0.2.0 steps below first.
 
 ## Upgrading to 0.2.0
 
@@ -913,7 +1049,9 @@ concern is specific to 005's two new indexes.
   too (5 s): if a client is still checked out, `stop()` logs a `warn` and resolves, and the pool
   finishes closing once that client is released. An injected pool is never closed.
 - **Pool sizing.** The pool needs `max >= total worker concurrency + 5` (the engine's own
-  bookkeeping queries need headroom beyond what your workers consume). A pool the engine creates
+  bookkeeping queries need headroom beyond what your workers consume). On top of the pool, every
+  **started** engine holds **two** dedicated connections outside it (leader election and the
+  outbox `LISTEN`), so budget `max_connections` for `processes × (pool.max + 2)`. A pool the engine creates
   gets that size by default (at least 10) and a 10 s `connectionTimeoutMillis`
   (`pool.connectionTimeoutMs`). If you inject your own `pg.Pool`, size it the same way and set a
   `connectionTimeoutMillis`: `start()` warns when it is smaller than the started queues need or
@@ -981,6 +1119,15 @@ install](#install) exercises.
   inferred `unknown` payload type to "no payload" (so `trigger(task)` is callable without a second
   argument); this applies whether the payload was truly omitted or explicitly typed as `unknown`.
   Use a named type (even a loose one) if you need `trigger()` to require an argument.
+
+## Contributing & releasing
+
+`pnpm typecheck && pnpm lint && pnpm test` must be green before any change lands; `pnpm test`
+needs the docker infra (`pnpm infra:up`) and includes the isolated `FLUSHALL` project (local
+Redis only). `prepublishOnly` deliberately runs only `pnpm typecheck && pnpm lint &&
+pnpm test:unit` (no infra, never a `FLUSHALL` on whatever Redis the publishing machine points
+at), and `prepare` builds `dist/`. So **run the full `pnpm test` against the local infra, plus
+`pnpm check:pack`, before `pnpm publish`** — publishing does not do it for you.
 
 ## Golden rules
 

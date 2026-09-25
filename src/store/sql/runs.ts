@@ -23,7 +23,6 @@ import type {
 } from "../types.js";
 import { concurrencyLimitedDelayMs, MAX_LIST_LIMIT } from "../types.js";
 import { atomic, type Db, direct, type SqlContext, type SqlExecutor } from "./db.js";
-import { claimKey } from "./idempotency.js";
 import {
 	applyResumeRule,
 	blockingWaitpointExistsSql,
@@ -83,44 +82,78 @@ function enqueueOfRow(row: RunRow & { delay_ms: number }): EnqueueRequest {
 export function createRunStore(exec: SqlExecutor, ctx: SqlContext): RunStore {
 	const runs = ctx.t("runs");
 
+	/**
+	 * One create attempt, a single autocommit-safe statement (no BEGIN, no SAVEPOINT): the caller's
+	 * transaction (decision 26) never gets a subtransaction per trigger, so hundreds of keyed
+	 * triggers in one transaction cannot overflow the backend's subxid cache (suboverflow makes
+	 * every snapshot on the cluster, replicas included, fall back to pg_subtrans lookups).
+	 *
+	 * With an idempotency key, decision 9's claim (`ON CONFLICT ... WHERE expires_at < now()
+	 * RETURNING`, never `xmax`) runs in a CTE and the run row is inserted only `WHERE EXISTS` a
+	 * claimed row. The key row references the run inserted by the sibling CTE: both CTEs share one
+	 * snapshot, but the (non-deferrable) FK check is an after-trigger fired at the end of the
+	 * statement, when the run row exists (verified on Postgres 16). A live key inserts nothing (and
+	 * queues no NOTIFY: `pg_notify` is in the run insert's RETURNING); its owner is then read by a
+	 * second statement, which sees a concurrent claimer that committed meanwhile.
+	 */
 	async function createOnce(db: Db, input: NewRun): Promise<CreateOnce> {
 		const idem = input.idempotency;
-		if (idem) await db.query("SAVEPOINT mt_create_run");
-		const { rows } = await db.query<RunRow & { delay_ms: number }>(
+		// Decision 26: with `outbox`, the row is flagged for the post-commit claim and the same
+		// statement queues a NOTIFY (delivered only on commit). The payload is constant, so
+		// Postgres collapses every trigger of one transaction into a single notification.
+		const outbox = input.outbox;
+		const params: unknown[] = [
+			input.id,
+			input.taskId,
+			input.queue,
+			jsonParam(input.payload),
+			input.maxAttempts,
+			input.delayMs,
+			input.concurrencyKey ?? null,
+			outbox !== undefined,
+		];
+		const notify = outbox
+			? `, pg_notify($${params.push(outbox.channel)}::text, '') AS notified`
+			: "";
+		const insertRun = (source: string) =>
 			`INSERT INTO ${runs} (id, task_id, queue, payload, status, attempt, max_attempts,
-			   enqueue_seq, run_after, created_at, updated_at, concurrency_key)
-			 VALUES ($1, $2, $3, $4::jsonb, 'queued', 1, $5, 1, ${nowPlusMs("$6")},
-			   ${CREATED_AT_SQL}, now(), $7)
-			 RETURNING ${RUN_COLUMNS}, ${DELAY_MS_SQL} AS delay_ms`,
-			[
-				input.id,
-				input.taskId,
-				input.queue,
-				jsonParam(input.payload),
-				input.maxAttempts,
-				input.delayMs,
-				input.concurrencyKey ?? null,
-			]
-		);
-		const row = rows[0];
-		if (!row) throw new Error("runs insert returned no row");
+			   enqueue_seq, run_after, created_at, updated_at, concurrency_key, outbox_pending)
+			 ${source}
+			 RETURNING ${RUN_COLUMNS}, ${DELAY_MS_SQL} AS delay_ms${notify}`;
+		const values = `$1::uuid, $2::text, $3::text, $4::jsonb, 'queued', 1, $5::int, 1,
+			   ${nowPlusMs("$6")}, ${CREATED_AT_SQL}, now(), $7::text, $8::boolean`;
+		let sql: string;
 		if (idem) {
-			const claim = await claimKey(db, ctx, {
-				taskId: input.taskId,
-				key: idem.key,
-				runId: input.id,
-				ttlMs: idem.ttlMs,
-			});
-			if (claim === null || !claim.claimed) {
-				await db.query("ROLLBACK TO SAVEPOINT mt_create_run");
-				await db.query("RELEASE SAVEPOINT mt_create_run");
-				if (claim === null) return "retry";
-				const existing = await getRun(db, claim.existingRunId);
-				return existing ? { kind: "existing", run: existing } : "retry";
-			}
-			await db.query("RELEASE SAVEPOINT mt_create_run");
+			const key = params.push(idem.key);
+			const ttl = params.push(idem.ttlMs);
+			sql = `WITH claim AS (
+			     INSERT INTO ${ctx.t("idempotency_keys")} AS k (task_id, key, run_id, expires_at)
+			     VALUES ($2, $${key}, $1,
+			       CASE WHEN $${ttl}::float8 IS NULL THEN NULL ELSE ${nowPlusMs(`$${ttl}`)} END)
+			     ON CONFLICT (task_id, key) DO UPDATE
+			       SET run_id = EXCLUDED.run_id, expires_at = EXCLUDED.expires_at
+			       WHERE k.expires_at < now()
+			     RETURNING run_id
+			   ), created AS (
+			     ${insertRun(`SELECT ${values} WHERE EXISTS (SELECT 1 FROM claim)`)}
+			   )
+			   SELECT * FROM created`;
+		} else {
+			sql = insertRun(`VALUES (${values})`);
 		}
-		return { kind: "created", run: mapRun(row), enqueue: enqueueOfRow(row) };
+		const { rows } = await db.query<RunRow & { delay_ms: number }>(sql, params);
+		const row = rows[0];
+		if (row) return { kind: "created", run: mapRun(row), enqueue: enqueueOfRow(row) };
+		if (!idem) throw new Error("runs insert returned no row");
+		// Live key: its owner. No row: it vanished since (retention deleted its run); retry.
+		const { rows: owners } = await db.query<RunRow>(
+			`SELECT ${RUN_COLUMNS} FROM ${runs}
+			 WHERE id = (SELECT run_id FROM ${ctx.t("idempotency_keys")}
+			             WHERE task_id = $1 AND key = $2)`,
+			[input.taskId, idem.key]
+		);
+		const owner = owners[0];
+		return owner ? { kind: "existing", run: mapRun(owner) } : "retry";
 	}
 
 	/**
@@ -340,6 +373,9 @@ export function createRunStore(exec: SqlExecutor, ctx: SqlContext): RunStore {
 	return {
 		async create(input) {
 			const debounce = input.debounce;
+			if (debounce && input.outbox) {
+				throw new Error("runs.create: debounce and outbox are mutually exclusive");
+			}
 			if (debounce) {
 				if (input.idempotency) {
 					throw new Error("runs.create: debounce and idempotency are mutually exclusive");
@@ -357,10 +393,34 @@ export function createRunStore(exec: SqlExecutor, ctx: SqlContext): RunStore {
 				);
 			}
 			for (let i = 0; i < 2; i++) {
-				const result = await atomic(exec, db => createOnce(db, input));
+				const result = await createOnce(direct(exec), input);
 				if (result !== "retry") return result;
 			}
 			throw new Error(`run owning idempotency key of task ${input.taskId} kept vanishing`);
+		},
+
+		async claimOutbox(limit) {
+			const { rows } = await direct(exec).query<
+				EnqueueRow & { attempt: number; error: SerializedError | null }
+			>(
+				`WITH picked AS (
+				   SELECT id FROM ${runs} WHERE outbox_pending
+				   ORDER BY created_at LIMIT $1
+				   FOR UPDATE SKIP LOCKED
+				 )
+				 UPDATE ${runs} r SET outbox_pending = false
+				 FROM picked WHERE r.id = picked.id
+				 RETURNING r.id, r.task_id, r.queue, r.enqueue_seq, r.status, r.updated_at, r.attempt,
+				   r.error, greatest(0, round(extract(epoch from (r.run_after - now())) * 1000))::float8
+				     AS delay_ms`,
+				[limit]
+			);
+			return {
+				claimed: rows.length,
+				enqueue: rows
+					.filter(row => row.status === "queued")
+					.map(row => ({ ...mapEnqueue(row), attempt: row.attempt, error: row.error })),
+			};
 		},
 
 		triggerChildren(input: TriggerChildrenInput): Promise<TriggerChildrenResult> {

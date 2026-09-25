@@ -1,10 +1,19 @@
-import { escapeIdentifier, type Pool, type PoolClient, type QueryResultRow } from "pg";
+import { escapeIdentifier, type Pool, type QueryResultRow } from "pg";
+
+/**
+ * The minimal client a transaction-bound repository needs: node-postgres `PoolClient`/`Client`
+ * satisfy it, and so can a thin adapter over another driver/ORM transaction (decision 26: the seam
+ * for `trigger(..., { tx })`). Parameters use `$1..$n` placeholders; `rowCount` may be omitted.
+ */
+export interface SqlQueryable {
+	query(text: string, values?: unknown[]): Promise<{ rows: unknown[]; rowCount?: number | null }>;
+}
 
 /**
  * Where a repository sends its SQL. Bound to the pool, each store method opens its own
  * transaction; bound to a transaction, it runs inside the caller's (see docs/store-contract.md).
  */
-export type SqlExecutor = { kind: "pool"; pool: Pool } | { kind: "tx"; client: PoolClient };
+export type SqlExecutor = { kind: "pool"; pool: Pool } | { kind: "tx"; client: SqlQueryable };
 
 export interface SqlContext {
 	/** Escaped schema name, e.g. `"minitrigger"`. */
@@ -34,11 +43,11 @@ export interface Db {
 	): Promise<{ rows: R[]; rowCount: number }>;
 }
 
-function wrap(client: PoolClient): Db {
+function wrap(client: SqlQueryable): Db {
 	return {
 		async query<R extends QueryResultRow>(text: string, values?: unknown[]) {
-			const res = await client.query<R>(text, values);
-			return { rows: res.rows, rowCount: res.rowCount ?? 0 };
+			const res = await client.query(text, values);
+			return { rows: res.rows as R[], rowCount: res.rowCount ?? 0 };
 		},
 	};
 }

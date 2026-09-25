@@ -37,6 +37,12 @@ import {
 import { createLeaderElector, type LeaderElector } from "./leader.js";
 import { type MigrateResult, migrate } from "./migrations/migrate.js";
 import {
+	createOutboxListener,
+	OUTBOX_BATCH_SIZE,
+	type OutboxListener,
+	outboxChannel,
+} from "./outbox.js";
+import {
 	createPubSub,
 	createPubSubPublisher,
 	type PubSub,
@@ -60,10 +66,13 @@ import {
 	ScheduleTickSchemaMismatchError,
 	syncDeclarativeSchedules,
 } from "./schedules.js";
-import { createSqlStore } from "./store/sql/index.js";
+import type { SqlQueryable } from "./store/sql/db.js";
+import { createSqlStore, createSqlTxRunStore } from "./store/sql/index.js";
 import {
+	type CreateRunResult,
 	type Json,
 	type LogLevel,
+	type NewRun,
 	type NewRunDebounce,
 	type RunCursor,
 	type RunRecord,
@@ -136,7 +145,28 @@ export interface TriggerOptions {
 	 * execute at once. The task's queue must declare `concurrencyKey: { limit }`.
 	 */
 	concurrencyKey?: string;
+	/**
+	 * Decision 26 (transactional trigger / outbox): inserts the run inside YOUR open transaction,
+	 * so it commits or rolls back together with your own writes. Pass the node-postgres client on
+	 * which you ran `BEGIN` (`await pool.connect()` + `BEGIN`, or a `pg.Client`), connected to the
+	 * engine's database; never the `Pool` itself. Nothing is enqueued before your `COMMIT`: after it,
+	 * a started engine (any process) dispatches the run within milliseconds (LISTEN/NOTIFY), or
+	 * within ~2 s by its poll if the notification is lost. `delay` counts from the start of your
+	 * transaction (Postgres `now()`). No status/event is emitted by `trigger` itself: `run:queued`
+	 * is emitted by the engine that dispatches the run. Not combinable with `debounce`.
+	 * The engine only runs single parameterized statements on it (no `SAVEPOINT`, so any number
+	 * of triggers, with or without `idempotencyKey`, opens no subtransaction), never session-level
+	 * state. A client without `BEGIN` also works: each trigger then autocommits on its own.
+	 */
+	tx?: TransactionClient;
 }
+
+/**
+ * What `trigger(..., { tx })` accepts: a node-postgres `PoolClient`/`Client` inside `BEGIN`, or
+ * any adapter with the same `query(text, values)` shape (`$1..$n` placeholders) bound to an open
+ * transaction on the engine's database (decision 26).
+ */
+export type TransactionClient = SqlQueryable;
 
 /** Decision 24: `trigger(task, payload, { debounce })`. */
 export interface DebounceOptions {
@@ -425,6 +455,11 @@ export interface EngineBackend {
 		name: string,
 		signal: AbortSignal | undefined
 	): AsyncIterable<string | Json>;
+	/**
+	 * Decision 26: `runs.create` inside the caller's transaction, flagged for the outbox. Absent
+	 * (test engine): `trigger(..., { tx })` is a `ConfigError`.
+	 */
+	createRunInTransaction?(tx: TransactionClient, input: NewRun): Promise<CreateRunResult>;
 }
 
 /** Lifecycle state owned by the engine wrapping the core. @internal */
@@ -627,13 +662,14 @@ export function createEngineCore(
 			idempotency?: { key: string; ttlMs: number } | undefined;
 			debounce?: NewRunDebounce | undefined;
 			concurrencyKey?: string | undefined;
+			tx?: TransactionClient | undefined;
 		}
 	): Promise<RunHandle<never>> {
 		assertSerializable(payload, {
 			label: `payload of task "${task.id}"`,
 			maxBytes: resolved.limits.maxPayloadBytes,
 		});
-		const result = await store.runs.create({
+		const input: NewRun = {
 			id: randomUUID(),
 			taskId: task.id,
 			queue: taskQueueName(task),
@@ -643,7 +679,14 @@ export function createEngineCore(
 			...(options.idempotency ? { idempotency: options.idempotency } : {}),
 			...(options.debounce ? { debounce: options.debounce } : {}),
 			...(options.concurrencyKey !== undefined ? { concurrencyKey: options.concurrencyKey } : {}),
-		});
+		};
+		if (options.tx !== undefined) {
+			// Decision 26: nothing is enqueued or published here (the caller's transaction is not
+			// committed); the engine that claims the run after the commit does both.
+			const result = await createRunInCallerTransaction(options.tx, input);
+			return { id: result.run.id, taskId: result.run.taskId };
+		}
+		const result = await store.runs.create(input);
 		// Decision 9: only a newly created run is enqueued; an existing one is returned as-is.
 		if (result.kind === "created") {
 			notifier.status({
@@ -666,6 +709,21 @@ export function createEngineCore(
 			await transport.removeRunJob(result.run.queue, result.run.id, result.staleSeq);
 		}
 		return { id: result.run.id, taskId: result.run.taskId };
+	}
+
+	async function createRunInCallerTransaction(
+		tx: TransactionClient,
+		input: NewRun
+	): Promise<CreateRunResult> {
+		const create = backend.createRunInTransaction;
+		if (!create) {
+			throw new ConfigError(
+				"trigger(..., { tx }) is not supported by this engine (createTestEngine has no Postgres " +
+					"transaction to join): trigger without `tx` in tests, e.g. behind a function that " +
+					"takes the transaction and is called only in production"
+			);
+		}
+		return create(tx, input);
 	}
 
 	async function trigger<T extends AnyTask>(
@@ -703,7 +761,16 @@ export function createEngineCore(
 				? undefined
 				: resolveConcurrencyKey(registry, task, options.concurrencyKey);
 
-		return createRun(task, payload, { delayMs, idempotency, debounce, concurrencyKey });
+		const tx = options.tx === undefined ? undefined : validateTransactionClient(options.tx);
+		if (tx !== undefined && debounce !== undefined) {
+			throw new ConfigError(
+				"trigger options.tx cannot be combined with options.debounce: collapsing into the " +
+					"pending run would lock that shared run (and block its workers and every other " +
+					"trigger of the key) until your transaction ends; trigger with debounce after COMMIT"
+			);
+		}
+
+		return createRun(task, payload, { delayMs, idempotency, debounce, concurrencyKey, tx });
 	}
 
 	/** Bounded wait for the best-effort publishes still in flight. */
@@ -1036,6 +1103,11 @@ export function createEngine(config: EngineConfig): Engine {
 	}
 
 	const streams = createStreams({ redis: connections.shared(), prefix: resolved.prefix });
+	/** Decision 26: the schema's NOTIFY channel and, once started, its listener. */
+	const outbox: { channel: string; listener: OutboxListener | undefined } = {
+		channel: outboxChannel(resolved.schema),
+		listener: undefined,
+	};
 	/** The pub/sub subscriber connection, once created (disconnected directly by `stop()`). */
 	let subscriberConnection: Redis | undefined;
 	/**
@@ -1099,6 +1171,11 @@ export function createEngine(config: EngineConfig): Engine {
 			},
 			streams,
 			readStream: readRunStream,
+			createRunInTransaction: (tx, input) =>
+				createSqlTxRunStore(tx, resolved.schema).create({
+					...input,
+					outbox: { channel: outbox.channel },
+				}),
 		},
 		{ isShuttingDown: () => shuttingDown, assertNotStopped }
 	);
@@ -1324,6 +1401,7 @@ export function createEngine(config: EngineConfig): Engine {
 				throw error;
 			}
 
+			startOutboxListener();
 			startLeaderLoop();
 		})();
 		startPromise = attempt.then(
@@ -1399,6 +1477,55 @@ export function createEngine(config: EngineConfig): Engine {
 					"(e.g. 10000)"
 			);
 		}
+	}
+
+	/**
+	 * Decision 26: claims committed `trigger(..., { tx })` runs, publishes `queued` (the transition
+	 * the caller's `trigger` could not publish before its commit) and enqueues them. An enqueue lost
+	 * here is recovered by the reconciler (decision 1): the flag is already cleared.
+	 */
+	async function dispatchOutboxBatch(): Promise<boolean> {
+		const claim = await store.runs.claimOutbox(OUTBOX_BATCH_SIZE);
+		await Promise.all(
+			claim.enqueue.map(item => {
+				notifyStatus({
+					runId: item.runId,
+					taskId: item.taskId,
+					status: item.status,
+					attempt: item.attempt,
+					error: item.error,
+					updatedAt: item.updatedAt,
+					transition: "queued",
+				});
+				return enqueue(deps, item);
+			})
+		);
+		return claim.claimed >= OUTBOX_BATCH_SIZE;
+	}
+
+	/**
+	 * Decision 26: the LISTEN client is dedicated (LISTEN is session state; never a pooled
+	 * connection, like the leader's, decision 16) and owned by the engine. Not awaited: its first
+	 * connection is best-effort (a failure warns and retries; the poll still dispatches).
+	 */
+	function startOutboxListener(): void {
+		outbox.listener = createOutboxListener({
+			clientConfig:
+				typeof resolved.postgres === "string"
+					? {
+							connectionString: resolved.postgres,
+							connectionTimeoutMillis: resolved.poolConnectionTimeoutMs,
+						}
+					: pool.options,
+			channel: outbox.channel,
+			logger,
+			dispatchBatch: dispatchOutboxBatch,
+		});
+		// start() never rejects on connection problems (it warns and retries); anything else
+		// unexpected is logged rather than left as an unhandled rejection.
+		outbox.listener.start().catch(error => {
+			logger.warn({ err: error }, "outbox listener failed to start");
+		});
 	}
 
 	function startLeaderLoop(): void {
@@ -1610,9 +1737,14 @@ export function createEngine(config: EngineConfig): Engine {
 				await transport.closeWorkers({
 					timeoutMs: resolved.shutdownTimeoutMs,
 					beforeClose: async () => {
-						await stopLeaderLoop().catch((error: unknown) =>
-							logger.warn({ err: error }, "error stopping the leader loop")
-						);
+						await Promise.all([
+							stopLeaderLoop().catch((error: unknown) =>
+								logger.warn({ err: error }, "error stopping the leader loop")
+							),
+							// Decision 26: bounded; a run it did not dispatch stays flagged for the
+							// next engine's sweep.
+							outbox.listener?.close(),
+						]);
 						await handBackActiveRuns();
 						await drainInFlight(IN_FLIGHT_DRAIN_MS);
 						core.endSubscriptions();
@@ -1880,6 +2012,31 @@ export function resolveDebounce(
 		}
 	}
 	return { key, delayMs, payload, maxDelayMs };
+}
+
+/**
+ * Decision 26: `trigger`'s `tx` must be a client with `query()`, not a `pg.Pool` (whose queries
+ * each run on a different pooled connection, outside the caller's transaction). @internal
+ */
+export function validateTransactionClient(tx: unknown): TransactionClient {
+	if (
+		tx === null ||
+		typeof tx !== "object" ||
+		typeof (tx as { query?: unknown }).query !== "function"
+	) {
+		throw new ConfigError(
+			`trigger options.tx must be a node-postgres client (or adapter) with query(), got ${describeOffendingValue(tx)}`
+		);
+	}
+	const maybePool = tx as { totalCount?: unknown; idleCount?: unknown };
+	if (typeof maybePool.totalCount === "number" && typeof maybePool.idleCount === "number") {
+		throw new ConfigError(
+			"trigger options.tx is a pg.Pool: pass the client of your transaction instead " +
+				"(const client = await pool.connect(); await client.query('BEGIN'); ... " +
+				"trigger(task, payload, { tx: client }); await client.query('COMMIT'))"
+		);
+	}
+	return tx as TransactionClient;
 }
 
 /** Decision 25: validates `trigger`'s `concurrencyKey` against the task's queue. @internal */
