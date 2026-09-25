@@ -56,13 +56,20 @@ Env de teste: `TEST_DATABASE_URL`, `TEST_REDIS_URL` (padrões apontam para o doc
 - Quando os tipos públicos referenciarem `pg.Pool`, adicionar `@types/pg` como peer opcional (`peerDependenciesMeta`).
 - Instalação via GitHub com pnpm pode bloquear o `prepare` de dependências git; validar na fase 10.
 
+- **`runs.created_at` truncado em milissegundos** (`date_trunc('milliseconds', now())`) em todo insert de run: o cursor `(created_at, id)` trafega como `Date` do JS; com microssegundos, a paginação pularia linhas. A store em memória (fase 9) deve seguir o mesmo.
+- Cancelamento recursivo percorre descendentes nível a nível com `FOR UPDATE` (CTE recursiva não permite `FOR UPDATE`); ordem de locks pai → run → descendentes → waitpoints (ver `docs/store-contract.md`).
+- Default de TTL de chave de usuário (`idempotencyKeyTtl`, 7 dias) é aplicado pela engine (fase 3), não pela store.
+
+- Falha definitiva de uma run **não** cancela descendentes (filhas de `step.trigger` podem sobreviver ao pai, como na conclusão). Pendência: os waitpoints pendentes da própria run que falhou continuam `pending` (tratar na fase 5/6: vencer junto com a falha e remover jobs de expiração).
+- Suspensão em `waiting_on_waitpoints` também faz `enqueue_seq + 1` (sem enqueue), para que uma reentrega do job antigo não readquira a run.
+
 ## Status das fases
 
 | Fase | Status |
 |---|---|
 | 1 — Fundação | ✅ concluída — build ESM/CJS/DTS, 103 testes unitários, infra de integração por arquivo, `examples/basic` (ESM+CJS) |
-| 2 — Schema e store | em andamento (migration + contrato prontos; repositórios SQL em implementação) |
-| 3 — Trigger/fila/execução | pendente |
+| 2 — Schema e store | ✅ concluída — migration 001, `migrate()` com advisory xact lock, contrato `src/store/types.ts` + `docs/store-contract.md`, repositórios SQL, 127 testes de integração (revisão opus aplicada) |
+| 3 — Trigger/fila/execução | em andamento (3.1 tasks/registry pronto; 3.2 BullMQ em implementação) |
 | 4 — Steps/replay/sleep | pendente |
 | 5 — Tokens/subtasks | pendente |
 | 6 — Resiliência | pendente |
