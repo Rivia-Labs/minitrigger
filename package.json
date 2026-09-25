@@ -1,6 +1,6 @@
 {
   "name": "minitrigger",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Durable tasks and workflows for Node.js on BullMQ + Redis + Postgres, as an installable library.",
   "repository": {
     "type": "git",

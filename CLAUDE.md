@@ -189,7 +189,7 @@ inteiro no Node, que não faz tree-shaking — é um único arquivo de dist). Se
 | 7 — Logs/eventos/consulta | ✅ concluída — `ctx.logger` em lote no `run_logs` (flush antes da escrita terminal/suspensão), config `logging`, `runs.list/logs/steps`, `engine.events.on`, `runs.subscribe` (ordem obrigatória, engine só de disparo), `ctx.stream`/`runs.readStream`; testes `logs`/`subscribe`/`events`/`stream`/`query` |
 | 8 — Schedules | ✅ concluída — `engine.schedules.upsert/delete/list`, `defineTask({ schedule })` sincronizado no `start()` (`pruneDeclarative` opt-in), handler `schedule-tick` na `-system`, reconciliação bidirecional Postgres↔BullMQ; 38 testes unitários + 4 de `system.test.ts` + 10 de integração (infra real, cron por segundo); revisão opus aplicada (ordem+re-checagem do reconciler, retry de `schedule-tick`, guarda de `source`, tipos, tag de schema) |
 | 9 — Modo de teste/DX | ✅ concluída — store em memória; `checkEnvironment` no `start()`; `createTestEngine` (núcleo compartilhado `createEngineCore`, transporte/pub-sub/streams em memória, relógio injetável, `runInline`/`drive`/`drain`/`tickSchedule`, `EngineClient`); mensagens de erro acionáveis; testes de tipo; revisão opus aplicada |
-| 10 — Exemplo/docs/empacotamento | ✅ concluída — `examples/basic` completo, README final, `pnpm bench`, `pnpm check:pack`, instalação via GitHub investigada (`docs/research/github-install.md`); falta só publicar o primeiro release (.tgz no GitHub Releases) |
+| 10 — Exemplo/docs/empacotamento | ✅ concluída — `examples/basic` completo, README final, `pnpm bench`, `pnpm check:pack`, instalação via GitHub investigada (`docs/research/github-install.md`); releases v0.1.0 e v0.2.0 publicados (.tgz no GitHub Releases, repo privado) |
 
 ## Benchmark
 

@@ -52,8 +52,8 @@ authentication. Download the tarball with the GitHub CLI (logged in with access 
 it from disk:
 
 ```bash
-gh release download v0.1.0 -R igorabreu29/minitrigger -p "minitrigger-*.tgz"
-pnpm add ./minitrigger-0.1.0.tgz bullmq ioredis pg
+gh release download v0.2.0 -R igorabreu29/minitrigger -p "minitrigger-*.tgz"
+pnpm add ./minitrigger-0.2.0.tgz bullmq ioredis pg
 pnpm add -D @types/pg   # optional, only needed if you use TypeScript
 ```
 
@@ -70,7 +70,7 @@ check:pack` (see [Benchmark](#benchmark)) exercises exactly this pack → instal
 Needs git access to the private repo (SSH key or a credential helper for HTTPS).
 
 ```bash
-pnpm add github:igorabreu29/minitrigger#v0.1.0 bullmq ioredis pg
+pnpm add github:igorabreu29/minitrigger#v0.2.0 bullmq ioredis pg
 ```
 
 `dist/` is `.gitignore`d and only produced by minitrigger's own `prepare` script, and pnpm 10+
