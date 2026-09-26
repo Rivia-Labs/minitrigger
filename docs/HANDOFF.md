@@ -7,7 +7,9 @@ Atualizado em 2026-09-25. Leia junto com `CLAUDE.md` (decisões e notas de imple
 - **Fases 1 a 10 concluídas.** `pnpm check:pack` ok (última vez rodado); `examples/basic` roda de ponta a ponta.
 - **Terceira revisão externa (2026-09-25):** aplicada e commitada (ver `CLAUDE.md`, "Terceira
   revisão externa"); testes novos em `test/{unit,integration}/review3-{engine,io}.test.ts`.
-- **Verificação completa:** `pnpm typecheck && pnpm lint && pnpm test` verde — 1398 testes
+- **Migration 008 (`idx_runs_active_created`):** índice parcial para `runs.cancelMany()`; ver
+  `CLAUDE.md`. Migrations 001–008 congeladas depois da publicação da 0.3.0.
+- **Verificação completa:** `pnpm typecheck && pnpm lint && pnpm test` verde — 1399 testes
   (unit + integration) + 3 no projeto flushall; `pnpm check:pack` e `pnpm skills:validate` ok.
 
 ### O que existe (resumo)

@@ -80,6 +80,9 @@ describe("migrate()", () => {
 			"WHERE (status = 'pending'::text)"
 		);
 		expect(byName.get("idx_runs_created")).toContain("(created_at DESC, id DESC)");
+		expect(byName.get("idx_runs_active_created")).toMatch(
+			/\(created_at, id\) WHERE \(status = ANY \(ARRAY\['queued'::text, 'running'::text, 'waiting'::text\]\)\)/
+		);
 	});
 
 	it("creates runs with fillfactor=80", async () => {

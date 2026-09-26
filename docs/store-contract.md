@@ -297,3 +297,11 @@ Adds `queue_state(queue text PRIMARY KEY, paused boolean NOT NULL, updated_at ti
 DEFAULT now())` (decision 27). No FK (queues are declared in application code, like
 `schedules.task_id`), no extra index. A queue without a row is not paused. The SQL contract
 harness truncates it and shifts `updated_at` with the other timestamps.
+
+## Schema assumptions for 008_runs_active_created_idx.sql
+
+Adds `idx_runs_active_created ON runs (created_at, id) WHERE status IN ('queued', 'running',
+'waiting')` for `listBatchCandidates({ purpose: "cancel" })`, whose `WHERE` repeats that exact
+status list and orders by `(created_at, id)` ascending: keep both in sync, or the planner falls
+back to walking `idx_runs_created` through the finished history. `IF NOT EXISTS`, so a copy
+pre-built `CONCURRENTLY` under the same name is kept.

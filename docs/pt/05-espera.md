@@ -146,8 +146,10 @@ const { retried, skipped, hasMore, nextCursor } = await engine.runs.retryFailed(
   processo não registra (`task_not_registered`), que uma chamada concorrente retentou primeiro na
   pequena janela entre listar e criar a retentativa (`already_retried`, raro na prática dado o
   acima), ou cujo payload guardado não valida mais (`invalid_payload`).
-- **Em tabelas `runs` grandes, passe `createdFrom`** (ex.: "não mais que 24h") nas duas chamadas:
-  sem ele, a query da primeira página ainda precisa avançar a partir da linha mais antiga que
-  casa, o que para `cancelMany`/`retryFailed` significa varrer todo o histórico já finalizado antes
-  de chegar a algo recente — medido em ~143 ms só para a query da primeira página numa tabela
-  `runs` com 1M de linhas finalizadas.
+- **Custo em tabelas `runs` grandes.** O `cancelMany` lê as runs ativas por um índice parcial
+  (`idx_runs_active_created`, migration 008), então a primeira página não percorre o histórico
+  finalizado: ~0,04 ms numa tabela com 1M de runs finalizadas (antes do índice, ~143 ms). O
+  `retryFailed` avança a partir da run falha mais antiga; como as falhas costumam estar espalhadas
+  pelo histórico, continua barato (~0,5 ms na mesma medição), mas `createdFrom` (ex.: "não mais que
+  24h") ainda limita a varredura se a tabela tiver uma longa sequência de sucessos antes das falhas
+  que interessam. A paginação por `cursor` busca pelo índice e nunca varre de novo.

@@ -612,13 +612,13 @@ const { retried, skipped, hasMore, nextCursor } = await engine.runs.retryFailed(
   (`already_retried`), or whose stored payload no longer validates, e.g. `config.limits.maxPayloadBytes`
   was lowered since it was created (`invalid_payload` — retrying it would fail the same way on every
   future call too, so it's skipped rather than failing the whole batch).
-- **On a large `runs` table, pass `createdFrom`** (e.g. "no older than 24h") to both calls: without
-  it, the first page's query still has to scan forward from the oldest matching row, which for
-  `cancelMany`/`retryFailed` means scanning through however much old, already-finished history
-  exists before it reaches anything recent — measured ~143 ms for the first page's query alone
-  against a `runs` table with 1M finished rows on unremarkable hardware. `cursor`-based pagination
-  itself is fine (it seeks by index, doesn't re-scan); it's specifically a `createdFrom`-less first
-  call on an old table that pays this cost every time.
+- **Cost on a large `runs` table.** `cancelMany` reads active runs through a partial index
+  (`idx_runs_active_created`, migration 008), so its first page does not walk the finished history:
+  ~0.04 ms against a table with 1M finished runs (it was ~143 ms before that index).
+  `retryFailed` scans forward from the oldest failed run; failed runs are usually spread through the
+  history, so this stays cheap (~0.5 ms in the same measurement), but `createdFrom` (e.g. "no older
+  than 24h") still bounds the scan if your table holds a very long run of successes before the
+  failures you care about. `cursor` pagination seeks by index and never re-scans.
 
 Cancellation works across processes: the canceled run ids are published on Redis pub/sub
 (`${prefix}:cancel`), and every started engine sharing the same `prefix` aborts its local
@@ -1263,6 +1263,22 @@ it("approves when the token resolves truthy", async () => {
   from 0.1.x, apply the 0.2.0 steps below first.
 - **Migration `007_queue_state`** (queue pause/resume, decision 27) only creates the small
   `queue_state` table: no lock on `runs`, nothing to prepare.
+- **Migration `008_runs_active_created_idx`** adds a partial index on `runs (created_at, id)`
+  holding only `queued`/`running`/`waiting` runs (it serves `runs.cancelMany()`). It is a plain
+  `CREATE INDEX IF NOT EXISTS`, so on a large table either accept the `SHARE` lock on `runs` while
+  it builds, or pre-build it with the same name — outside a transaction, against the target schema,
+  before `engine.migrate()` — and let the migration just record version 8:
+
+  ```sql
+  SET search_path TO "<schema>";
+  CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_runs_active_created ON runs (created_at, id)
+    WHERE status IN ('queued', 'running', 'waiting');
+
+  -- Must return indisvalid = t; if f (interrupted build), DROP INDEX CONCURRENTLY and rebuild,
+  -- otherwise the migration's IF NOT EXISTS would keep the invalid index.
+  SELECT indisvalid FROM pg_index
+  WHERE indexrelid = '"<schema>".idx_runs_active_created'::regclass;
+  ```
 - **New APIs:** `engine.queues` (pause/resume/list/scale) and `engine.runs.cancelMany`/
   `retryFailed`; `EngineClient` now includes `queues`.
 - **Transactional trigger (outbox), decision 26.** `trigger(task, payload, { tx })` inserts the run

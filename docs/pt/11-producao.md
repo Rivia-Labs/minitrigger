@@ -185,6 +185,22 @@ reenfileira toda run a partir de Postgres dentro de aproximadamente
   Vindo de 0.1.x, aplique primeiro os passos de 0.2.0 abaixo.
 - **Migration `007_queue_state`** (pause/resume de fila) só cria a pequena tabela `queue_state`:
   sem lock em `runs`, nada a preparar.
+- **Migration `008_runs_active_created_idx`** cria um índice parcial em `runs (created_at, id)`
+  só com as runs `queued`/`running`/`waiting` (atende o `runs.cancelMany()`). É um `CREATE INDEX IF
+  NOT EXISTS` simples: numa tabela grande, aceite o lock `SHARE` em `runs` durante a construção, ou
+  pré-construa com o mesmo nome — fora de uma transação, no schema alvo, antes do
+  `engine.migrate()` — e a migration só registra a versão 8:
+
+  ```sql
+  SET search_path TO "<schema>";
+  CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_runs_active_created ON runs (created_at, id)
+    WHERE status IN ('queued', 'running', 'waiting');
+
+  -- Precisa devolver indisvalid = t; se f (build interrompido), DROP INDEX CONCURRENTLY e
+  -- reconstrua, senão o IF NOT EXISTS da migration manteria o índice inválido.
+  SELECT indisvalid FROM pg_index
+  WHERE indexrelid = '"<schema>".idx_runs_active_created'::regclass;
+  ```
 - **APIs novas:** `engine.queues` (pause/resume/list/scale) e `engine.runs.cancelMany`/
   `retryFailed`; `EngineClient` agora inclui `queues`.
 - **Trigger transacional (outbox), decisão 26.** `trigger(task, payload, { tx })` insere a run na
