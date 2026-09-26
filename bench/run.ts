@@ -2,20 +2,27 @@
  * `pnpm bench` — SPEC.md §6 / CLAUDE.md "Fase 10" benchmark.
  *
  * Triggers 1,000 runs of a 3-step task against the docker infra (`pnpm infra:up`), on a fresh
- * Postgres schema / BullMQ prefix so it never collides with real data, and measures:
+ * Postgres schema (and, in `bullmq` mode, a fresh BullMQ prefix) so it never collides with real
+ * data, and measures:
  *
  *   1. End-to-end throughput: wall-clock time from firing 1,000 `trigger()` calls to the last one
  *      completing, as runs/s.
  *   2. Sleep resume latency: for a task that does `step.sleep(...)` then one more step, the gap
  *      between the run becoming due (`runAfter`, Postgres time, read right after it suspends) and
  *      it reporting `completed` (also Postgres time, from the `run:completed` event) — i.e. how
- *      long BullMQ's delayed-job wake-up plus reacquiring the run plus the trailing step take.
+ *      long the transport's delayed wake-up plus reacquiring the run plus the trailing step take.
  *   3. Token resume latency: for a task suspended on `waitForToken`, the gap between this
  *      process's own `engine.tokens.complete()` call returning and the `run:completed` event
  *      firing — both read from this process's clock, since the call and the event are both local.
  *
- * Prints a summary table, then cleans up: drops the schema and obliterates every BullMQ queue it
- * created (including `${prefix}-system`).
+ * `--transport postgres|bullmq` (default `bullmq`, spec §3.10/decision 28) picks which transport
+ * config to build: `bullmq` config unchanged (`redis`/`prefix`); `postgres` config carries neither
+ * (`transport: "postgres"`, `polling` left at its default) per the design doc's Task 10d ruling.
+ * Cleanup also branches: `postgres` mode never touches Redis/BullMQ (no queues were ever created),
+ * so it only drops the schema.
+ *
+ * Prints a summary table, then cleans up: drops the schema and, in `bullmq` mode, obliterates
+ * every BullMQ queue it created (including `${prefix}-system`).
  *
  * Imports from `../dist/index.js` (the **built** package entry), not `../src`: running this file
  * straight off `.ts` sources works (Node >=23.6 strips erasable TS syntax with no flag/deps), but
@@ -32,6 +39,18 @@ import { Redis } from "ioredis";
 import { escapeIdentifier, Pool } from "pg";
 import type { Engine, RunEvent, Task, TaskContext } from "../dist/index.js";
 import { createEngine, defineTask } from "../dist/index.js";
+
+type TransportKind = "bullmq" | "postgres";
+
+function parseTransport(argv: readonly string[]): TransportKind {
+	const flagIndex = argv.indexOf("--transport");
+	const value = flagIndex === -1 ? undefined : argv[flagIndex + 1];
+	if (value === undefined || value === "bullmq") return "bullmq";
+	if (value === "postgres") return "postgres";
+	throw new Error(`--transport must be "bullmq" or "postgres", got ${JSON.stringify(value)}`);
+}
+
+const transport = parseTransport(process.argv.slice(2));
 
 const PG_URL =
 	process.env["BENCH_DATABASE_URL"] ??
@@ -79,15 +98,25 @@ async function main(): Promise<void> {
 		},
 	});
 
-	const engine: Engine = createEngine({
-		postgres: PG_URL,
-		redis: REDIS_URL,
-		schema: namespace,
-		prefix: namespace,
-		tasks: [throughputTask, sleepTask, tokenTask],
-		pool: { max: 60 },
-		systemConcurrency: 5,
-	});
+	const engine: Engine =
+		transport === "postgres"
+			? createEngine({
+					transport: "postgres",
+					postgres: PG_URL,
+					schema: namespace,
+					tasks: [throughputTask, sleepTask, tokenTask],
+					pool: { max: 60 },
+					systemConcurrency: 5,
+				})
+			: createEngine({
+					postgres: PG_URL,
+					redis: REDIS_URL,
+					schema: namespace,
+					prefix: namespace,
+					tasks: [throughputTask, sleepTask, tokenTask],
+					pool: { max: 60 },
+					systemConcurrency: 5,
+				});
 
 	const results: {
 		throughput?: { runs: number; totalMs: number; runsPerSec: number };
@@ -298,6 +327,7 @@ function printReport(results: {
 	console.log(`node: ${process.version}  platform: ${os.platform()}/${os.arch()}`);
 	console.log(`cpu: ${cpus[0]?.model ?? "unknown"} x${cpus.length}`);
 	console.log(`mem: ${(os.totalmem() / 1024 ** 3).toFixed(1)} GiB`);
+	console.log(`transport: ${transport}`);
 	console.log(`namespace: ${namespace}\n`);
 
 	if (results.throughput) {
@@ -351,6 +381,10 @@ async function cleanup(taskQueueNames: string[]): Promise<void> {
 	} finally {
 		await pool.end().catch(() => {});
 	}
+
+	// `transport: "postgres"` never touched Redis/BullMQ (decision 28: no queues, no prefix), so
+	// there is nothing to obliterate — the schema drop above is the whole cleanup.
+	if (transport === "postgres") return;
 
 	const redis = new Redis(REDIS_URL, { maxRetriesPerRequest: null });
 	try {

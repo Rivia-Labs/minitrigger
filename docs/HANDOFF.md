@@ -93,6 +93,33 @@ Atualizado em 2026-09-25. Leia junto com `CLAUDE.md` (decisões e notas de imple
 - Fase 10: `examples/basic` completo, README final, `pnpm bench`, `pnpm check:pack`, `docs/research/github-install.md`.
 - Menores: migration 003 (`idx_runs_created`), argumentos inválidos de step fatais, flake do teste de retenção.
 
+### Task 10d (2026-09-26): bench antecipado dos dois transportes
+
+`bench/run.ts` ganhou `--transport postgres|bullmq` (padrão `bullmq`; `postgres` não usa
+`redis`/`prefix`, `transport: "postgres"` explícito, limpeza só `DROP SCHEMA`, sem obliterate).
+Três execuções de cada, máquina/infra da nota "Benchmark" do `CLAUDE.md` (Apple M5 Pro, Postgres
+16-alpine + Redis 7-alpine locais, `pnpm bench` builda antes):
+
+| Métrica | BullMQ #1 | BullMQ #2 | BullMQ #3 | Postgres #1 | Postgres #2 | Postgres #3 |
+|---|---|---|---|---|---|---|
+| Vazão (1.000 runs, 3 steps) | 1312.9 runs/s | 1333.6 runs/s | 1280.3 runs/s | 1512.4 runs/s | 1401.1 runs/s | 1499.6 runs/s |
+| Sleep resume p50 | 105.0 ms | 43.0 ms | 98.0 ms | 26.0 ms | 13.0 ms | 48.0 ms |
+| Sleep resume p99 | 108.0 ms | 45.0 ms | 100.0 ms | 30.0 ms | 17.0 ms | 50.0 ms |
+| Token resume p50 | 5.3 ms | 5.2 ms | 5.4 ms | 8.8 ms | 9.2 ms | 9.4 ms |
+| Token resume p99 | 7.1 ms | 7.0 ms | 8.3 ms | 15.7 ms | 11.2 ms | 17.2 ms |
+
+**Meta da spec §6 batida sem qualquer otimização:** vazão do modo Postgres ficou **acima** da do
+BullMQ nas três execuções (não só dentro de ±20 %), e o p99 de retomada por sleep (17–50 ms) ficou
+bem abaixo do teto de 150 ms — na verdade mais rápido que o BullMQ (45–108 ms), porque a retomada
+por `NOTIFY` evita o `moveToDelayed`/polling de fila atrasada do Redis. Retomada por token ficou um
+pouco mais lenta que o BullMQ (11–17 ms vs. 7–8 ms) mas irrelevante frente à meta (só a vazão e o
+sleep têm meta numérica) — plausível pelo `SELECT pg_notify(...)` do publicador em vez do `publish`
+direto do Redis, não investigado (a meta não pede).
+
+**Decisão: nenhum diagnóstico/otimização necessário** (o passo 2 da tarefa só entra se a vazão
+ficar fora da meta). Nenhuma mudança em `src/` nesta tarefa. `bench/run.ts` é o único arquivo de
+código alterado.
+
 ## Como retomar
 
 1. `pnpm infra:up` (Docker Desktop precisa estar aberto) e `pnpm install`.
