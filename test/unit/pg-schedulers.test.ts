@@ -18,6 +18,14 @@ describe("nextOccurrence", () => {
 		expect(() => nextOccurrence("99 * * * *", undefined, new Date())).toThrow(ConfigError);
 		expect(() => nextOccurrence("* * * * *", "Not/AZone", new Date())).toThrow(ConfigError);
 	});
+
+	// Fix round 1 (controller ruling): `cron-parser` does NOT throw on an empty string -- it
+	// silently falls back to "0 * * * * *" (once a minute). Guarded explicitly here so a blank
+	// pattern is a loud `ConfigError`, not a surprising once-a-minute schedule.
+	it("rejects an empty or whitespace-only pattern with ConfigError", () => {
+		expect(() => nextOccurrence("", undefined, new Date())).toThrow(ConfigError);
+		expect(() => nextOccurrence("   ", undefined, new Date())).toThrow(ConfigError);
+	});
 });
 
 describe("scheduleTickJobId / scheduleIdOfJob", () => {

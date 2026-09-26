@@ -30,8 +30,21 @@ const SCHEDULE_TICK_PREFIX = "schedule-tick:";
  * behavior, not assumed from memory): a malformed field value throws a plain `Error` from deep in
  * its constraint checking, and a bad IANA zone throws once `next()`/date construction actually
  * tries to interpret a timestamp in it. Both are wrapped here into one actionable `ConfigError`.
+ *
+ * An empty or whitespace-only `pattern` is rejected explicitly, before ever reaching
+ * `cron-parser`: `CronExpressionParser.parse("")` does NOT throw -- it silently falls back to
+ * `"0 * * * * *"` (once a minute), which would otherwise turn a blank/missing cron field into a
+ * surprising once-a-minute schedule instead of a loud, actionable error (fix round 1, controller
+ * ruling on Task 6). A pure-whitespace pattern already throws from `cron-parser` itself
+ * (`"Invalid characters"`), but the explicit guard keeps the error message consistent across both
+ * cases and matches the same guard in `src/schedules.ts#validateCronPattern`.
  */
 export function nextOccurrence(pattern: string, timezone: string | undefined, after: Date): Date {
+	if (pattern.trim().length === 0) {
+		throw new ConfigError(
+			`invalid cron pattern ${JSON.stringify(pattern)}: must not be empty or whitespace-only`
+		);
+	}
 	try {
 		const expr = CronExpressionParser.parse(pattern, {
 			currentDate: after,

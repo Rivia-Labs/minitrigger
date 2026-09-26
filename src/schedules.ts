@@ -67,12 +67,24 @@ function validateScheduleId(id: unknown): string {
  * -- cron-parser only recognizes 5 or 6 fields, an optional leading seconds field) now fails right
  * here, before touching Postgres or Redis, instead of surfacing later as an opaque
  * `upsertJobScheduler`/Postgres-transport rejection.
+ *
+ * The empty/whitespace-only case is rejected explicitly, before delegating to `cron-parser` at
+ * all (fix round 1, controller ruling): `cron-parser` treats `""` as `"0 * * * * *"` (once a
+ * minute) rather than throwing, which would otherwise silently turn a blank cron field into a
+ * surprising schedule instead of the loud `ConfigError` the old regex gave. `nextOccurrence`
+ * ({@link nextOccurrence}, `src/pg/schedulers.ts`) carries the same guard, so a caller reaching it
+ * directly (Task 8's Postgres-backend scheduler) gets the identical rejection.
  */
 function validateCronPattern(cron: unknown): string {
 	if (typeof cron !== "string") {
 		throw new ConfigError(`schedule cron must be a string, got ${JSON.stringify(cron)}`);
 	}
 	const trimmed = cron.trim();
+	if (trimmed.length === 0) {
+		throw new ConfigError(
+			`schedule cron must not be empty or whitespace-only, got ${JSON.stringify(cron)}`
+		);
+	}
 	nextOccurrence(trimmed, undefined, new Date());
 	return trimmed;
 }

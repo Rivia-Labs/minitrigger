@@ -262,6 +262,21 @@ describe("createSchedulesApi: validation", () => {
 		).rejects.toThrow(ConfigError);
 	});
 
+	// Fix round 1 (controller ruling): `cron-parser` doesn't throw on `""` -- it interprets it as
+	// "0 * * * * *" (once a minute). The old regex rejected an empty cron outright, so this guards
+	// `validateCronPattern` explicitly, before ever calling `nextOccurrence`/`cron-parser`.
+	it("rejects an empty cron pattern", async () => {
+		await expect(
+			api().upsert({ id: "ok", task: echoTask, cron: "", payload: { v: 1 } })
+		).rejects.toThrow(ConfigError);
+	});
+
+	it("rejects a whitespace-only cron pattern", async () => {
+		await expect(
+			api().upsert({ id: "ok", task: echoTask, cron: "   ", payload: { v: 1 } })
+		).rejects.toThrow(ConfigError);
+	});
+
 	it("accepts a 6-field cron pattern (seconds)", async () => {
 		const { transport, upsertCalls } = fakeTransport();
 		const { store } = fakeStore();
