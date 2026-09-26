@@ -30,7 +30,9 @@ export type TableName =
 	| "run_logs"
 	| "schema_migrations"
 	| "schedules"
-	| "queue_state";
+	| "queue_state"
+	| "system_jobs"
+	| "schema_meta";
 
 export function createSqlContext(schema: string): SqlContext {
 	const escaped = escapeIdentifier(schema);

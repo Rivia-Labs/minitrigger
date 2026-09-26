@@ -49,6 +49,13 @@ export const RUN_COLUMNS =
 	"enqueue_seq, heartbeat_at, run_after, parent_run_id, parent_waitpoint_id, parent_step_name, " +
 	"batch_index, started_at, finished_at, created_at, updated_at, progress, debounce_key, concurrency_key";
 
+/** RUN_COLUMNS with an alias prefix: required in `UPDATE ... FROM` (the other relation also has `id`). */
+export function qualifiedRunColumns(alias: string): string {
+	return RUN_COLUMNS.split(",")
+		.map(column => `${alias}.${column.trim()}`)
+		.join(", ");
+}
+
 export interface RunRow {
 	id: string;
 	task_id: string;

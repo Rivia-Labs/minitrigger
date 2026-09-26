@@ -305,3 +305,69 @@ Adds `idx_runs_active_created ON runs (created_at, id) WHERE status IN ('queued'
 status list and orders by `(created_at, id)` ascending: keep both in sync, or the planner falls
 back to walking `idx_runs_created` through the finished history. `IF NOT EXISTS`, so a copy
 pre-built `CONCURRENTLY` under the same name is kept.
+
+## Postgres transport (migration 009, decision 28)
+
+SQL store only: `createSqlStore` returns `SqlStore extends Store` with three pool-bound
+repositories that are not part of `StoreTx` and have no memory-store counterpart.
+
+### RunClaimStore (`store.claim`, `src/store/sql/claim.ts`)
+
+| Method      | SQL shape |
+| ----------- | --------- |
+| `claimRuns({ queue, limit })` | One statement, no explicit transaction: `WITH picked AS (SELECT r.id ... WHERE queue=$1 AND status IN ('queued','waiting') AND run_after <= now() AND NOT outbox_pending AND queue not paused ORDER BY run_after, created_at, id LIMIT $2 FOR UPDATE OF r SKIP LOCKED) UPDATE runs r SET status='running', execution_id=gen_random_uuid(), heartbeat_at=now(), started_at=<below>, debounce_key=NULL, updated_at=now() FROM picked RETURNING r.*` (columns qualified with `r.`; result re-sorted by `(run_after, created_at, id)`). `limit <= 0` → `[]` without a query. |
+| `claimRuns({ ..., globalConcurrency })` | Short transaction: `pg_advisory_xact_lock(hashtextextended('<schema>:<queue>:global', 0))`, then `count(*)` of the queue's `running` rows (fresh READ COMMITTED snapshot), then the same claim with `LIMIT least(limit, globalConcurrency - running)`; nothing claimed when that is `<= 0`. Exact across processes. |
+| `nextDueAt(queue)` | `min(run_after)` over the queue's `queued`/`waiting` rows with `run_after > now()`, or null. |
+
+Mirrors `acquire` with two deliberate differences: `enqueue_seq` is unchanged (there is no job to
+fence; `release`/`retry`/`suspend` still bump it) and `concurrency_waits` is NOT reset (the
+decision 25 backoff grows from it; the concurrency-key re-check resets it on `ok`).
+`started_at = CASE WHEN concurrency_key IS NULL THEN coalesce(started_at, now()) ELSE started_at
+END`: a run with a concurrency key only "starts" after the re-check says `ok`. The returned
+`runAfter` is the pre-claim value (the `UPDATE` does not touch it).
+
+Invariant used by the claim (already true before this migration): `waiting` + `run_after` set =
+ready to resume at `run_after`; `waiting` + `run_after NULL` = blocked on waitpoints, never
+claimed. A `waiting` run whose only pending waitpoint is a token that is not awaited yet has
+`run_after` set (decision 3) and is claimed.
+
+Lock order: with `globalConcurrency`, the queue's advisory xact lock first, then row locks via
+`SKIP LOCKED`. The claim never WAITS on a row lock, so it cannot form a cycle with the
+parent -> run -> descendants -> waitpoints order; the advisory key is one bigint, outside the
+`(hashtext(schema), 1|2)` space of decision 16 (like the decision 25 lock).
+
+Indexes: `idx_runs_claim ON runs (queue, run_after) WHERE status IN ('queued','waiting')` and
+`idx_runs_running_queue ON runs (queue) WHERE status = 'running'` (the `globalConcurrency` count),
+both `IF NOT EXISTS` so they can be pre-built `CONCURRENTLY`.
+
+### SystemJobStore (`store.systemJobs`, `src/store/sql/system-jobs.ts`)
+
+`system_jobs (job_id PK, name, data jsonb, run_after, attempts, max_attempts, locked_until,
+locked_by uuid, created_at)`, index `idx_system_jobs_due (run_after)`.
+
+| Method | SQL shape |
+| ------ | --------- |
+| `upsert` | `INSERT ... VALUES (..., now() + delayMs, maxAttempts) ON CONFLICT (job_id) DO NOTHING` (BullMQ jobId semantics: re-add is a no-op). Defaults: `data {}`, `delayMs 0`, `maxAttempts 1`. |
+| `upsertScheduleTick` | `INSERT (name 'schedule-tick', max_attempts 5) ON CONFLICT DO UPDATE SET data, run_after, attempts=0, locked_until/locked_by=NULL WHERE data->>'cron' or data->>'timezone' IS DISTINCT FROM EXCLUDED RETURNING (xmax = 0)`: `created` / `updated` / `unchanged` (no row). Same pattern is a no-op, so a restart never skips a due, unprocessed tick; a changed pattern releases the lock and the worker on the old tick loses its fencing. |
+| `claim(limit, lockMs)` | `WITH picked AS (SELECT job_id WHERE run_after <= now() AND (locked_until IS NULL OR locked_until <= now()) ORDER BY run_after LIMIT $1 FOR UPDATE SKIP LOCKED) UPDATE ... SET locked_until = now() + lockMs, locked_by = gen_random_uuid()`. An expired lock is claimable again with a new token. |
+| `complete` | `DELETE ... WHERE job_id=$1 AND locked_by=$2`. |
+| `delay` | `run_after = now() + delayMs`, lock released; fenced. |
+| `fail` | Two CTEs with disjoint predicates over one snapshot: `DELETE ... WHERE attempts + 1 >= max_attempts` (`exhausted`) and `UPDATE SET attempts+1, run_after = now() + backoffMs, lock released WHERE attempts + 1 < max_attempts` (`retried`); neither matched = `lost`. Never a DELETE and an UPDATE on the same row in one statement (the second would be silently ignored). |
+| `rescheduleTick` | `run_after = $3, attempts = 0, data = jsonb_set(data, '{prevMillis}', ...)`, lock released; fenced. |
+| `remove` | Without `evenIfLocked`: `AND (locked_until IS NULL OR locked_until <= now())` (never removes an active job, like BullMQ). `evenIfLocked` removes a scheduler row even mid-tick. |
+| `get` / `listByName` | Plain reads (`listByName` ordered by `run_after, job_id`). |
+| `nextDueAt` | `min(run_after) WHERE run_after > now()` (indexed); a lock that expires later is found by the regular poll. |
+| `now` | `SELECT now()` (decision 17). |
+
+Fencing: every write after a claim matches `job_id AND locked_by`. A token that is not a UUID
+never matches (checked in JS, no query). A worker whose lock expired and was re-claimed by
+another gets `false`/`"lost"` and must drop its result; handlers are idempotent (expiry re-checks
+the waitpoint, retention is `SKIP LOCKED`, a repeated tick hits the `__schedule:id:ts` key).
+
+### SchemaMetaStore (`store.meta`, `src/store/sql/schema-meta.ts`)
+
+`schema_meta (key PK, value, updated_at)`. `get` is a plain lookup. `setIfAbsent`: `INSERT ...
+ON CONFLICT (key) DO NOTHING RETURNING value` (waits for a concurrent inserter to commit); when
+nothing was inserted, the effective value is re-read in a NEW statement (a read inside the same
+statement would use the snapshot from before the concurrent commit). The existing value always
+wins.

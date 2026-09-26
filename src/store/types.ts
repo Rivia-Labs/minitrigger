@@ -1154,6 +1154,96 @@ export interface QueueStateStore {
 }
 
 // ---------------------------------------------------------------------------
+// Postgres transport (decision 28, migration 009) -- SQL store only
+// ---------------------------------------------------------------------------
+
+export interface ClaimRunsInput {
+	queue: string;
+	limit: number;
+	/** `undefined` = no global limit. With a limit, claims are serialized per queue (exact). */
+	globalConcurrency?: number;
+}
+
+/**
+ * The run claim of the Postgres transport: `queued`/`waiting` runs whose `run_after` is due are
+ * moved to `running` in one statement (`FOR UPDATE SKIP LOCKED`), writing what `acquire` writes
+ * except `enqueue_seq` (unchanged: there is no job to fence) and `concurrency_waits` (not reset:
+ * the concurrency-key re-check does that). See docs/store-contract.md "Postgres transport".
+ */
+export interface RunClaimStore {
+	/** Claimed runs ordered by `(run_after, created_at, id)`; `runAfter` is the pre-claim value. */
+	claimRuns(input: ClaimRunsInput): Promise<RunRecord[]>;
+	/** Next future `run_after` of the queue (only `queued`/`waiting`), or null. */
+	nextDueAt(queue: string): Promise<Date | null>;
+}
+
+export interface ScheduleTickData {
+	scheduleId: string;
+	cron: string;
+	timezone?: string;
+	schema: string;
+	prevMillis: number;
+}
+
+export interface SystemJobRecord {
+	jobId: string;
+	name: string;
+	data: Json;
+	runAfter: Date;
+	attempts: number;
+	maxAttempts: number;
+	/** Token of the current claim (fencing); `null` outside a claim. */
+	lockedBy: string | null;
+}
+
+export interface SystemJobStore {
+	/** Inserts if absent (BullMQ jobId semantics: re-adding is a no-op). */
+	upsert(input: {
+		jobId: string;
+		name: string;
+		data?: Json;
+		delayMs?: number;
+		maxAttempts?: number;
+	}): Promise<void>;
+	/** Cron tick: creates, or rewrites only when `cron`/`timezone` changed (releases the lock). */
+	upsertScheduleTick(input: {
+		jobId: string;
+		data: ScheduleTickData;
+		runAt: Date;
+	}): Promise<"created" | "updated" | "unchanged">;
+	/** Claims due jobs: `locked_until = now() + lockMs`, fresh `locked_by`. */
+	claim(limit: number, lockMs: number): Promise<SystemJobRecord[]>;
+	/** Every write below matches `job_id` AND `locked_by`; `false`/`"lost"` = lock lost. */
+	complete(jobId: string, lockedBy: string): Promise<boolean>;
+	delay(jobId: string, lockedBy: string, delayMs: number): Promise<boolean>;
+	/** attempts+1; below max → `run_after = now() + backoffMs`; otherwise deleted. */
+	fail(
+		jobId: string,
+		lockedBy: string,
+		backoffMs: number
+	): Promise<"retried" | "exhausted" | "lost">;
+	/** Tick done or exhausted: next occurrence in place, `attempts = 0`, lock released. */
+	rescheduleTick(
+		jobId: string,
+		lockedBy: string,
+		next: { runAt: Date; prevMillis: number }
+	): Promise<boolean>;
+	/** By default never deletes a locked (active) job, like BullMQ. `evenIfLocked` removes a scheduler. */
+	remove(jobId: string, options?: { evenIfLocked?: boolean }): Promise<boolean>;
+	get(jobId: string): Promise<SystemJobRecord | null>;
+	listByName(name: string): Promise<SystemJobRecord[]>;
+	nextDueAt(): Promise<Date | null>;
+	/** The database's `now()` (decision 17), to compute cron occurrences. */
+	now(): Promise<Date>;
+}
+
+export interface SchemaMetaStore {
+	get(key: string): Promise<string | null>;
+	/** Writes if absent; returns the effective value (the existing one wins, re-read after a race). */
+	setIfAbsent(key: string, value: string): Promise<string>;
+}
+
+// ---------------------------------------------------------------------------
 // Store and transactions
 // ---------------------------------------------------------------------------
 

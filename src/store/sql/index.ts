@@ -1,14 +1,34 @@
 import type { Pool } from "pg";
 import { validateSqlIdentifier } from "../../utils/identifiers.js";
-import type { RunStore, Store, StoreTx } from "../types.js";
+import type {
+	RunClaimStore,
+	RunStore,
+	SchemaMetaStore,
+	Store,
+	StoreTx,
+	SystemJobStore,
+} from "../types.js";
+import { createRunClaimStore } from "./claim.js";
 import { createSqlContext, type SqlExecutor, type SqlQueryable } from "./db.js";
 import { createIdempotencyStore } from "./idempotency.js";
 import { createLogStore } from "./logs.js";
 import { createQueueStateStore } from "./queues.js";
 import { createRunStore } from "./runs.js";
 import { createScheduleStore } from "./schedules.js";
+import { createSchemaMetaStore } from "./schema-meta.js";
 import { createStepStore } from "./steps.js";
+import { createSystemJobStore } from "./system-jobs.js";
 import { createWaitpointStore } from "./waitpoints.js";
+
+/**
+ * The SQL {@link Store} plus the repositories only the Postgres transport uses (decision 28,
+ * migration 009). Pool-bound only: none of them is part of {@link StoreTx}.
+ */
+export interface SqlStore extends Store {
+	claim: RunClaimStore;
+	systemJobs: SystemJobStore;
+	meta: SchemaMetaStore;
+}
 
 /**
  * Builds the Postgres-backed {@link Store} for `schema` (decision 15; validated and escaped via
@@ -17,7 +37,7 @@ import { createWaitpointStore } from "./waitpoints.js";
  * transaction on a dedicated client and hands every repository, bound to that client, to the
  * caller.
  */
-export function createSqlStore(pool: Pool, schema: string): Store {
+export function createSqlStore(pool: Pool, schema: string): SqlStore {
 	validateSqlIdentifier("schema", schema);
 	const ctx = createSqlContext(schema);
 
@@ -31,6 +51,9 @@ export function createSqlStore(pool: Pool, schema: string): Store {
 		logs: createLogStore(poolExec, ctx),
 		schedules: createScheduleStore(poolExec, ctx),
 		queues: createQueueStateStore(poolExec, ctx),
+		claim: createRunClaimStore(poolExec, ctx),
+		systemJobs: createSystemJobStore(poolExec, ctx),
+		meta: createSchemaMetaStore(poolExec, ctx),
 
 		async withTransaction<T>(fn: (tx: StoreTx) => Promise<T>): Promise<T> {
 			const client = await pool.connect();
