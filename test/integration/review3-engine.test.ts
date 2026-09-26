@@ -152,7 +152,7 @@ function trackedConnection(): {
 }
 
 describe("item 1: start()/stop() bounded on Redis connection problems", () => {
-	it("start() fails (ConfigError) when the subscriber never becomes ready, and can be retried", async () => {
+	it("start() fails (MinitriggerError, not ConfigError) when the subscriber never becomes ready, and can be retried", async () => {
 		const { connection, duplicates, control } = trackedConnection();
 		const task = simpleTask();
 		const engine = makeEngine([task], { redis: { connection } });
@@ -166,7 +166,9 @@ describe("item 1: start()/stop() bounded on Redis connection problems", () => {
 			),
 			new Promise(resolve => setTimeout(() => resolve("hung"), 9_000)),
 		]);
-		expect(outcome).toBeInstanceOf(ConfigError);
+		// Review 4 item 2: transient infrastructure, so not a ConfigError (callers retry it).
+		expect(outcome).toBeInstanceOf(MinitriggerError);
+		expect(outcome).not.toBeInstanceOf(ConfigError);
 		expect((outcome as Error).message).toMatch(/subscriber did not become ready/);
 		expect(Date.now() - startedAt).toBeLessThan(8_000);
 		// The subscriber this attempt opened was dropped.
@@ -244,7 +246,7 @@ describe("item 1: start()/stop() bounded on Redis connection problems", () => {
 		expect(leaderConfigs).toHaveLength(0);
 	}, 30_000);
 
-	it("runs.subscribe iterations sharing a discarded subscriber end instead of lingering", async () => {
+	it("runs.subscribe iterations sharing a discarded subscriber throw instead of lingering", async () => {
 		const { connection, duplicates, control } = trackedConnection();
 		const task = simpleTask();
 		const engine = makeEngine([task], { redis: { connection } });
@@ -259,13 +261,15 @@ describe("item 1: start()/stop() bounded on Redis connection problems", () => {
 			let next = await iterator.next();
 			while (!next.done) next = await iterator.next();
 			return "ended";
-		})();
-		await expect(start).rejects.toBeInstanceOf(ConfigError);
+		})().catch((error: unknown) => error);
+		await expect(start).rejects.toBeInstanceOf(MinitriggerError);
 		const outcome = await Promise.race([
 			drained,
 			new Promise(resolve => setTimeout(() => resolve("lingering"), 3_000)),
 		]);
-		expect(outcome).toBe("ended");
+		// Review 4 item 5: not a silent end (no terminal status was seen): it throws.
+		expect(outcome).toBeInstanceOf(MinitriggerError);
+		expect((outcome as Error).message).toMatch(/subscriber it used was discarded/);
 		await iterator.return?.();
 	}, 20_000);
 

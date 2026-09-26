@@ -93,6 +93,17 @@ await prisma.$transaction(async tx => {
   `timeout` da transação interativa (5 s por padrão), como para qualquer statement dela.
 - Qualquer outro driver/ORM funciona do mesmo jeito: passe um objeto com `query(text, values)` que
   rode o statement `$1..$n` na conexão da transação e resolva para `{ rows }`.
+- `drizzleTx` faz **uma ida e volta extra por chamada de `query()`** (mais uma no momento do
+  wrap): o drizzle-orm 0.45.x não expõe um jeito confiável de saber se a transação já terminou, então
+  o adaptador compara a identidade da própria transação no Postgres (`pg_current_xact_id()` +
+  `pg_backend_pid()`) a cada chamada e lança `ConfigError` numa divergência (usar o wrapper depois
+  que o callback de `db.transaction(...)` retornou rodaria em silêncio dentro de outra transação que
+  reaproveitar a mesma conexão reciclada depois).
+- `knexTx` **rejeita SQL cru que contenha uma barra invertida literal** — não só o escape `?`/`\?`
+  acima, mas qualquer barra invertida no texto passado por ele (um literal de escape, um operador de
+  regex, ...) — porque o escape de `?` do knex não consegue distinguir com segurança um placeholder
+  injetado de um adjacente a essa barra. O SQL do próprio minitrigger nunca tem uma; isso só importa
+  se você mandar outro SQL cru pelo mesmo `tx` embrulhado.
 
 ## NOTIFY/LISTEN + varredura de 2s como rede de segurança
 

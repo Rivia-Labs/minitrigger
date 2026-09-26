@@ -66,9 +66,14 @@ type TriggerOptions = {
 	delay?: Duration;
 	debounce?: { key: string; delay: Duration; payload?: "last" | "first"; maxDelay?: Duration };
 	concurrencyKey?: string;
-	tx?: PoolClient | Client; // ver 06-outbox.md
+	tx?: TransactionClient; // ver 06-outbox.md
 };
 ```
+
+`TransactionClient` é só `{ query(text, values?) }` — um client node-postgres (`PoolClient`/`Client`,
+nunca um `Pool`) com `BEGIN` já rodado, ou o retorno de um dos adaptadores de ORM
+(`typeormTx`/`knexTx`/`drizzleTx`/`prismaTx`, ver
+[06. Outbox](06-outbox.md#com-um-orm-typeorm-knex-drizzle-prisma)).
 
 Ver [05. Espera](05-espera.md), [06. Outbox](06-outbox.md), [07. Filas](07-filas.md).
 
@@ -159,7 +164,54 @@ Todos os erros acima estendem `MinitriggerError`. Ver [12. Troubleshooting](12-t
 `Duration` (usado em vários campos) aceita um número de milissegundos ou uma string como `"5m"`,
 `"2d"`, `"1.5h"` (unidades: `ms`, `s`, `m`, `h`, `d`, `w`).
 
+## Outros exports (entrada principal)
+
+Não repetidos acima porque já cobertos por seção própria ou por uma tabela: os tipos auxiliares de
+`runs.*`/`queues.*`/`schedules.*`/`events.*` (`Run`, `RunList`, `ListRunsOptions`, `RunStep`,
+`RunLogEntry`, `RunLogPage`, `CancelRunOutcome`, `CancelManyResult`, `BatchRunsFilter`,
+`BatchRunError`, `RetryFailedResult`, `RetrySkipReason`, `CompleteTokenOutcome`, `QueueInfo`,
+`QueueState`, `RunEvent`, `RunEventName`, `RunEventHandler`, `RunStatusUpdate`, `SubscribeOptions`,
+`ReadStreamOptions`, `Schedule`, `ScheduleUpsertInput`), os tipos de task/step (`Task`, `AnyTask`,
+`TaskOptions`, `TaskPayload<T>`, `TaskOutput<T>`, `TaskLogger`, `TaskProgress`,
+`StepTriggerOptions`, `TokenHandle`, `WaitResult<T>`, `RunHandle<O>`, `TaskQueueOptions`,
+`TaskScheduleOptions`), `SerializedError` (formato `{ name, message, stack?, cause? }` de um erro
+persistido) e os erros (`MinitriggerError` e subclasses, ver [Erros](#erros)).
+
+O que falta:
+
+| Export | O que é |
+|---|---|
+| `checkEnvironment`, `CheckEnvironmentOptions`, `EnvCheckReport`, `EnvCheckWarning`, `EnvCheckName`, `MIN_POSTGRES_VERSION_NUM` | Checagens autônomas de versão do Postgres / política de eviction do Redis / migrations pendentes (decisão 22) — `engine.start()` já chama isto com `autoMigrate: false`; chame direto para, por exemplo, um readiness probe. `MIN_POSTGRES_VERSION_NUM` é o piso checado (`130000`, ou seja 13.0). |
+| `MigrateResult` | Retorno de `engine.migrate()`: `{ applied: number[] }`, as versões aplicadas por aquela chamada. |
+| `attachDefaultLogger`, `EngineEventSource` | Ver [09. Observabilidade](09-observabilidade.md#attachdefaultlogger); `EngineEventSource` é o formato mínimo `{ events }` que a função aceita (qualquer `Engine`/`TestEngine`). |
+| `RunStatus`, `RunCursor`, `StepKind`, `StepStatus`, `LogLevel` | `Run.status`; o formato opaco do cursor de `list()`; o tipo e status de um step; o nível de uma entrada de log. |
+| `Json`, `Serializable<T>` | Um valor JSON simples; a checagem em tempo de compilação usada por `defineTask`/`trigger`/`ctx.progress.set`/etc. para rejeitar um tipo de payload/output que não é serializável em JSON — ver [Serialização](04-tasks-e-steps.md#serialização). |
+| `Duration`, `parseDuration` | O tipo `number \| "5m"` aceito por `delay`/`maxDurationMs`/etc., e a função que o interpreta. |
+| `BackoffOptions`, `RetryOptions` | Formato de `defineTask({ retry })` — ver [05. Espera](05-espera.md). |
+
 ## Testing subpath (`@rivia-labs/minitrigger/testing`)
 
-`createTestEngine`, `assertTriggered`, `refuteTriggered`, `allTriggered`, `runTask`, `EngineClient`.
-Ver [10. Testes](10-testes.md).
+| Export | O que é |
+|---|---|
+| `createTestEngine`, `TestEngine`, `TestEngineConfig` | Client em memória parecido com `Engine`, para testes, e sua config. |
+| `TestClock`, `TestClockOptions` | API de `testEngine.clock` (`now()`, `advance()`) e sua config `{ start?, autoAdvance? }`. |
+| `InlineRunResult` | Retorno de `runInline`/`drive`: `{ runId, status, output, error, attempt }`. |
+| `PendingToken`, `TestEngineTokens` | Formato de item de `tokens.pending(run)`; o tipo da sub-API `tokens` (acrescenta `pending` a `EngineTokens`). |
+| `assertTriggered`, `refuteTriggered`, `allTriggered` | Ver [10. Testes](10-testes.md). |
+| `AssertionError` | Lançado por `assertTriggered`/`refuteTriggered` quando a expectativa falha (estende `MinitriggerError`). |
+| `TriggeredEngine`, `TriggeredMatch`, `TriggeredRun` | O formato mínimo `{ runs }` aceito pelos helpers acima; o formato do filtro `match`; o formato de uma run casada. |
+| `runTask` | Ver [10. Testes](10-testes.md). |
+| `RunTaskOptions`, `RunTaskResult`, `RunTaskStep`, `RunTaskLogEntry`, `RunTaskTriggered`, `ChildStub` | Opções de `runTask` (inclusive dublês de token/filha), seu retorno, e os formatos dos steps/linhas de log/filhas disparadas que ele registrou; `ChildStub` é o dublê de uma task filha. |
+
+## Adaptadores de ORM (`@rivia-labs/minitrigger/typeorm\|knex\|drizzle\|prisma`)
+
+Cada subpath exporta sua função `*Tx`, o(s) tipo(s) estrutural(is) que ela aceita, e reexporta
+`TransactionClient`. Nenhum deles importa o ORM em si — os tipos são estruturais, casados contra o
+que o seu ORM devolver. Ver [06. Outbox](06-outbox.md#com-um-orm-typeorm-knex-drizzle-prisma).
+
+| Subpath | Wrapper | Tipo(s) estrutural(is) aceito(s) |
+|---|---|---|
+| `/typeorm` | `typeormTx(manager \| queryRunner)` | `TypeormEntityManagerLike`, `TypeormQueryRunnerLike` |
+| `/knex` | `knexTx(trx)` | `KnexTransactionLike` |
+| `/drizzle` | `drizzleTx(tx, sql)` | `DrizzleTransactionLike`, `DrizzleSqlTag` |
+| `/prisma` | `prismaTx(tx)` | `PrismaTransactionLike` |

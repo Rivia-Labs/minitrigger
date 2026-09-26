@@ -15,7 +15,7 @@ import type { EngineClient, RunEvent, RunEventName } from "./engine.js";
 import { ConfigError } from "./errors.js";
 
 /** What `attachDefaultLogger` needs from an engine: its `events` (any `Engine`/`TestEngine`). */
-export type EventSource = Pick<EngineClient, "events">;
+export type EngineEventSource = Pick<EngineClient, "events">;
 
 /**
  * `defaultLogger` (used when `config.logger` is omitted) drops `debug`/`info`, which would make
@@ -111,12 +111,12 @@ function logEvent(logger: EngineLogger, event: RunEvent): void {
  * Returns an unsubscribe function (idempotent, like every `engine.events.on` unsubscribe).
  */
 export function attachDefaultLogger(
-	engine: EventSource & { readonly logger: EngineLogger },
+	engine: EngineEventSource & { readonly logger: EngineLogger },
 	logger?: EngineLogger
 ): () => void;
-export function attachDefaultLogger(engine: EventSource, logger: EngineLogger): () => void;
+export function attachDefaultLogger(engine: EngineEventSource, logger: EngineLogger): () => void;
 export function attachDefaultLogger(
-	engine: EventSource & { readonly logger?: EngineLogger },
+	engine: EngineEventSource & { readonly logger?: EngineLogger },
 	logger?: EngineLogger
 ): () => void {
 	const configured = logger ?? engine.logger;

@@ -60,7 +60,11 @@ export interface RunTaskOptions {
 	 * result (`{ ok: false, error }`); `trigger` (fire-and-forget) propagates it like any step.
 	 */
 	children?: Record<string, ChildStub>;
-	/** `ctx.signal`; never fires on its own when omitted. */
+	/**
+	 * Forwarded into `ctx.signal` (aborting it aborts `ctx.signal` with the same reason). Never
+	 * aborted by `runTask` itself: like production's `abort("finished")`, `ctx.signal` (a signal
+	 * of `runTask`'s own) always aborts once `runTask` has produced its result, on every path.
+	 */
 	signal?: AbortSignal;
 	/**
 	 * When the task throws with steps still in flight, how long to wait for them before reporting
@@ -177,6 +181,17 @@ export async function runTask<T extends AnyTask>(
 	 * (directly, or via anything it awaits) is detected as nested.
 	 */
 	const stepScope = new AsyncLocalStorage<string>();
+
+	/**
+	 * Set once `runTask` has produced its result: on the fatal path in-flight steps are not
+	 * awaited, and their late completions must not mutate the returned result (which is also a
+	 * snapshot of these arrays, see `snapshot()` below).
+	 */
+	let finished = false;
+
+	function record<E>(list: E[], entry: E): void {
+		if (!finished) list.push(entry);
+	}
 
 	function markFatal<E>(error: E): E {
 		fatal = true;
@@ -338,7 +353,7 @@ export async function runTask<T extends AnyTask>(
 			label: `output of step "${name}" (task "${task.id}")`,
 			maxBytes: limits.maxStepOutputBytes,
 		});
-		steps.push({ name, kind: "run", output: output as Json });
+		record(steps, { name, kind: "run", output: structuredClone(output) as Json });
 		return output;
 	}
 
@@ -346,7 +361,7 @@ export async function runTask<T extends AnyTask>(
 		validateName(name);
 		parseDurationArg(duration);
 		register("sleep", name);
-		steps.push({ name, kind: "sleep", output: null });
+		record(steps, { name, kind: "sleep", output: null });
 	}
 
 	async function createToken(name: string, opts?: { timeout?: Duration }): Promise<TokenHandle> {
@@ -357,7 +372,7 @@ export async function runTask<T extends AnyTask>(
 		// Item 4(c): the recorded step output must be the SAME id the caller gets back (it wasn't --
 		// the step used to record `{ id: name }`, the step name, instead of the token's actual id).
 		const id = randomUUID();
-		steps.push({ name, kind: "token", output: { id } });
+		record(steps, { name, kind: "token", output: { id } });
 		return { id, name };
 	}
 
@@ -403,7 +418,7 @@ export async function runTask<T extends AnyTask>(
 		} catch (error) {
 			throw markFatal(error as Error);
 		}
-		steps.push({ name: `${name}#wait`, kind: "wait", output: null });
+		record(steps, { name: `${name}#wait`, kind: "wait", output: null });
 		return { ok: true, output };
 	}
 
@@ -420,9 +435,15 @@ export async function runTask<T extends AnyTask>(
 		register("trigger", name);
 		const stub = childStub(taskId, name, "trigger");
 		const output = normalizeOutput(await stub(value));
-		triggered.push({ name, taskId, mode: "trigger", payload: value, output: output as Json });
+		record(triggered, {
+			name,
+			taskId,
+			mode: "trigger",
+			payload: structuredClone(value),
+			output: structuredClone(output) as Json,
+		});
 		const id = randomUUID();
-		steps.push({ name, kind: "trigger", output: { id } });
+		record(steps, { name, kind: "trigger", output: { id } });
 		return { id, taskId };
 	}
 
@@ -438,7 +459,7 @@ export async function runTask<T extends AnyTask>(
 		if (opts?.timeout !== undefined) parseDurationArg(opts.timeout);
 		register("triggerAndWait", name);
 		const stub = childStub(taskId, name, "triggerAndWait");
-		steps.push({ name, kind: "trigger_wait", output: null });
+		record(steps, { name, kind: "trigger_wait", output: null });
 		return runChild(name, taskId, value, stub, "triggerAndWait");
 	}
 
@@ -464,7 +485,7 @@ export async function runTask<T extends AnyTask>(
 		// needs no stub.
 		if (values.length === 0) return [];
 		const stub = childStub(taskId, name, "batchTriggerAndWait");
-		steps.push({ name, kind: "batch_wait", output: null });
+		record(steps, { name, kind: "batch_wait", output: null });
 		const results: WaitResult<unknown>[] = [];
 		for (const value of values) {
 			results.push(await runChild(name, taskId, value, stub, "batchTriggerAndWait"));
@@ -481,11 +502,23 @@ export async function runTask<T extends AnyTask>(
 	): Promise<WaitResult<unknown>> {
 		try {
 			const output = normalizeOutput(await stub(payload));
-			triggered.push({ name, taskId, mode, payload, output: output as Json });
+			record(triggered, {
+				name,
+				taskId,
+				mode,
+				payload: structuredClone(payload),
+				output: structuredClone(output) as Json,
+			});
 			return { ok: true, output };
 		} catch (error) {
 			const serialized = formatError(error, true);
-			triggered.push({ name, taskId, mode, payload, error: serialized });
+			record(triggered, {
+				name,
+				taskId,
+				mode,
+				payload: structuredClone(payload),
+				error: serialized,
+			});
 			return { ok: false, error: serialized };
 		}
 	}
@@ -518,19 +551,36 @@ export async function runTask<T extends AnyTask>(
 		maxLogEntryBytes: limits.maxLogEntryBytes,
 		insertBatch: async (entries: NewLogEntry[]) => {
 			for (const entry of entries) {
-				logEntries.push({ level: entry.level, message: entry.message, data: entry.data });
+				record(logEntries, { level: entry.level, message: entry.message, data: entry.data });
 			}
 		},
 	});
 
-	const controller = options.signal === undefined ? new AbortController() : undefined;
+	// Always a signal of our own, so it can be aborted when runTask ends (production's
+	// `abort("finished")`) without ever aborting the caller's `options.signal`, which is only
+	// forwarded into it.
+	const controller = new AbortController();
+	const signal =
+		options.signal === undefined
+			? controller.signal
+			: AbortSignal.any([controller.signal, options.signal]);
+	const runId = randomUUID();
+	/** Same reason shape as production's `abortReason("finished", ...)` (`executor/execution.ts`). */
+	function abortFinished(message?: string): void {
+		controller.abort(
+			new DOMException(
+				message ?? `this execution of run ${runId} finished; its attempt is over`,
+				"AbortError"
+			)
+		);
+	}
 
 	const ctx: TaskContext = {
 		step,
 		logger: logBuffer,
-		signal: options.signal ?? (controller as AbortController).signal,
+		signal,
 		run: {
-			id: randomUUID(),
+			id: runId,
 			taskId: task.id,
 			attempt: options.attempt ?? 1,
 			createdAt: new Date(),
@@ -538,7 +588,7 @@ export async function runTask<T extends AnyTask>(
 		async stream(name, source) {
 			if (streams[name] === undefined) streams[name] = [];
 			const items = streams[name];
-			for await (const item of source) items.push(item);
+			for await (const item of source) record(items, item);
 		},
 		progress: {
 			async set<V>(value: V): Promise<void> {
@@ -549,63 +599,79 @@ export async function runTask<T extends AnyTask>(
 					label: `progress of task "${task.id}"`,
 					maxBytes: limits.maxProgressBytes,
 				});
-				progress.push(structuredClone(value) as Json);
+				record(progress, structuredClone(value) as Json);
 			},
 		},
 	};
 
-	const anyTask = task as AnyTask;
-	let outcome: { ok: true; value: unknown } | { ok: false; error: unknown };
 	try {
-		outcome = { ok: true, value: await anyTask.options.run(payload, ctx) };
-	} catch (error) {
-		outcome = { ok: false, error };
+		return await execute();
+	} finally {
+		// Like production (`runAcquired`'s finally, after the terminal write): the attempt is over,
+		// stop whatever user code is still running. No-op if already aborted.
+		finished = true;
+		abortFinished();
 	}
-	// Production settles every step still in flight before the terminal write (success: steps not
-	// awaited are still recorded; error: `settleBeforeFail`), so `steps`/`triggered` are complete.
-	// Production parity: a fatal error (code bug) fails the run right away, without waiting for
-	// steps in flight; a thrown error waits at most `settleTimeoutMs` (production: `stallTimeoutMs`)
-	// and then reports the original error; success drains everything (unawaited steps recorded).
-	if (!fatal) {
-		const settled = await settleInFlight(outcome.ok ? undefined : settleTimeoutMs);
-		// Like production's `abort("finished")` after giving up: tell stuck steps the attempt ended.
-		if (!settled)
-			controller?.abort(new MinitriggerError("runTask finished while steps were in flight"));
-	}
-	await logBuffer.close();
-	// A missing test double is a test-authoring mistake: surface it even if the task caught it.
-	if (missingDoubleError !== undefined) throw missingDoubleError;
 
-	const failed = (error: unknown, retryable: boolean): RunTaskResult<TaskOutput<T>> => ({
-		output: null,
-		error: formatError(error, retryable),
-		steps,
-		logs: logEntries,
-		progress,
-		triggered,
-		streams,
-	});
-	// A fatal error (a code bug such as NestedStepError or an invalid step name) fails the run
-	// without retry and is the reported error, whatever the function did afterwards -- even if it
-	// caught it and resolved, or threw something else (production's `state.fatalError`).
-	if (fatal) return failed(fatalError, false);
-	if (!outcome.ok) return failed(outcome.error, !(outcome.error instanceof AbortTaskRunError));
-	const output = normalizeOutput(outcome.value);
-	try {
-		assertSerializable(output, {
-			label: `output of task "${task.id}"`,
-			maxBytes: limits.maxPayloadBytes,
+	async function execute(): Promise<RunTaskResult<TaskOutput<T>>> {
+		const anyTask = task as AnyTask;
+		let outcome: { ok: true; value: unknown } | { ok: false; error: unknown };
+		try {
+			outcome = { ok: true, value: await anyTask.options.run(payload, ctx) };
+		} catch (error) {
+			outcome = { ok: false, error };
+		}
+		// Production settles every step still in flight before the terminal write (success: steps not
+		// awaited are still recorded; error: `settleBeforeFail`), so `steps`/`triggered` are complete.
+		// Production parity: a fatal error (code bug) fails the run right away, without waiting for
+		// steps in flight; a thrown error waits at most `settleTimeoutMs` (production: `stallTimeoutMs`)
+		// and then reports the original error; success drains everything (unawaited steps recorded).
+		if (!fatal) {
+			const settled = await settleInFlight(outcome.ok ? undefined : settleTimeoutMs);
+			// Like production's `abort("finished")` after giving up: tell stuck steps the attempt ended.
+			if (!settled)
+				abortFinished(
+					`run ${runId}: the task function threw and its in-flight steps did not settle within ` +
+						`${settleTimeoutMs} ms (settleTimeoutMs); this attempt is over`
+				);
+		}
+		await logBuffer.close();
+		// A missing test double is a test-authoring mistake: surface it even if the task caught it.
+		if (missingDoubleError !== undefined) throw missingDoubleError;
+		// From here on the result is being produced: late completions (fatal path, or a step that
+		// outlived settleTimeoutMs) must not touch it, and the returned arrays are snapshots.
+		finished = true;
+		const snapshot = () => ({
+			steps: [...steps],
+			logs: [...logEntries],
+			progress: [...progress],
+			triggered: [...triggered],
+			streams: Object.fromEntries(Object.entries(streams).map(([k, v]) => [k, [...v]])),
 		});
-	} catch (error) {
-		return failed(error, false);
+
+		const failed = (error: unknown, retryable: boolean): RunTaskResult<TaskOutput<T>> => ({
+			output: null,
+			error: formatError(error, retryable),
+			...snapshot(),
+		});
+		// A fatal error (a code bug such as NestedStepError or an invalid step name) fails the run
+		// without retry and is the reported error, whatever the function did afterwards -- even if it
+		// caught it and resolved, or threw something else (production's `state.fatalError`).
+		if (fatal) return failed(fatalError, false);
+		if (!outcome.ok) return failed(outcome.error, !(outcome.error instanceof AbortTaskRunError));
+		const output = normalizeOutput(outcome.value);
+		try {
+			assertSerializable(output, {
+				label: `output of task "${task.id}"`,
+				maxBytes: limits.maxPayloadBytes,
+			});
+		} catch (error) {
+			return failed(error, false);
+		}
+		return {
+			output: output as TaskOutput<T>,
+			error: null,
+			...snapshot(),
+		};
 	}
-	return {
-		output: output as TaskOutput<T>,
-		error: null,
-		steps,
-		logs: logEntries,
-		progress,
-		triggered,
-		streams,
-	};
 }

@@ -63,14 +63,15 @@ you, release assets need GitHub authentication; download the tarball with the Gi
 with access to the repo) and add it from disk:
 
 ```bash
-gh release download v0.2.0 -R igorabreu29/minitrigger -p "*.tgz"
-pnpm add ./minitrigger-0.2.0.tgz bullmq ioredis pg
+gh release download v0.3.0 -R igorabreu29/minitrigger -p "*.tgz"
+pnpm add ./rivia-labs-minitrigger-0.3.0.tgz bullmq ioredis pg
 pnpm add -D @types/pg   # optional, only needed if you use TypeScript
 ```
 
-(`v0.2.0`'s tarball is named `minitrigger-0.2.0.tgz` — unscoped, see the note below. From
-`v0.3.0` on it's `rivia-labs-minitrigger-<version>.tgz`, and the install command uses
-`@rivia-labs/minitrigger` as shown in the "Recommended: npm" section above.)
+(From `v0.3.0` on, the tarball is named `rivia-labs-minitrigger-<version>.tgz` and its
+`package.json` says `@rivia-labs/minitrigger`, matching the "Recommended: npm" section above. Only
+the older `v0.2.0` tag — kept for reference, not recommended for new installs — used the unscoped
+`minitrigger-0.2.0.tgz`/`minitrigger`, see the note below.)
 
 Commit the `.tgz` (e.g. under `vendor/`) or fetch it in CI with a token that can read the repo.
 
@@ -84,10 +85,11 @@ build script. It's also pinned and reproducible — a fixed artifact per version
 `HEAD` currently contains." `pnpm check:pack` (see [Benchmark](#benchmark)) exercises exactly this
 pack → install → import path in CI.
 
-Releases up to and including `v0.2.0` were published under the unscoped name `minitrigger` (the
-tarball and its `package.json` inside that tag say `minitrigger`, not `@rivia-labs/minitrigger`) —
-that only matters if you pin to one of those older tags; from `v0.3.0` on, everything (npm, the
-release tarball, the GitHub-install fallback below) uses `@rivia-labs/minitrigger`.
+Only `v0.2.0` and earlier were published under the unscoped name `minitrigger` (the tarball and its
+`package.json` inside that tag say `minitrigger`, not `@rivia-labs/minitrigger`) — that's the old
+API and only matters if you deliberately pin to one of those older tags; `v0.3.0` on is current and
+everything (npm, the release tarball, the GitHub-install fallback below) uses
+`@rivia-labs/minitrigger`.
 
 ### Fallback: install straight from GitHub
 
@@ -95,7 +97,7 @@ Needs git access to the repo (SSH key or a credential helper for HTTPS) — only
 repository is private; a public repo needs no auth for this.
 
 ```bash
-pnpm add github:igorabreu29/minitrigger#v0.2.0 bullmq ioredis pg
+pnpm add github:igorabreu29/minitrigger#v0.3.0 bullmq ioredis pg
 ```
 
 `dist/` is `.gitignore`d and only produced by minitrigger's own `prepare` script, and pnpm 10+
@@ -105,8 +107,8 @@ blocks a git dependency's lifecycle scripts by default — so a plain `pnpm add 
 ```yaml
 # your project's pnpm-workspace.yaml
 allowBuilds:
-  minitrigger@github.com/igorabreu29/minitrigger#<resolved-commit>: true # tags up to v0.2.0
-  # "@rivia-labs/minitrigger@github.com/igorabreu29/minitrigger#<resolved-commit>": true  # v0.3.0+
+  "@rivia-labs/minitrigger@github.com/igorabreu29/minitrigger#<resolved-commit>": true # v0.3.0+
+  # minitrigger@github.com/igorabreu29/minitrigger#<resolved-commit>: true # only for tags up to v0.2.0
   msgpackr-extract: true # ioredis's optional native accelerator; blocked by the same pnpm mechanism
 ```
 
@@ -383,7 +385,7 @@ try {
   exactly one of them dispatch each run), so the cost per commit grows with the number of started
   engines, not with the number of runs.
 - **Connections.** Each started engine holds its `LISTEN` connection outside the pool, in
-  addition to the leader-election one — see [pool sizing](#operation).
+  addition to the leader-election one — see [Pool sizing](#pool-sizing).
 - **A stuck listener can hold back every notifying commit.** Postgres keeps undelivered
   notifications in one cluster-wide queue (8 GB) until the slowest listening backend consumes
   them; a `LISTEN` session that stops reading (a frozen process whose socket stays open) pins it,
@@ -475,6 +477,17 @@ await prisma.$transaction(async tx => {
   the interactive transaction's `timeout` (5 s by default) like for any other statement in it.
 - Any other driver/ORM works the same way: pass an object with `query(text, values)` that runs the
   `$1..$n` statement on the transaction's connection and resolves to `{ rows }`.
+- `drizzleTx` does **one extra round trip per `query()` call** (plus one at wrap time): drizzle-orm
+  0.45.x exposes no reliable "this transaction ended" flag, so the adapter instead compares
+  Postgres's own transaction identity (`pg_current_xact_id()` + `pg_backend_pid()`) on every call
+  and throws `ConfigError` on a mismatch (using the wrapper after its `db.transaction(...)`
+  callback returned would otherwise silently run inside whatever unrelated transaction later
+  checks out the same recycled connection).
+- `knexTx` **rejects raw SQL containing a literal backslash** — not just the `?`/`\?` escaping
+  above, but any backslash at all in the text passed through it (an escape-string literal, a regex
+  operator, ...) — since knex's own `?`-escaping can't reliably tell an injected placeholder from a
+  backslash-adjacent one apart in that case. Minitrigger's own SQL never contains one; this only
+  matters if you send other raw SQL through the same wrapped `tx`.
 
 ### Queues
 
@@ -490,6 +503,11 @@ Queue settings are shared per queue **name**: several tasks can reference the sa
 one of them may declare `concurrency`/`globalConcurrency`/`rateLimit` for it — a second, differing
 declaration for the same name fails engine creation with a clear error. A task with no `queue`
 belongs to the `"default"` queue (concurrency 10 unless something else declares it).
+
+`concurrency` limits how many runs of the queue execute at once **in this process**; `globalConcurrency`
+is BullMQ's own queue-level limit, enforced across **every** process sharing the queue (Redis-side,
+via `Queue.setGlobalConcurrency()`) — set it when several deployed processes share a queue and the
+cap needs to hold across all of them, not per process.
 
 #### Pausing, resuming and scaling queues
 
@@ -659,6 +677,68 @@ All of the above extend `MinitriggerError`.
 
 ## API reference
 
+### Exports reference
+
+Every named export of the main entry, `/testing` and the four ORM-adapter subpaths, one line each.
+Names already covered by their own subsection above/below link there instead of repeating.
+
+**Main entry (`@rivia-labs/minitrigger`):**
+
+| Export | What it is |
+|---|---|
+| `createEngine(config)` | Builds an [`Engine`](#createengineconfig). |
+| `Engine`, `EngineClient` | `Engine` is the full client (also `migrate`/`start`/`stop`); `EngineClient` is the `Pick<Engine, "trigger" \| "runs" \| "tokens" \| "schedules" \| "events">` subset both `Engine` and `TestEngine` satisfy. |
+| `EngineConfig`, `EngineLimits`, `EngineLogger`, `EngineLogFn` | `createEngine`'s config shape; payload/output size limits ([config table](#config-options)); the pino/console-compatible logger shape and its per-level function type. |
+| `StartOptions` | `engine.start(options)`'s options (e.g. `{ queues }` to start only some). |
+| `TriggerOptions`, `DebounceOptions`, `TransactionClient` | `engine.trigger`'s third argument (idempotency, delay, [debounce](#debounce)/[concurrency keys](#concurrency-keys)/[`tx`](#transactional-trigger-outbox)); `DebounceOptions` is its `debounce` field; `TransactionClient` is the `tx` client shape. |
+| `Run`, `RunList`, `ListRunsOptions`, `RunStep`, `RunLogEntry`, `RunLogPage`, `RunLogsOptions` | Shapes returned by `runs.get`/`list`/`steps`/`logs` — see [Run introspection](#run-introspection-events-and-streams). |
+| `EngineRuns`, `EngineTokens`, `EngineQueues`, `EngineEvents`, `EngineSchedules` | The `runs`/`tokens`/`queues`/`events`/`schedules` sub-APIs of `Engine`/`EngineClient`. |
+| `CancelRunOutcome`, `CancelManyResult`, `BatchRunsFilter`, `BatchRunError`, `RetryFailedResult`, `RetrySkipReason` | `runs.cancel`'s return; `runs.cancelMany`/`retryFailed`'s filter and results (a per-run failure, and why a failed run wasn't retried — e.g. its payload no longer fits `maxPayloadBytes`). |
+| `CompleteTokenOutcome` | `tokens.complete(id, output)`'s return (`{ completed: boolean, reason?: ... }`). |
+| `QueueInfo`, `QueueState` | `queues.list()`'s per-queue info; the persisted pause state behind it. |
+| `RunEvent`, `RunEventName`, `RunEventHandler` | `engine.events.on(name, handler)`'s event shape (includes `durationMs`/`startedAt` on the transitions that carry them), event names and handler type. |
+| `RunStatusUpdate`, `SubscribeOptions` | `runs.subscribe(run)`'s yielded value and its `{ signal? }` option. |
+| `ReadStreamOptions` | `runs.readStream(run, name, options)`'s `{ signal? }` option. |
+| `Schedule`, `ScheduleUpsertInput` | A row read from `schedules.list()`; the input shape for `schedules.upsert()`. |
+| `attachDefaultLogger`, `EngineEventSource` | [Structured logging](#structured-logging-attachdefaultlogger); `EngineEventSource` is the minimal `{ events }` shape it accepts (any `Engine`/`TestEngine`). |
+| `checkEnvironment`, `CheckEnvironmentOptions`, `EnvCheckReport`, `EnvCheckWarning`, `EnvCheckName`, `MIN_POSTGRES_VERSION_NUM` | Standalone version/eviction-policy/pending-migrations checks (decision 22) — `engine.start()` runs this itself with `autoMigrate: false`; call it directly for e.g. a readiness probe. `EnvCheckName` is `"postgres-version" \| "redis-eviction-policy" \| "pending-migrations"`; `MIN_POSTGRES_VERSION_NUM` is the floor it checks against (`130000`, i.e. 13.0). |
+| `MigrateResult` | `engine.migrate()`'s return: `{ applied: number[] }`, the migration versions applied by that call. |
+| `defineTask`, `Task`, `AnyTask`, `TaskOptions`, `TaskPayload<T>`, `TaskOutput<T>` | Declares a task; its type, an unconstrained version for generic helper signatures, its options shape, and helpers that extract a task's payload/output type. |
+| `TaskContext`, `TaskLogger`, `TaskProgress`, `StepApi`, `StepTriggerOptions`, `TokenHandle`, `WaitResult<T>`, `RunHandle<O>` | The second argument of `run` (`ctx`) and its pieces — see [`ctx`](#ctx-second-argument-of-a-tasks-run) and [`StepApi`](#stepapi). `RunHandle<O>` is what `trigger`/`step.trigger` return (`{ id }`, typed by the task's output). |
+| `TaskQueueOptions`, `TaskScheduleOptions` | `defineTask({ queue, schedule })`'s option shapes — see [Queues](#queues) and [Schedules](#schedules-cron). |
+| `SerializedError` | The `{ name, message, stack?, cause? }` shape an error takes once persisted (e.g. `Run.error`, a `WaitResult`'s `error`). |
+| `MinitriggerError`, `ConfigError`, `SerializationError`, `AbortTaskRunError`, `NonDeterminismError`, `DuplicateStepError`, `NestedStepError`, `ExecutionLostError`, `TaskNotRegisteredError` | See [Errors reference](#errors-reference) — all extend `MinitriggerError`. |
+| `RunStatus`, `RunCursor`, `StepKind`, `StepStatus`, `LogLevel` | `Run.status`; the opaque cursor shape of `list()`'s `nextCursor`; a step's kind (`run`/`sleep`/`token`/`wait`/`trigger`/`trigger_wait`/`batch_wait`) and status; a log entry's level. |
+| `Json`, `Serializable<T>` | A plain JSON value; the compile-time check used by `defineTask`/`trigger`/`ctx.progress.set`/etc. to reject a payload/output type that isn't JSON-serializable (see [Serialization rules](#serialization-rules)). |
+| `Duration`, `parseDuration` | `number \| "5m"`-style duration type accepted by `delay`/`maxDurationMs`/etc., and the function that parses it. |
+| `BackoffOptions`, `RetryOptions` | `defineTask({ retry })`'s backoff and retry option shapes — see [Retries & backoff](#retries--backoff). |
+
+**`@rivia-labs/minitrigger/testing`** (see [Testing your tasks](#testing-your-tasks)):
+
+| Export | What it is |
+|---|---|
+| `createTestEngine`, `TestEngine`, `TestEngineConfig` | An in-memory `Engine`-like client for tests, and its config. |
+| `TestClock`, `TestClockOptions` | `testEngine.clock`'s API (`now()`, `advance()`) and its `{ start?, autoAdvance? }` config. |
+| `InlineRunResult` | `runInline`/`drive`'s return: `{ runId, status, output, error, attempt }`. |
+| `PendingToken`, `TestEngineTokens` | `tokens.pending(run)`'s item shape; the `tokens` sub-API's type (adds `pending` to `EngineTokens`). |
+| `assertTriggered`, `refuteTriggered`, `allTriggered` | See [`assertTriggered` / `refuteTriggered` / `allTriggered`](#asserttriggered--refutetriggered--alltriggered). |
+| `AssertionError` | Thrown by `assertTriggered`/`refuteTriggered` when the expectation fails (extends `MinitriggerError`). |
+| `TriggeredEngine`, `TriggeredMatch`, `TriggeredRun` | The minimal `{ runs }` shape the helpers above accept; their `match` filter shape; a matched run's shape. |
+| `runTask` | See [`runTask`: unit-testing one task's logic](#runtask-unit-testing-one-tasks-logic). |
+| `RunTaskOptions`, `RunTaskResult`, `RunTaskStep`, `RunTaskLogEntry`, `RunTaskTriggered`, `ChildStub` | `runTask`'s options (incl. token/child stubs), its return shape, and the shapes of the steps/log lines/triggered children it recorded; `ChildStub` is one child-task stub. |
+
+**ORM adapter subpaths** (`@rivia-labs/minitrigger/typeorm\|knex\|drizzle\|prisma`, see [With an ORM](#with-an-orm-typeorm-knex-drizzle-prisma)) — each exports its `*Tx` wrapper function, the `*TransactionLike`/`*SqlTag` structural type(s) it accepts, and re-exports `TransactionClient`:
+
+| Subpath | Wrapper | Structural input type(s) |
+|---|---|---|
+| `/typeorm` | `typeormTx(manager \| queryRunner)` | `TypeormEntityManagerLike`, `TypeormQueryRunnerLike` |
+| `/knex` | `knexTx(trx)` | `KnexTransactionLike` |
+| `/drizzle` | `drizzleTx(tx, sql)` | `DrizzleTransactionLike`, `DrizzleSqlTag` |
+| `/prisma` | `prismaTx(tx)` | `PrismaTransactionLike` |
+
+None of the four import the ORM itself — the types above are structural, matched against whatever
+transaction handle your ORM gives you.
+
 ### `createEngine(config)`
 
 See the [config options table](#config-options) below for every field.
@@ -714,7 +794,12 @@ the simplified `payload?` shown above.
 
 `TriggerOptions`: `{ idempotencyKey?: string; idempotencyKeyTtl?: Duration; delay?: Duration;
 debounce?: { key: string; delay: Duration; payload?: "last" | "first"; maxDelay?: Duration };
-concurrencyKey?: string }` (see [Debounce](#debounce) and [Concurrency keys](#concurrency-keys)).
+concurrencyKey?: string; tx?: TransactionClient }` (see [Debounce](#debounce),
+[Concurrency keys](#concurrency-keys) and [Transactional trigger](#transactional-trigger-outbox)).
+`TransactionClient` is just `{ query(text, values?) }` — a node-postgres client with an open
+`BEGIN` (never a `Pool`), or the return value of one of the ORM adapters
+(`typeormTx`/`knexTx`/`drizzleTx`/`prismaTx` from `@rivia-labs/minitrigger/typeorm|knex|drizzle|prisma`
+— see [With an ORM](#with-an-orm-typeorm-knex-drizzle-prisma)).
 
 An engine that never calls `start()` can still `trigger()` and query — no workers, no queue
 consumption (decision 19 in `docs/SPEC.md`).
@@ -1289,22 +1374,34 @@ it("approves when the token resolves truthy", async () => {
   (`typeormTx`, `knexTx`, `drizzleTx`, `prismaTx`) turn an ORM's own transaction handle into the
   `tx` client above — see [With an ORM](#with-an-orm-typeorm-knex-drizzle-prisma).
 - **`attachDefaultLogger(engine, logger?)`**, opt-in structured logging over `engine.events` — see
-  [Structured logging](#structured-logging-attachdefaultlogger).
+  [Structured logging](#structured-logging-attachdefaultlogger). It reads `engine.logger` when no
+  logger is passed, a new read-only field on `Engine` (`= config.logger`; not on `EngineClient`/
+  `TestEngine`).
+- **`durationMs`/`startedAt` on `engine.events`.** `run:completed`/`run:failed`/`run:retrying`/
+  `run:waiting` now carry `startedAt` (DB clock) and `durationMs` (monotonic clock, never
+  persisted) — see [`engine.events.on`](#run-introspection-events-and-streams). They measure the
+  **current execution** since its last acquisition/resume, not the attempt summed across
+  suspensions.
 - **Test helpers**, from the `/testing` subpath: `assertTriggered`/`refuteTriggered`/`allTriggered`
   (assert what an `Engine`/`TestEngine` triggered) and `runTask` (unit-test one task's `run`
   function directly, no engine/store/queue) — see
   [`assertTriggered` / `refuteTriggered` / `allTriggered`](#asserttriggered--refutetriggered--alltriggered)
   and [`runTask`: unit-testing one task's logic](#runtask-unit-testing-one-tasks-logic).
 - **Reads keep working while `stop()` drains, writes don't.** During a graceful `stop()` (workers
-  closing, active runs draining, connections being released), read-only calls — `runs.get`/`list`/
-  `logs`/`steps`, `runs.cancel`, `tokens.complete`, `queues.list`, `schedules.list` — keep working
-  right up until `stop()` finishes closing everything (its very last step, just before closing a
-  pool this engine created); only after that do they throw `"this engine was stopped; create a new
-  one"`. Calls that start new work — `trigger`, `runs.replay`/`subscribe`/`readStream`/`cancelMany`/
+  closing, active runs draining, connections being released), reads plus the handful of calls a
+  graceful drain still needs to finish cleanly — `runs.get`/`list`/`logs`/`steps`, `runs.cancel`,
+  `tokens.complete`, `queues.list`, `schedules.list` — keep working right up until `stop()`
+  finishes closing everything (its very last step, just before closing a pool this engine
+  created); only after that do they throw `"this engine was stopped; create a new one"`. Calls
+  that start new work — `trigger`, `runs.replay`/`subscribe`/`readStream`/`cancelMany`/
   `retryFailed`, `queues.pause`/`resume`/`scale`, `schedules.upsert`/`delete` — throw that same
   error as soon as `stop()` **begins**, not when it finishes, since starting new work while the
-  engine is on its way out would fight the shutdown. A `TestEngine` never throws this on its own
-  (it has no `stop()`); it stays usable for the lifetime of the object.
+  engine is on its way out would fight the shutdown. `TestEngine` *does* have a `stop()`
+  (`await testEngine.stop()`), and it enforces the same "begins vs. finishes" split for the
+  write-side calls above (`trigger`, `cancelMany`, `retryFailed`, `queues.pause`/`resume`/`scale`,
+  `schedules.upsert`/`delete` all throw right after `stop()` is called) — it just never enforces
+  the second, "fully closed" half of the split for the read-plus-drain group, so those keep
+  working for the lifetime of the object, even long after `stop()` resolved.
 
 ## Upgrading to 0.2.0
 
@@ -1453,18 +1550,30 @@ concern is specific to 005's two new indexes.
   would wait for a reconnection that never comes). Closing the pool the engine created is bounded
   too (5 s): if a client is still checked out, `stop()` logs a `warn` and resolves, and the pool
   finishes closing once that client is released. An injected pool is never closed.
+
 #### Pool sizing
 
 The pool needs `max >= total worker concurrency + 5` (the engine's own
-bookkeeping queries need headroom beyond what your workers consume). On top of the pool, every
-**started** engine holds **two** dedicated Postgres connections outside it (leader election and the
-outbox `LISTEN`), so budget `max_connections` for `processes × (pool.max + 2)`. A pool the engine creates
+bookkeeping queries need headroom beyond what your workers consume; this fixed `+5` headroom is
+not derived from `systemConcurrency` — see the note below). On top of the pool, every **started**
+engine holds **up to two** dedicated Postgres connections outside it (leader election and the
+outbox `LISTEN`) — fewer while either is still connecting or backing off after a dropped
+connection, and momentarily fewer if one fails to (re)connect — so budget `max_connections` for
+`processes × (pool.max + 2)`. A pool the engine creates
 gets that size by default (at least 10) and a 10 s `connectionTimeoutMillis`
 (`pool.connectionTimeoutMs`). If you inject your own `pg.Pool`, size it the same way and set a
 `connectionTimeoutMillis`: `start()` warns when it is smaller than the started queues need or
 has no acquisition timeout (a heartbeat would then wait for a connection without limit instead of
 failing with a warning). A separate, dedicated pool for the library is recommended over sharing
 your application's pool.
+
+The `+5` headroom above (`DEFAULTS.poolHeadroom`) is a fixed constant, not a count of
+`systemConcurrency`'s own queries: the recommended `pool.max` is `max(10, sum of task-queue
+concurrency + 5)`, computed only from your task queues' `concurrency` (`recommendedPoolMax` in
+`src/engine.ts`) — it never adds `systemConcurrency` (default `5`, the `-system` worker's own
+concurrency), even though the two numbers happen to match by default. If you raise
+`systemConcurrency` well above its default, size `pool.max` for that yourself; `start()`'s warning
+won't account for it.
 
 #### Redis connections per engine
 

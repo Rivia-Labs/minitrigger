@@ -735,3 +735,138 @@ describe("runTask: bounded settle of in-flight steps (production parity)", () =>
 		expect(result.error).toMatchObject({ message: "original" });
 	});
 });
+
+describe("runTask: result isolation and end-of-run abort (production parity)", () => {
+	const echoChild = defineTask({
+		id: "iso-child",
+		run: async (payload: { n: number }) => payload,
+	});
+
+	it("result.steps[].output and result.triggered[].payload/output are copies", async () => {
+		const stubOutput = { value: 1 };
+		const task = defineTask({
+			id: "iso-copies",
+			run: async (_payload: undefined, ctx) => {
+				const out = await ctx.step.run("make", async () => ({ list: [1, 2] }));
+				out.list.push(3);
+				const childPayload = { n: 1 };
+				await ctx.step.triggerAndWait("child", echoChild, childPayload);
+				childPayload.n = 99;
+				const firePayload = { n: 2 };
+				await ctx.step.trigger("fire", echoChild, firePayload);
+				firePayload.n = 98;
+				return "ok";
+			},
+		});
+		const result = await runTask(task, undefined, { children: { "iso-child": () => stubOutput } });
+		stubOutput.value = 42;
+		expect(result.steps[0]?.output).toEqual({ list: [1, 2] });
+		expect(result.triggered.map(t => t.payload)).toEqual([{ n: 1 }, { n: 2 }]);
+		expect(result.triggered.map(t => t.output)).toEqual([{ value: 1 }, { value: 1 }]);
+	});
+
+	function signalTask(id: string, body: (ctx: { signal: AbortSignal }) => Promise<unknown>) {
+		let seen: AbortSignal | undefined;
+		let abortedDuringRun: boolean | undefined;
+		const task = defineTask({
+			id,
+			run: async (_payload: undefined, ctx) => {
+				seen = ctx.signal;
+				abortedDuringRun = ctx.signal.aborted;
+				return (await body(ctx)) as string;
+			},
+		});
+		return { task, seen: () => seen, abortedDuringRun: () => abortedDuringRun };
+	}
+
+	it.each([
+		["success", async (): Promise<unknown> => "ok"],
+		[
+			"error",
+			async (): Promise<unknown> => {
+				throw new Error("boom");
+			},
+		],
+	] as const)(
+		"ctx.signal aborts with a 'finished' AbortError once runTask ends (%s)",
+		async (_label, body) => {
+			const probe = signalTask(`signal-end-${_label}`, body);
+			await runTask(probe.task);
+			expect(probe.abortedDuringRun()).toBe(false);
+			expect(probe.seen()?.aborted).toBe(true);
+			expect(probe.seen()?.reason).toMatchObject({
+				name: "AbortError",
+				message: expect.stringMatching(/finished/),
+			});
+		}
+	);
+
+	it("ctx.signal aborts once runTask ends on the fatal path", async () => {
+		let seen: AbortSignal | undefined;
+		const task = defineTask({
+			id: "signal-end-fatal",
+			run: async (_payload: undefined, ctx) => {
+				seen = ctx.signal;
+				await ctx.step.run("bad:name", async () => 1);
+				return "unreachable";
+			},
+		});
+		const result = await runTask(task);
+		expect(result.error).toMatchObject({ retryable: false });
+		expect(seen?.aborted).toBe(true);
+		expect(seen?.reason).toMatchObject({ name: "AbortError" });
+	});
+
+	it("never aborts the caller's options.signal, but still forwards its abort", async () => {
+		const controller = new AbortController();
+		let seen: AbortSignal | undefined;
+		let forwarded: boolean | undefined;
+		const task = defineTask({
+			id: "signal-caller",
+			run: async (_payload: undefined, ctx) => {
+				seen = ctx.signal;
+				controller.abort(new Error("caller"));
+				forwarded = ctx.signal.aborted;
+				return "ok";
+			},
+		});
+		await runTask(task, undefined, { signal: controller.signal });
+		expect(forwarded).toBe(true);
+		expect(seen?.reason).toMatchObject({ message: "caller" });
+
+		const untouched = new AbortController();
+		const plain = defineTask({ id: "signal-caller-2", run: async () => "ok" });
+		await runTask(plain, undefined, { signal: untouched.signal });
+		expect(untouched.signal.aborted).toBe(false);
+	});
+
+	it("late step completions after a fatal error do not mutate the returned result", async () => {
+		const task = defineTask({
+			id: "fatal-late",
+			run: async (_payload: undefined, ctx) => {
+				void ctx.step.run("slow", async () => {
+					await new Promise(resolve => setTimeout(resolve, 20));
+					return 1;
+				});
+				void ctx.step.trigger("slow-child", echoChild, { n: 1 });
+				await ctx.step.run("bad:name", async () => 1);
+				return "unreachable";
+			},
+		});
+		const result = await runTask(task, undefined, {
+			children: {
+				"iso-child": async payload => {
+					await new Promise(resolve => setTimeout(resolve, 20));
+					return payload;
+				},
+			},
+		});
+		expect(result.error).toMatchObject({ name: "ConfigError", retryable: false });
+		const stepsBefore = [...result.steps];
+		const triggeredBefore = [...result.triggered];
+		await new Promise(resolve => setTimeout(resolve, 60));
+		expect(result.steps).toEqual(stepsBefore);
+		expect(result.triggered).toEqual(triggeredBefore);
+		expect(result.steps).toEqual([]);
+	});
+});

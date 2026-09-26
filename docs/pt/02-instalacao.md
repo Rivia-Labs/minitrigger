@@ -69,14 +69,15 @@ autenticação do GitHub — baixe o tarball com o GitHub CLI (logado com acesso
 partir do disco:
 
 ```bash
-gh release download v0.2.0 -R igorabreu29/minitrigger -p "*.tgz"
-pnpm add ./minitrigger-0.2.0.tgz bullmq ioredis pg
+gh release download v0.3.0 -R igorabreu29/minitrigger -p "*.tgz"
+pnpm add ./rivia-labs-minitrigger-0.3.0.tgz bullmq ioredis pg
 pnpm add -D @types/pg
 ```
 
-(o tarball da `v0.2.0` se chama `minitrigger-0.2.0.tgz` — sem escopo, ver nota abaixo; a partir da
-`v0.3.0` é `rivia-labs-minitrigger-<versão>.tgz`, e o comando de instalação usa
-`@rivia-labs/minitrigger` como na seção "Recomendada: registry npm" acima.)
+(a partir da `v0.3.0`, o tarball se chama `rivia-labs-minitrigger-<versão>.tgz` e seu
+`package.json` diz `@rivia-labs/minitrigger`, igual à seção "Recomendada: registry npm" acima. Só a
+tag antiga `v0.2.0` — mantida por referência, não recomendada para instalações novas — usava o nome
+sem escopo `minitrigger-0.2.0.tgz`/`minitrigger`, ver nota abaixo.)
 
 O tarball já contém o `dist/` buildado — nada é compilado na instalação: sem precisar do
 `allowBuilds` do pnpm, e sem puxar transitivamente `ioredis`/`msgpackr-extract` só para rodar um
@@ -85,10 +86,10 @@ que o `HEAD` contenha agora". O `files` do `package.json` também inclui o plugi
 deste pacote (`.claude-plugin`, `skills`, `docs/pt`) — nada disso é importado pela biblioteca em
 si, é só conteúdo extra para quem instala dentro de um projeto Claude Code.
 
-> Releases até `v0.2.0` (inclusive) foram publicadas sob o nome sem escopo `minitrigger` (o
-> tarball e seu `package.json` dizem `minitrigger`, não `@rivia-labs/minitrigger`) — isso só
-> importa se você fixar em uma dessas tags antigas; a partir de `v0.3.0`, tudo (npm, tarball de
-> release, fallback de instalação via GitHub) usa `@rivia-labs/minitrigger`.
+> Só `v0.2.0` e tags anteriores foram publicadas sob o nome sem escopo `minitrigger` (o tarball e
+> seu `package.json` dizem `minitrigger`, não `@rivia-labs/minitrigger`) — é a API antiga, e isso só
+> importa se você fixar deliberadamente numa dessas tags antigas; `v0.3.0` em diante é a atual, e
+> tudo (npm, tarball de release, fallback de instalação via GitHub) usa `@rivia-labs/minitrigger`.
 
 ### Fallback: instalar direto do GitHub
 
@@ -97,7 +98,7 @@ enquanto/se o repositório for privado; um repositório público não precisa de
 isso.
 
 ```bash
-pnpm add github:igorabreu29/minitrigger#v0.2.0 bullmq ioredis pg
+pnpm add github:igorabreu29/minitrigger#v0.3.0 bullmq ioredis pg
 ```
 
 O `dist/` está no `.gitignore` e só é produzido pelo script `prepare` do próprio minitrigger, e o
@@ -108,8 +109,8 @@ add github:...` falha com `ERR_PNPM_GIT_DEP_PREPARE_NOT_ALLOWED` até você habi
 ```yaml
 # pnpm-workspace.yaml do seu projeto
 allowBuilds:
-  minitrigger@github.com/igorabreu29/minitrigger#<commit-resolvido>: true # tags até v0.2.0
-  # "@rivia-labs/minitrigger@github.com/igorabreu29/minitrigger#<commit-resolvido>": true  # v0.3.0+
+  "@rivia-labs/minitrigger@github.com/igorabreu29/minitrigger#<commit-resolvido>": true # v0.3.0+
+  # minitrigger@github.com/igorabreu29/minitrigger#<commit-resolvido>: true # só para tags até v0.2.0
   msgpackr-extract: true # acelerador nativo opcional do ioredis; bloqueado pelo mesmo mecanismo
 ```
 

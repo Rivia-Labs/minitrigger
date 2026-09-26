@@ -21,17 +21,24 @@ conexão compartilhada funcionar não é suficiente: uma conexão NOVA (o subscr
 ficar pronta (Redis recusando conexões novas por `maxclients`, ou caindo bem depois daquele
 primeiro `PING`), o que sem esse limite travaria `start()` para sempre (o subscriber tem
 `maxRetriesPerRequest: null`, que tenta de novo indefinidamente). Passados os 5 s, `start()`
-rejeita com `ConfigError` nomeando a causa provável (checar `maxclients`/`CLIENT LIST` ou a rede)
-em vez de travar; corrija e chame `start()` de novo.
+rejeita com `MinitriggerError` (não `ConfigError`: é infraestrutura transitória, não erro de
+configuração — quem trata `ConfigError` como fatal ainda deve tentar `start()` de novo) nomeando a
+causa provável (checar `maxclients`/`CLIENT LIST` ou a rede) em vez de travar; corrija e chame
+`start()` de novo.
 
 ## Dimensionamento do pool
 
 O pool precisa de `max >= concorrência total dos workers + 5` (as próprias queries de bookkeeping
-do engine precisam de folga além do que seus workers consomem). Além do pool, todo engine
-**iniciado** segura **duas** conexões dedicadas fora dele (eleição de líder e o `LISTEN` do
-outbox), então dimensione `max_connections` para `processos × (pool.max + 2)`. Um pool que o engine
-cria já recebe esse tamanho por padrão (no mínimo 10) e um `connectionTimeoutMillis` de 10 s
-(`pool.connectionTimeoutMs`).
+do engine precisam de folga além do que seus workers consomem; essa folga fixa de `+5` não vem de
+`systemConcurrency` — a conta é só `max(10, soma da concorrência das filas de task + 5)`, nunca
+soma a concorrência do worker `-system`, mesmo os dois tendo o mesmo valor padrão). Além do pool,
+todo engine **iniciado** segura **até duas** conexões dedicadas fora dele (eleição de líder e o
+`LISTEN` do outbox) — menos enquanto uma delas ainda está conectando ou em backoff depois de cair,
+e momentaneamente menos se uma delas falha ao (re)conectar —, então dimensione `max_connections`
+para `processos × (pool.max + 2)`. Um pool que o engine cria já recebe esse tamanho por padrão (no
+mínimo 10) e um `connectionTimeoutMillis` de 10 s (`pool.connectionTimeoutMs`). Se você aumentar
+`systemConcurrency` bem além do padrão, dimensione o `pool.max` por conta própria — o aviso do
+`start()` não considera isso.
 
 Se você injeta seu próprio `pg.Pool`, dimensione-o da mesma forma e configure um
 `connectionTimeoutMillis`: `start()` avisa quando ele é menor do que as filas iniciadas precisam ou
@@ -216,15 +223,21 @@ reenfileira toda run a partir de Postgres dentro de aproximadamente
   `runTask` (testa a lógica de uma task isoladamente, sem engine/store/fila) — veja
   [10. Testes](10-testes.md).
 - **Leituras continuam funcionando durante o `stop()`, escritas não.** Enquanto `stop()` está
-  drenando (workers fechando, runs ativas terminando, conexões sendo liberadas), chamadas de
-  leitura — `runs.get`/`list`/`logs`/`steps`, `runs.cancel`, `tokens.complete`, `queues.list`,
-  `schedules.list` — continuam funcionando até `stop()` terminar de fechar tudo (seu último passo,
-  antes de fechar um pool criado pelo engine); só depois disso lançam `"this engine was stopped;
-  create a new one"`. Chamadas que iniciam trabalho novo — `trigger`, `runs.replay`/`subscribe`/
-  `readStream`/`cancelMany`/`retryFailed`, `queues.pause`/`resume`/`scale`, `schedules.upsert`/
-  `delete` — lançam esse mesmo erro assim que `stop()` **começa**, não quando termina, já que
-  começar trabalho novo enquanto o engine está saindo lutaria contra o shutdown. Um `TestEngine`
-  nunca lança isso por conta própria (não tem `stop()`).
+  drenando (workers fechando, runs ativas terminando, conexões sendo liberadas), leituras mais as
+  poucas chamadas que um dreno gracioso ainda precisa para terminar direito — `runs.get`/`list`/
+  `logs`/`steps`, `runs.cancel`, `tokens.complete`, `queues.list`, `schedules.list` — continuam
+  funcionando até `stop()` terminar de fechar tudo (seu último passo, antes de fechar um pool
+  criado pelo engine); só depois disso lançam `"this engine was stopped; create a new one"`.
+  Chamadas que iniciam trabalho novo — `trigger`, `runs.replay`/`subscribe`/`readStream`/
+  `cancelMany`/`retryFailed`, `queues.pause`/`resume`/`scale`, `schedules.upsert`/`delete` — lançam
+  esse mesmo erro assim que `stop()` **começa**, não quando termina, já que começar trabalho novo
+  enquanto o engine está saindo lutaria contra o shutdown. O `TestEngine` **tem** um `stop()`
+  (`await testEngine.stop()`) e aplica essa mesma divisão "começa vs. termina" para as chamadas de
+  escrita acima (`trigger`, `cancelMany`, `retryFailed`, `queues.pause`/`resume`/`scale`,
+  `schedules.upsert`/`delete` lançam logo depois de `stop()` ser chamado) — só nunca aplica a
+  segunda metade da divisão, a de "totalmente fechado", ao grupo de leitura-mais-dreno acima, que
+  por isso continua funcionando pelo resto da vida do objeto, mesmo bem depois do `stop()` já ter
+  resolvido.
 
 ## Upgrade 0.1.x/anterior para 0.2.0
 

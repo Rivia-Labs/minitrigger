@@ -18,7 +18,7 @@ defineTask({
 | `concurrency` | `number` | Quantas runs dessa fila rodam ao mesmo tempo, por processo. |
 | `globalConcurrency` | `number` | Limite de concorrência global (entre processos), aplicado pelo BullMQ. |
 | `rateLimit` | `{ max, durationMs }` | Limite de taxa da fila (no máximo `max` jobs iniciados a cada `durationMs`). |
-| `concurrencyKey` | `{ limit }` | Ver [Chaves de concorrência](#chaves-de-concorrência) abaixo. |
+| `concurrencyKey` | `{ limit }` | Ver [Chaves de concorrência](#chaves-de-concorrência-concurrencykey) abaixo. |
 
 Configurações de fila são compartilhadas por **nome**: várias tasks podem referenciar a mesma fila,
 mas só uma delas pode declarar `concurrency`/`globalConcurrency`/`rateLimit`/`concurrencyKey` para

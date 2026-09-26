@@ -8,7 +8,7 @@
 
 import { randomUUID } from "node:crypto";
 import type { Redis } from "ioredis";
-import { Pool } from "pg";
+import { type ClientConfig, Pool } from "pg";
 import {
 	assertTimerMs,
 	assertTtlWithinRetention,
@@ -684,8 +684,11 @@ export interface EngineCore {
 	currentPubSub(): PubSub | undefined;
 	/** Forgets the subscriber side (a failed start() closes it); returns it, if any. */
 	discardPubSub(): PubSub | undefined;
-	/** Ends every open `runs.subscribe` iteration. */
-	endSubscriptions(): void;
+	/**
+	 * Ends every open `runs.subscribe` iteration: quietly (`stop()`), or, given `error`, by making
+	 * each iteration throw it (its subscriber was discarded, so it ended without a terminal status).
+	 */
+	endSubscriptions(error?: Error): void;
 	/** Bounded wait for the best-effort publishes still in flight. */
 	drainNotifications(timeoutMs: number): Promise<void>;
 }
@@ -852,8 +855,11 @@ export function createEngineCore(
 		pubsub ??= backend.createPubSub();
 		return pubsub;
 	}
-	/** Ends every open `runs.subscribe` iteration (on `stop()`). */
-	const openSubscriptions = new Set<() => void>();
+	/**
+	 * Ends every open `runs.subscribe` iteration: quietly on `stop()`, or with the given error
+	 * (thrown by the iteration) when its subscriber was discarded by a failed start().
+	 */
+	const openSubscriptions = new Set<(error?: Error) => void>();
 
 	type CreateRunOptions = {
 		delayMs: number;
@@ -1363,14 +1369,23 @@ export function createEngineCore(
 		const pending: RunStatusMessage[] = [];
 		let wake: (() => void) | undefined;
 		let ended = false;
+		/** Review 4 item 5: why the iteration was ended from outside, when not quietly. */
+		let endError: Error | undefined;
 		const notify = () => {
 			const resolve = wake;
 			wake = undefined;
 			resolve?.();
 		};
-		const end = () => {
+		const endWith = (error?: Error) => {
+			if (!ended) endError = error;
 			ended = true;
 			notify();
+		};
+		// The abort listener receives the Event: never pass it through as an error.
+		const end = () => endWith();
+		/** An ended iteration returns quietly, or throws the error it was ended with. */
+		const finish = (): void => {
+			if (endError) throw endError;
 		};
 		const ps = getPubSub();
 		// (1) Before the read, so nothing published after it can be missed.
@@ -1379,13 +1394,14 @@ export function createEngineCore(
 			notify();
 		});
 		signal?.addEventListener("abort", end, { once: true });
-		openSubscriptions.add(end);
+		openSubscriptions.add(endWith);
 		try {
 			await ps.ready;
-			if (ended) return;
+			if (ended) return finish();
 			// (2) Postgres is the source of truth for the starting point.
 			const row = await store.runs.get(runId);
-			if (!row || ended) return;
+			if (ended) return finish();
+			if (!row) return;
 			let last: RunStatusUpdate = {
 				runId,
 				status: row.status,
@@ -1429,7 +1445,8 @@ export function createEngineCore(
 						resolve(false);
 					};
 				});
-				if (!timedOut || ended) continue;
+				if (ended) break;
+				if (!timedOut) continue;
 				wake = undefined;
 				// Safety net: pub/sub may drop messages (e.g. on a reconnect).
 				const current = await store.runs.get(runId);
@@ -1449,10 +1466,11 @@ export function createEngineCore(
 					});
 				}
 			}
+			finish();
 		} finally {
 			unsubscribe();
 			signal?.removeEventListener("abort", end);
-			openSubscriptions.delete(end);
+			openSubscriptions.delete(endWith);
 		}
 	}
 
@@ -1505,8 +1523,8 @@ export function createEngineCore(
 			pubsub = undefined;
 			return current;
 		},
-		endSubscriptions() {
-			for (const end of Array.from(openSubscriptions)) end();
+		endSubscriptions(error?: Error) {
+			for (const end of Array.from(openSubscriptions)) end(error);
 		},
 		drainNotifications,
 	};
@@ -1831,6 +1849,7 @@ export function createEngine(config: EngineConfig): Engine {
 			// `checkEnvironment` itself calls `logger.warn` per warning; nothing else to do with the
 			// returned report here.
 			await assertRedisReachable(connections.shared());
+			assertStartNotAbandoned();
 			await checkEnvironment({
 				pool,
 				redis: connections.shared(),
@@ -1838,7 +1857,9 @@ export function createEngine(config: EngineConfig): Engine {
 				logger,
 				autoMigrate: false,
 			});
+			assertStartNotAbandoned();
 			await claimPrefix();
+			assertStartNotAbandoned();
 			warnPoolSizing(options.queues);
 			warnOutboxConfig();
 
@@ -1854,11 +1875,13 @@ export function createEngine(config: EngineConfig): Engine {
 				maxPayloadBytes: resolved.limits.maxPayloadBytes,
 				pruneDeclarative: resolved.schedules.pruneDeclarative,
 			});
+			assertStartNotAbandoned();
 
 			// Decision 27: a queue paused in Postgres is paused in BullMQ BEFORE any worker fetches
 			// (Redis lost the flag on a FLUSHALL, or a pause's Redis call failed). A failure here
 			// fails start() (retryable): starting workers could run jobs of a paused queue.
 			await core.syncQueueStates();
+			assertStartNotAbandoned();
 
 			// Subscribed before the workers, so a cancel published for a run acquired right away is
 			// not missed. `ready` never rejects.
@@ -1871,21 +1894,23 @@ export function createEngine(config: EngineConfig): Engine {
 				// one may never become ready (Redis maxclients, a drop right after the PING); the
 				// SUBSCRIBE would then wait forever (`maxRetriesPerRequest: null`), and start() with it.
 				if (!(await withTimeout(ps.ready, SUBSCRIBE_READY_TIMEOUT_MS))) {
-					throw new ConfigError(
+					// Review 4 item 2: transient infrastructure, not a configuration mistake: a
+					// `MinitriggerError` (not `ConfigError`), so callers that treat `ConfigError` as
+					// fatal still retry start().
+					throw new MinitriggerError(
 						`the Redis pub/sub subscriber did not become ready within ${SUBSCRIBE_READY_TIMEOUT_MS} ` +
 							"ms, although PING on the shared connection worked: Redis may refuse new " +
 							"connections (check maxclients / CLIENT LIST) or the network dropped; fix it, " +
 							"then call start() again"
 					);
 				}
-				if (shuttingDown) {
-					throw new MinitriggerError("engine.stop() was called while start() was in progress");
-				}
+				assertStartNotAbandoned();
 			} catch (error) {
 				offCancel?.();
 				offCancel = undefined;
 				// Close what this attempt opened, so a later start() begins from a clean state.
-				if (createdPubSub) await discardPubSub();
+				// Iterations sharing it end quietly when stop() caused this (as stop() ends them).
+				if (createdPubSub) await discardPubSub(!shuttingDown);
 				throw error;
 			}
 
@@ -1938,13 +1963,34 @@ export function createEngine(config: EngineConfig): Engine {
 		return startPromise;
 	}
 
+	/**
+	 * Review 4 item 4: stop() may have begun (and even resolved, giving up on this start() after its
+	 * bounded wait) while a start() step was pending; every later step would then still write to
+	 * Redis/Postgres (prefix claim, declarative schedules, queue states). Checked between steps.
+	 */
+	function assertStartNotAbandoned(): void {
+		if (shuttingDown) {
+			throw new MinitriggerError("engine.stop() was called while start() was in progress");
+		}
+	}
+
 	/** Drops the subscriber created by a failed start() (Review 3 item 1). */
-	async function discardPubSub(): Promise<void> {
+	async function discardPubSub(startFailed: boolean): Promise<void> {
 		const ps = core.discardPubSub();
 		// `runs.subscribe` iterations begun during this attempt took this same pub/sub (every one
 		// begun before it would have created it first, and then it isn't discarded): end them
 		// rather than leave them on a closed subscriber, noticing changes only via the re-read.
-		core.endSubscriptions();
+		// Review 4 item 5: they end with an error, not quietly: without a terminal status the caller
+		// could not tell this apart from a subscription that simply finished.
+		core.endSubscriptions(
+			startFailed
+				? new MinitriggerError(
+						"runs.subscribe() ended before the run reached a terminal status: the Redis pub/sub " +
+							"subscriber it used was discarded because engine.start() failed; subscribe again " +
+							"(after a successful start(), or on an engine that only triggers)"
+					)
+				: undefined
+		);
 		await ps?.close().catch(() => {});
 		subscriberConnection?.disconnect();
 		subscriberConnection = undefined;
@@ -2123,6 +2169,27 @@ export function createEngine(config: EngineConfig): Engine {
 	}
 
 	/**
+	 * Config of the engine's dedicated `pg.Client`s (leader, outbox LISTEN), always with a bounded
+	 * connect (review 3 item 1, review 4 item 3): the engine's `pool.connectionTimeoutMs` for a
+	 * connection string; for an injected pool, its own `connectionTimeoutMillis` when set, else
+	 * that same default (an unbounded connect would let a leader tick or the listener wait forever
+	 * on a Postgres that accepts TCP but never answers; the pool itself is only warned about).
+	 */
+	function dedicatedClientConfig(): ClientConfig {
+		if (typeof resolved.postgres === "string") {
+			return {
+				connectionString: resolved.postgres,
+				connectionTimeoutMillis: resolved.poolConnectionTimeoutMs,
+			};
+		}
+		const options = pool.options as ClientConfig;
+		return {
+			...options,
+			connectionTimeoutMillis: options.connectionTimeoutMillis || resolved.poolConnectionTimeoutMs,
+		};
+	}
+
+	/**
 	 * Decision 26: the LISTEN client is dedicated (LISTEN is session state; never a pooled
 	 * connection, like the leader's, decision 16) and owned by the engine. Not awaited: its first
 	 * connection is best-effort (a failure warns and retries; the poll still dispatches).
@@ -2130,13 +2197,7 @@ export function createEngine(config: EngineConfig): Engine {
 	function startOutboxListener(): void {
 		if (shuttingDown) return;
 		outbox.listener = createOutboxListener({
-			clientConfig:
-				typeof resolved.postgres === "string"
-					? {
-							connectionString: resolved.postgres,
-							connectionTimeoutMillis: resolved.poolConnectionTimeoutMs,
-						}
-					: pool.options,
+			clientConfig: dedicatedClientConfig(),
 			channel: outbox.channel,
 			logger,
 			dispatchBatch: dispatchOutboxBatch,
@@ -2155,13 +2216,7 @@ export function createEngine(config: EngineConfig): Engine {
 		leader = createLeaderElector({
 			// Review 3 item 1: the same bounded connect as the pool, so a leader tick can't wait
 			// forever on a Postgres that accepts TCP but never answers.
-			clientConfig:
-				typeof resolved.postgres === "string"
-					? {
-							connectionString: resolved.postgres,
-							connectionTimeoutMillis: resolved.poolConnectionTimeoutMs,
-						}
-					: pool.options,
+			clientConfig: dedicatedClientConfig(),
 			schema: resolved.schema,
 			logger,
 			onAcquire: () =>
@@ -2437,7 +2492,19 @@ export function createEngine(config: EngineConfig): Engine {
 	}
 
 	return {
-		migrate: () => migrate(pool, resolved.schema),
+		migrate: () => {
+			// Review 4 item 1: `migrate()` starts new work, like `start()`/`trigger()`, so it is
+			// refused from the moment stop() is called (`assertNotStopped`), not only once the pool
+			// is closed (`assertNotClosed`, for the reads a graceful drain still needs): a migration
+			// has no part in draining, and otherwise an engine-owned pool would surface pg's raw
+			// "Cannot use a pool after calling end" once stop() resolved.
+			try {
+				assertNotStopped();
+			} catch (error) {
+				return Promise.reject(error);
+			}
+			return migrate(pool, resolved.schema);
+		},
 		start,
 		stop,
 		trigger: core.trigger,

@@ -7,9 +7,13 @@ Atualizado em 2026-09-25. Leia junto com `CLAUDE.md` (decisões e notas de imple
 - **Fases 1 a 10 concluídas.** `pnpm check:pack` ok (última vez rodado); `examples/basic` roda de ponta a ponta.
 - **Terceira revisão externa (2026-09-25):** aplicada e commitada (ver `CLAUDE.md`, "Terceira
   revisão externa"); testes novos em `test/{unit,integration}/review3-{engine,io}.test.ts`.
+- **Quarta revisão externa (2026-09-25):** aplicada, ainda não commitada nesta sessão (`src/engine.ts`,
+  `src/index.ts`, `src/telemetry.ts`, `src/testing/run-task.ts` + testes novos/ajustados em
+  `test/{unit,integration}/review4-engine.test.ts`, `test/unit/run-task.test.ts`,
+  `test/integration/review3-engine.test.ts`); ver `CLAUDE.md`, "Quarta revisão externa".
 - **Migration 008 (`idx_runs_active_created`):** índice parcial para `runs.cancelMany()`; ver
   `CLAUDE.md`. Migrations 001–008 congeladas depois da publicação da 0.3.0.
-- **Verificação completa:** `pnpm typecheck && pnpm lint && pnpm test` verde — 1399 testes
+- **Verificação completa:** `pnpm typecheck && pnpm lint && pnpm test` verde — 1416 testes
   (unit + integration) + 3 no projeto flushall; `pnpm check:pack` e `pnpm skills:validate` ok.
 
 ### O que existe (resumo)
@@ -17,7 +21,7 @@ Atualizado em 2026-09-25. Leia junto com `CLAUDE.md` (decisões e notas de imple
 | Área                             | Arquivos principais                                                                                                              |
 | -------------------------------- | -------------------------------------------------------------------------------------------------------------------------------- |
 | Base, utilitários                | `src/utils/*`, `src/errors.ts`                                                                                                   |
-| Schema e migrations              | `src/migrations/001_init.sql`, `002_schedules.sql`, `migrate.ts`                                                                 |
+| Schema e migrations              | `src/migrations/001_init.sql` … `008_runs_active_created_idx.sql` (001–008, congeladas depois da publicação da 0.3.0), `migrate.ts` |
 | Store (contrato + SQL + memória) | `src/store/types.ts`, `src/store/sql/*`, `src/store/memory/*`, `docs/store-contract.md`                                          |
 | Tasks e filas                    | `src/task.ts`, `src/registry.ts`, `src/queue/*`                                                                                  |
 | Executor                         | `src/executor/*` (aquisição, heartbeat, steps, suspensão, tokens, subtasks, logs, notificação)                                   |
@@ -50,7 +54,7 @@ Atualizado em 2026-09-25. Leia junto com `CLAUDE.md` (decisões e notas de imple
 - ✅ Task que lança com steps em voo: o executor espera os steps terminarem (sem abortar) antes de gravar falha/retry; o retry reaproveita os que concluíram. Erro fatal não espera.
 - Filtros de data de `runs.list` se chamam `createdFrom`/`createdTo` (nomes mantidos, decisão do dono).
 - ✅ `step.trigger*` aceita task filha não registrada (spec sai do próprio objeto); objeto malformado, fila inválida e payload de filha inválido são fatais.
-- `sideEffects: false` só ajuda bundlers; em Node o `dist/index.js` único é carregado inteiro, incluindo o modo de teste. **Avaliado em 2026-09-25 e mantido:** o código do minitrigger inteiro carrega em ~2,3 ms, contra ~44 ms das peers (bullmq/ioredis/pg). Se um dia for necessário: subpath `minitrigger/testing` com `splitting: true` no tsup (chunk compartilhado para não duplicar as classes de erro e quebrar o `instanceof`), o que é uma mudança incompatível de import.
+- ✅ `sideEffects: false` deixou de ser o desfecho: o modo de teste (`createTestEngine`) foi movido para o subpath `@rivia-labs/minitrigger/testing` (fase 9.2), com `splitting: true` no tsup para as duas entradas compartilharem o chunk das classes de erro (`instanceof ConfigError`/etc. funciona vindo de qualquer uma). Quem nunca importa `/testing` não paga pelo backend em memória no bundle da entrada principal; ver `CLAUDE.md`, "Fase 9.2".
 
 ### Parte 2 (2026-09-25, depois do v0.1.0)
 
@@ -69,9 +73,12 @@ Atualizado em 2026-09-25. Leia junto com `CLAUDE.md` (decisões e notas de imple
 
 ### Próximas ondas (decididas pelo dono em 2026-09-25)
 
-1. ✅ (0.3.0, não publicado no npm ainda) Propostas da comparação com `@rivia-labs/oban-ts`, por valor: outbox transacional (`trigger(..., { tx })`), pacote `@rivia-labs/minitrigger` público (LICENSE MIT, subpath `/testing`, Node >= 22), gestão de filas e operações em lote, helpers de teste, telemetria (`durationMs`, `attachDefaultLogger`), skills de Claude Code e docs em PT.
+1. ✅ **v0.3.0 publicado no npm** como `@rivia-labs/minitrigger` (tag `v0.3.0`, GitHub Release com o `.tgz`; `v0.2.0` e anteriores ficam só como a API antiga, sem escopo). Propostas da comparação com `@rivia-labs/oban-ts`, por valor: outbox transacional (`trigger(..., { tx })`), pacote `@rivia-labs/minitrigger` público (LICENSE MIT, subpath `/testing`, Node >= 22), gestão de filas e operações em lote, helpers de teste, telemetria (`durationMs`, `attachDefaultLogger`), skills de Claude Code e docs em PT.
 2. ✅ Adapters de ORM para o outbox (`/typeorm`, `/knex`, `/drizzle`, `/prisma`), testados contra TypeORM 1.1, Knex 3.3, Drizzle 0.45 (node-postgres e postgres.js) e Prisma 7.10.
-3. **Modo só-Postgres** (`transport: "postgres" | "bullmq"`, BullMQ continua padrão): fazer depois das propostas atuais. Escopo mínimo avaliado: fábricas de backend, fetch+acquire direto em `runs` com `SKIP LOCKED`, LISTEN/NOTIFY + timer + poll, ticks de cron pelo líder, pub/sub por NOTIFY com payload enxuto, `globalConcurrency` em SQL; `rateLimit` e streams com `ConfigError` no MVP. Exige emendas às decisões 1, 8, 14, 15, 16, 21 e 22 (aprovação do dono antes de implementar). Estimativa ~3 semanas; medir paridade com `pnpm bench` antes de pensar em trocar o padrão.
+
+Único item pendente desta lista:
+
+3. **Modo só-Postgres** (`transport: "postgres" | "bullmq"`, BullMQ continua padrão) — aguardando revisão do dono antes de começar. Escopo mínimo avaliado: fábricas de backend, fetch+acquire direto em `runs` com `SKIP LOCKED`, LISTEN/NOTIFY + timer + poll, ticks de cron pelo líder, pub/sub por NOTIFY com payload enxuto, `globalConcurrency` em SQL; `rateLimit` e streams com `ConfigError` no MVP. Exige emendas às decisões 1, 8, 14, 15, 16, 21 e 22 (aprovação do dono antes de implementar). Estimativa ~3 semanas; medir paridade com `pnpm bench` antes de pensar em trocar o padrão.
 
 ### Auditoria externa (2026-09-25)
 

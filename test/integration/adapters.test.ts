@@ -529,3 +529,40 @@ describe("TypeORM: raw dataSource.manager / DataSource as tx", () => {
 		expect(await count()).toBe(0);
 	});
 });
+
+describe("knexTx: a key-renaming postProcessResponse (camelCase)", () => {
+	let camelKnex: Knex;
+	const camel = (key: string) => key.replace(/_([a-z])/g, (_m, c: string) => c.toUpperCase());
+	beforeAll(() => {
+		camelKnex = knexFactory({
+			client: "pg",
+			connection: ns.databaseUrl,
+			pool: { min: 0, max: 2 },
+			// Applied to trx.raw() results too: `task_id` comes back as `taskId`.
+			postProcessResponse: (result: { rows?: Array<Record<string, unknown>> }) => {
+				if (!Array.isArray(result?.rows)) return result;
+				return {
+					...result,
+					rows: result.rows.map(row =>
+						Object.fromEntries(Object.entries(row).map(([k, v]) => [camel(k), v]))
+					),
+				};
+			},
+		});
+	});
+	afterAll(() => camelKnex.destroy());
+
+	it("engine.trigger(..., { tx: knexTx(trx) }) returns the task's id as taskId", async () => {
+		const { task } = recorder();
+		const engine = makeEngine([task]);
+		const handle = await camelKnex.transaction(trx =>
+			engine.trigger(task, { n: 1, tags: [], note: "" }, { tx: knexTx(trx) })
+		);
+		expect(handle.taskId).toBe(task.id);
+		const { rows } = await ns.pool.query<{ task_id: string }>(
+			`SELECT task_id FROM ${t("runs")} WHERE id = $1`,
+			[handle.id]
+		);
+		expect(rows[0]?.task_id).toBe(task.id);
+	});
+});

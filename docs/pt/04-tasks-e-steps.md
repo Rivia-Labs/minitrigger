@@ -53,7 +53,7 @@ type TaskContext = {
 - `ctx.run` — metadados fixos da execução atual (id da run, id da task, número da tentativa, data
   de criação).
 - `ctx.stream(name, source)` e `ctx.progress.set(value)` — ver
-  [09. Observabilidade](09-observabilidade.md#streams) e
+  [09. Observabilidade](09-observabilidade.md#ctxstream--runsreadstream) e
   [09. Observabilidade](09-observabilidade.md#progresso).
 
 ## `StepApi`
