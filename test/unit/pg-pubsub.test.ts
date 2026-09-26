@@ -115,13 +115,75 @@ describe("createNotifyBatcher", () => {
 		expect(query).not.toHaveBeenCalled();
 		batcher.notify("b", "2");
 
-		// maxItems reached: sent right away, without waiting for the (never-fired) window timer.
-		await batcher.flush();
+		// maxItems reached: sent via the microtask queue, without ever calling flush() and without
+		// ever firing the window timer (`clock.fire()` is never called in this test) -- proves the
+		// send is truly immediate, not incidentally caused by the assertion's own flush() call.
+		await Promise.resolve();
+		await Promise.resolve();
+		await Promise.resolve();
+
 		expect(query).toHaveBeenCalledTimes(1);
 		expect(query).toHaveBeenCalledWith(expect.stringContaining("pg_notify"), [
 			["a", "b"],
 			["1", "2"],
 		]);
+	});
+
+	it("a slow statement never overlaps with the next, and each one carries at most maxItems rows", async () => {
+		const clock = fakeClock();
+		const calls: Array<{ channels: string[]; payloads: string[] }> = [];
+		let concurrent = 0;
+		let maxConcurrent = 0;
+		let resolveCurrent: (() => void) | undefined;
+		const query = vi.fn(async (_text: string, values?: unknown[]) => {
+			concurrent++;
+			maxConcurrent = Math.max(maxConcurrent, concurrent);
+			const [channels, payloads] = values as [string[], string[]];
+			calls.push({ channels, payloads });
+			await new Promise<void>(resolve => {
+				resolveCurrent = resolve;
+			});
+			concurrent--;
+			return { rows: [], rowCount: 0 };
+		});
+		const batcher = createNotifyBatcher({
+			db: fakeDb(query),
+			logger: quietLogger,
+			maxItems: 3,
+			setTimeoutFn: clock.setTimeoutFn,
+		});
+
+		// 7 unique items, cap 3: three statements (3 + 3 + 1), never more than one in flight.
+		for (let i = 0; i < 7; i++) batcher.notify(`c${i}`, `p${i}`);
+
+		await Promise.resolve();
+		await Promise.resolve();
+		await Promise.resolve();
+		expect(query).toHaveBeenCalledTimes(1);
+		expect(calls[0]?.channels.length).toBeLessThanOrEqual(3);
+
+		resolveCurrent?.();
+		await Promise.resolve();
+		await Promise.resolve();
+		await Promise.resolve();
+		expect(query).toHaveBeenCalledTimes(2);
+		expect(calls[1]?.channels.length).toBeLessThanOrEqual(3);
+
+		resolveCurrent?.();
+		await Promise.resolve();
+		await Promise.resolve();
+		await Promise.resolve();
+		expect(query).toHaveBeenCalledTimes(3);
+		expect(calls[2]?.channels.length).toBeLessThanOrEqual(3);
+
+		resolveCurrent?.();
+		await batcher.flush();
+
+		// No 4th statement: the backlog was fully drained by the third.
+		expect(query).toHaveBeenCalledTimes(3);
+		expect(maxConcurrent).toBe(1);
+		for (const call of calls) expect(call.channels.length).toBeLessThanOrEqual(3);
+		expect(calls.reduce((sum, call) => sum + call.channels.length, 0)).toBe(7);
 	});
 
 	it("never throws when the statement rejects; warns instead", async () => {
@@ -324,8 +386,12 @@ describe("createPgPubSub", () => {
 	});
 
 	it("close() unsubscribes and stops delivering to handlers", async () => {
+		// A real UUID, unlike the earlier "r1" placeholder: with a non-UUID payload the invalid-
+		// payload guard alone would drop it regardless of close(), so that would prove nothing about
+		// close() itself.
+		const R1 = "00000000-0000-4000-8000-000000000001";
 		const { subscribe, emit, isUnsubscribed } = fakeSubscribe();
-		const get = vi.fn(async () => fakeRun());
+		const get = vi.fn(async () => fakeRun({ id: R1 }));
 		const pubsub = createPgPubSub({
 			publisher: noopPublisher(),
 			store: { runs: { get } as never },
@@ -336,14 +402,183 @@ describe("createPgPubSub", () => {
 		});
 
 		const received: unknown[] = [];
-		pubsub.subscribeStatus("r1", message => received.push(message));
+		pubsub.subscribeStatus(R1, message => received.push(message));
 
 		await pubsub.close();
 		expect(isUnsubscribed()).toBe(true);
 
-		emit("mt_status_s_s", "r1");
+		emit("mt_status_s_s", R1);
 		await Promise.resolve();
 		await Promise.resolve();
 		expect(received).toEqual([]);
+		expect(get).not.toHaveBeenCalled();
+	});
+
+	it("dedupes cancel ids repeated within the same batch before filtering/reading", async () => {
+		const R1 = "00000000-0000-4000-8000-000000000001";
+		const get = vi.fn(async () => fakeRun({ id: R1, status: "canceled" }));
+		const { subscribe, emit } = fakeSubscribe();
+		const pubsub = createPgPubSub({
+			publisher: noopPublisher(),
+			store: { runs: { get } as never },
+			schema: "s",
+			isActiveLocally: () => true,
+			subscribe,
+			logger: quietLogger,
+		});
+
+		const received: string[][] = [];
+		pubsub.onCancel(runIds => received.push(runIds));
+
+		emit("mt_cancel_s_s", R1);
+		emit("mt_cancel_s_s", R1);
+		emit("mt_cancel_s_s", R1);
+		await Promise.resolve();
+		await Promise.resolve();
+		await Promise.resolve();
+
+		expect(get).toHaveBeenCalledTimes(1);
+		expect(received).toEqual([[R1]]);
+	});
+
+	it("a status read failure warns without throwing; the pub/sub keeps working afterward", async () => {
+		const R1 = "00000000-0000-4000-8000-000000000001";
+		const { logger, messages } = warnCollector();
+		const get = vi.fn(async (): Promise<RunRecord | null> => {
+			throw new Error("connection reset");
+		});
+		const { subscribe, emit } = fakeSubscribe();
+		const pubsub = createPgPubSub({
+			publisher: noopPublisher(),
+			store: { runs: { get } as never },
+			schema: "s",
+			isActiveLocally: () => false,
+			subscribe,
+			logger,
+		});
+
+		const received: unknown[] = [];
+		pubsub.subscribeStatus(R1, message => received.push(message));
+
+		emit("mt_status_s_s", R1);
+		await Promise.resolve();
+		await Promise.resolve();
+
+		expect(received).toEqual([]);
+		expect(messages.some(m => /failed to re-read run/i.test(m.message))).toBe(true);
+
+		// The pub/sub isn't wedged: a later, successful read still reaches the handler.
+		get.mockResolvedValueOnce(fakeRun({ id: R1, status: "completed" }));
+		emit("mt_status_s_s", R1);
+		await Promise.resolve();
+		await Promise.resolve();
+		expect(received).toHaveLength(1);
+	});
+
+	it("a cancel read failure warns without throwing; the rest of the batch still works", async () => {
+		const R1 = "00000000-0000-4000-8000-000000000001";
+		const R2 = "00000000-0000-4000-8000-000000000002";
+		const { logger, messages } = warnCollector();
+		const get = vi.fn(async (runId: string) => {
+			if (runId === R1) throw new Error("connection reset");
+			return fakeRun({ id: R2, status: "canceled" });
+		});
+		const { subscribe, emit } = fakeSubscribe();
+		const pubsub = createPgPubSub({
+			publisher: noopPublisher(),
+			store: { runs: { get } as never },
+			schema: "s",
+			isActiveLocally: runId => runId === R1 || runId === R2,
+			subscribe,
+			logger,
+		});
+
+		const received: string[][] = [];
+		pubsub.onCancel(runIds => received.push(runIds));
+
+		// A read failure for R1 is warned and skipped; R2 (canceled) still reaches handlers.
+		emit("mt_cancel_s_s", R1);
+		emit("mt_cancel_s_s", R2);
+		await Promise.resolve();
+		await Promise.resolve();
+		await Promise.resolve();
+
+		expect(received).toEqual([[R2]]);
+		expect(messages.some(m => /failed to re-read run/i.test(m.message))).toBe(true);
+	});
+
+	it("isActiveLocally throwing during cancel filtering warns and safely drops the whole batch", async () => {
+		const R1 = "00000000-0000-4000-8000-000000000001";
+		const R2 = "00000000-0000-4000-8000-000000000002";
+		const { logger, messages } = warnCollector();
+		const get = vi.fn(async (runId: string) => fakeRun({ id: runId, status: "canceled" }));
+		const { subscribe, emit } = fakeSubscribe();
+		const pubsub = createPgPubSub({
+			publisher: noopPublisher(),
+			store: { runs: { get } as never },
+			schema: "s",
+			isActiveLocally: () => {
+				throw new Error("isActiveLocally boom");
+			},
+			subscribe,
+			logger,
+		});
+
+		const received: string[][] = [];
+		pubsub.onCancel(runIds => received.push(runIds));
+
+		// A throwing isActiveLocally must never become an unhandled rejection (vitest would
+		// surface one and fail this test); the whole batch is safely dropped instead.
+		emit("mt_cancel_s_s", R1);
+		emit("mt_cancel_s_s", R2);
+		await Promise.resolve();
+		await Promise.resolve();
+		await Promise.resolve();
+
+		expect(received).toEqual([]);
+		expect(get).not.toHaveBeenCalled();
+		expect(messages.some(m => /isActiveLocally/i.test(m.message))).toBe(true);
+	});
+
+	it("safeCall warns instead of throwing when a handler rejects or throws synchronously", async () => {
+		const R1 = "00000000-0000-4000-8000-000000000001";
+		const { logger, messages } = warnCollector();
+		const get = vi.fn(async () => fakeRun({ id: R1, status: "completed" }));
+		const { subscribe, emit } = fakeSubscribe();
+		const pubsub = createPgPubSub({
+			publisher: noopPublisher(),
+			store: { runs: { get } as never },
+			schema: "s",
+			isActiveLocally: () => false,
+			subscribe,
+			logger,
+		});
+
+		const calls: unknown[] = [];
+		// Typed `=> void`, but nothing stops a real caller from returning a rejecting promise or
+		// throwing synchronously; both must be swallowed, never an unhandledRejection (vitest would
+		// surface one and fail this test) or a thrown error that skips the other handlers.
+		pubsub.subscribeStatus(R1, () => {
+			calls.push("throws");
+			throw new Error("handler boom");
+		});
+		pubsub.subscribeStatus(R1, () => Promise.reject(new Error("handler rejected")));
+		pubsub.subscribeStatus(R1, message => {
+			calls.push(message);
+		});
+
+		emit("mt_status_s_s", R1);
+		await Promise.resolve();
+		await Promise.resolve();
+		await Promise.resolve();
+		await Promise.resolve();
+
+		// The other two handlers still ran despite the throwing/rejecting one; at least one of the
+		// two misbehaviors was reported (the two warns are throttled together, so only one is
+		// guaranteed to survive -- the safety property under test is "never thrown, never
+		// unhandled", not "every distinct warning surfaces").
+		expect(calls).toEqual(["throws", expect.objectContaining({ runId: R1 })]);
+		expect(messages.length).toBeGreaterThan(0);
+		expect(messages.some(m => /handler (threw|rejected)/i.test(m.message))).toBe(true);
 	});
 });

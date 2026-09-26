@@ -50,12 +50,12 @@ function isUuid(value: string): boolean {
 	return UUID_PATTERN.test(value);
 }
 
-function safeCall(fn: () => void): void {
-	try {
-		fn();
-	} catch {
-		// A handler registered by the caller must never break delivery to the others.
-	}
+function isThenable(value: unknown): value is PromiseLike<unknown> {
+	return (
+		typeof value === "object" &&
+		value !== null &&
+		typeof (value as { then?: unknown }).then === "function"
+	);
 }
 
 /**
@@ -123,6 +123,25 @@ export function createPgPubSub(options: CreatePgPubSubOptions): PubSub {
 		}
 	}
 
+	/**
+	 * Calls a caller-registered handler, swallowing both a synchronous throw and (since a handler
+	 * is typed `=> void` but nothing stops a caller from actually returning a promise) a returned
+	 * rejected promise -- either way, warned (throttled), never an unhandled rejection or a thrown
+	 * error breaking delivery to the other handlers.
+	 */
+	function safeCall(fn: () => unknown): void {
+		try {
+			const result = fn();
+			if (isThenable(result)) {
+				result.then(undefined, (error: unknown) => {
+					warn("a pub/sub handler rejected; ignoring", { error });
+				});
+			}
+		} catch (error) {
+			warn("a pub/sub handler threw; ignoring", { error });
+		}
+	}
+
 	function handleStatus(runId: string): void {
 		const handlers = statusHandlers.get(runId);
 		if (!handlers || handlers.size === 0) return; // No handler: skip the read entirely.
@@ -159,13 +178,32 @@ export function createPgPubSub(options: CreatePgPubSubOptions): PubSub {
 		queueMicrotask(() => {
 			const ids = pendingCancelIds ?? [];
 			pendingCancelIds = undefined;
-			void flushCancel(ids);
+			// Defense in depth: `flushCancel` already catches every error it can produce internally
+			// (a throwing `isActiveLocally`, a rejecting `store.runs.get`), so this `.catch` should
+			// never actually fire -- but a `void` call on an async function must never risk an
+			// unhandledRejection if some future change (or a testing double) breaks that invariant.
+			flushCancel(ids).catch((error: unknown) => {
+				warn("cancel notification batch failed unexpectedly; ignoring", { error });
+			});
 		});
 	}
 
 	async function flushCancel(ids: readonly string[]): Promise<void> {
 		if (cancelHandlers.size === 0) return;
-		const localIds = ids.filter(id => isActiveLocally(id));
+		const uniqueIds = [...new Set(ids)];
+		let localIds: string[];
+		try {
+			// `isActiveLocally` is caller-supplied: a throw here must never become an
+			// unhandledRejection (§5/review focus 6's guard is worthless if the guard itself can
+			// crash the process). Dropping the whole batch is safe -- the poll/reconciler fallback
+			// (and, for a genuinely canceled run, a later NOTIFY/retry) still catches up.
+			localIds = uniqueIds.filter(id => isActiveLocally(id));
+		} catch (error) {
+			warn("isActiveLocally threw while filtering a cancel notification; dropping the batch", {
+				error,
+			});
+			return;
+		}
 		if (localIds.length === 0) return; // Not run by this process: never even read.
 		const canceled: string[] = [];
 		for (const runId of localIds) {
