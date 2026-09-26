@@ -108,6 +108,10 @@ settings:
 importers:
 
   .:
+    dependencies:
+      cron-parser:
+        specifier: ^5.10.1
+        version: 5.10.1
     devDependencies:
       '@biomejs/biome':
         specifier: 2.5.14

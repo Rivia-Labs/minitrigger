@@ -252,6 +252,16 @@ describe("createSchedulesApi: validation", () => {
 		).rejects.toThrow(ConfigError);
 	});
 
+	// Task 6: `validateCronPattern` now delegates to `cron-parser` (real validation, same library
+	// BullMQ uses) instead of a hand-rolled regex that only checked field count/shape -- a
+	// syntactically well-formed-looking but semantically invalid field value (minute 99, out of
+	// 0-59) used to pass the old regex and only fail later, opaquely, at `upsertJobScheduler`.
+	it("rejects a cron pattern with an out-of-range field value", async () => {
+		await expect(
+			api().upsert({ id: "ok", task: echoTask, cron: "99 * * * *", payload: { v: 1 } })
+		).rejects.toThrow(ConfigError);
+	});
+
 	it("accepts a 6-field cron pattern (seconds)", async () => {
 		const { transport, upsertCalls } = fakeTransport();
 		const { store } = fakeStore();

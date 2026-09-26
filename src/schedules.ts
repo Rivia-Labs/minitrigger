@@ -26,6 +26,7 @@ import { escapeIdentifier, type Pool } from "pg";
 import type { EngineLogger } from "./config.js";
 import { ConfigError } from "./errors.js";
 import { childTaskSpec, enqueue, type RunNotifier, taskQueueName } from "./executor/index.js";
+import { nextOccurrence } from "./pg/schedulers.js";
 import type { JobSchedulerInfo, Transport } from "./queue/transport.js";
 import { getTask, type Registry } from "./registry.js";
 import type { Json, ScheduleRecord, ScheduleSource, Store } from "./store/types.js";
@@ -56,29 +57,23 @@ function validateScheduleId(id: unknown): string {
 }
 
 /**
- * `cron-parser` (via BullMQ's `upsertJobScheduler`) is the actual authority on cron syntax --
- * minitrigger does not depend on it directly (it is a transitive dependency of `bullmq`, not
- * resolvable as a direct import under pnpm's strict `node_modules`, and adding it as a second,
- * separately-versioned cron parser would risk disagreeing with BullMQ's own). This only rejects
- * the obviously malformed (wrong shape, illegal characters) before touching Postgres or Redis, so
- * `schedules.upsert()`/`defineTask({ schedule })` sync fail fast and locally for a typo'd pattern;
- * a pattern that passes this but is still invalid cron surfaces as a `upsertJobScheduler` rejection
- * (logged, decision 8: Postgres already has the row, the reconciler keeps retrying the BullMQ side).
+ * `cron-parser` (Task 6: now a direct dependency, `^5.10.1` -- the same version BullMQ 6.3.8
+ * already resolves transitively, `pnpm ls cron-parser` shows one copy) is the actual authority on
+ * cron syntax in BOTH transports now: this calls {@link nextOccurrence} purely to validate `cron`
+ * against `new Date()` (`tz` deliberately left `undefined` here -- timezone is validated
+ * separately by {@link validateTimezone}, via `Intl`, before this ever runs; combining the two
+ * isn't needed just to reject a syntactically malformed pattern). The result is discarded. A
+ * pattern the old hand-rolled regex let through but `cron-parser` rejects (e.g. a 7-field pattern
+ * -- cron-parser only recognizes 5 or 6 fields, an optional leading seconds field) now fails right
+ * here, before touching Postgres or Redis, instead of surfacing later as an opaque
+ * `upsertJobScheduler`/Postgres-transport rejection.
  */
-const CRON_FIELD_PATTERN = /^[\d*/,\-A-Za-z?LW#]+$/;
-
 function validateCronPattern(cron: unknown): string {
 	if (typeof cron !== "string") {
 		throw new ConfigError(`schedule cron must be a string, got ${JSON.stringify(cron)}`);
 	}
 	const trimmed = cron.trim();
-	const fields = trimmed.length === 0 ? [] : trimmed.split(/\s+/);
-	if (fields.length < 5 || fields.length > 7 || !fields.every(f => CRON_FIELD_PATTERN.test(f))) {
-		throw new ConfigError(
-			`schedule cron "${cron}" does not look like a valid cron pattern ` +
-				"(expected 5-7 whitespace-separated fields)"
-		);
-	}
+	nextOccurrence(trimmed, undefined, new Date());
 	return trimmed;
 }
 
