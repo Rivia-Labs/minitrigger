@@ -485,4 +485,108 @@ export function defineDebounceConcurrencyContractSuite(get: () => StoreHarness):
 			expect(rb2.enqueue.delayMs).toBeLessThanOrEqual(1_250);
 		});
 	});
+
+	describe("contract: recheckConcurrencyLimit (decision 25 after a Postgres-transport claim)", () => {
+		async function created(overrides: Partial<NewRun> = {}) {
+			const res = await s().runs.create(newRun(overrides));
+			if (res.kind !== "created") throw new Error("expected created");
+			return res.run;
+		}
+
+		/**
+		 * What `claim.claimRuns` writes for a keyed run, portably: `running` + a new execution id,
+		 * leaving `enqueue_seq`, `concurrency_waits` and (keyed) `started_at` untouched.
+		 */
+		async function claim(runId: string): Promise<string> {
+			const executionId = randomUUID();
+			await get().patchRun(runId, { status: "running", executionId });
+			return executionId;
+		}
+
+		it("limit reached -> limited: back to queued, no owner, run_after = now + 1 s backoff", async () => {
+			const a = await created({ concurrencyKey: "r1" });
+			const b = await created({ concurrencyKey: "r1" });
+			const ea = await claim(a.id);
+			const eb = await claim(b.id);
+			expect((await s().runs.recheckConcurrencyLimit(a.id, ea, { limit: 1 })).kind).toBe("limited");
+			// a (limited) left the slot: b now fits, and a's own row does not count against b.
+			const rb = await s().runs.recheckConcurrencyLimit(b.id, eb, { limit: 1 });
+			expect(rb.kind).toBe("ok");
+			const after = await s().runs.get(a.id);
+			expect(after?.status).toBe("queued");
+			expect(after?.executionId).toBeNull();
+			expect(after?.attempt).toBe(1);
+			expect(after?.enqueueSeq).toBe(a.enqueueSeq);
+			expect(after?.startedAt).toBeNull();
+			const due = await dueIn(a.id);
+			expect(due).toBeGreaterThan(1_000 - SLACK_MS);
+			expect(due).toBeLessThanOrEqual(1_250);
+		});
+
+		it("the claim never resets concurrency_waits: the backoff keeps growing (review focus 7)", async () => {
+			const holder = await created({ concurrencyKey: "r2" });
+			const eh = await claim(holder.id);
+			expect((await s().runs.recheckConcurrencyLimit(holder.id, eh, { limit: 1 })).kind).toBe("ok");
+			const b = await created({ concurrencyKey: "r2" });
+			const delays: number[] = [];
+			for (let i = 0; i < 3; i++) {
+				const eb = await claim(b.id);
+				const r = await s().runs.recheckConcurrencyLimit(b.id, eb, { limit: 1 });
+				if (r.kind !== "limited") throw new Error(`expected limited, got ${r.kind}`);
+				delays.push(await dueIn(b.id));
+			}
+			expect(delays[0]).toBeLessThanOrEqual(1_250);
+			expect(delays[1]).toBeGreaterThan(2_000 - SLACK_MS);
+			expect(delays[1]).toBeLessThanOrEqual(2_250);
+			expect(delays[2]).toBeGreaterThan(4_000 - SLACK_MS);
+			expect(delays[2]).toBeLessThanOrEqual(4_250);
+		});
+
+		it("under the limit -> ok: started_at set, concurrency_waits reset", async () => {
+			const a = await created({ concurrencyKey: "r3" });
+			const b = await created({ concurrencyKey: "r3" });
+			const eb = await claim(b.id);
+			expect((await s().runs.recheckConcurrencyLimit(b.id, eb, { limit: 1 })).kind).toBe("ok");
+			// a is limited once (waits = 1) while b holds the only slot.
+			const ea = await claim(a.id);
+			expect((await s().runs.recheckConcurrencyLimit(a.id, ea, { limit: 1 })).kind).toBe("limited");
+			const ea2 = await claim(a.id);
+			const ok = await s().runs.recheckConcurrencyLimit(a.id, ea2, { limit: 2 });
+			if (ok.kind !== "ok") throw new Error(`expected ok, got ${ok.kind}`);
+			expect(ok.run.id).toBe(a.id);
+			expect(ok.run.status).toBe("running");
+			expect(ok.run.executionId).toBe(ea2);
+			expect(ok.run.startedAt).toBeInstanceOf(Date);
+			// waits were reset: a later limited result of a starts back at the base delay (~1 s,
+			// not the ~2 s that waits = 1 would give).
+			const ea3 = await claim(a.id);
+			expect((await s().runs.recheckConcurrencyLimit(a.id, ea3, { limit: 1 })).kind).toBe(
+				"limited"
+			);
+			expect(await dueIn(a.id)).toBeLessThanOrEqual(1_250);
+		});
+
+		it("without a limit -> ok with started_at set", async () => {
+			const a = await created({ concurrencyKey: "r4" });
+			const b = await created({ concurrencyKey: "r4" });
+			await claim(b.id);
+			const ea = await claim(a.id);
+			const r = await s().runs.recheckConcurrencyLimit(a.id, ea, {});
+			if (r.kind !== "ok") throw new Error(`expected ok, got ${r.kind}`);
+			expect(r.run.startedAt).toBeInstanceOf(Date);
+			expect(r.run.status).toBe("running");
+		});
+
+		it("an execution that no longer owns the run -> lost", async () => {
+			const a = await created({ concurrencyKey: "r5" });
+			await claim(a.id);
+			expect((await s().runs.recheckConcurrencyLimit(a.id, randomUUID(), { limit: 1 })).kind).toBe(
+				"lost"
+			);
+			const queued = await created({ concurrencyKey: "r5" });
+			expect(
+				(await s().runs.recheckConcurrencyLimit(queued.id, randomUUID(), { limit: 1 })).kind
+			).toBe("lost");
+		});
+	});
 }

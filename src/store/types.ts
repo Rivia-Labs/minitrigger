@@ -351,6 +351,18 @@ export function concurrencyLimitedDelayMs(waitsBeforeThisAttempt: number): numbe
 	return base + Math.floor(Math.random() * Math.min(CONCURRENCY_LIMITED_JITTER_MS, base));
 }
 
+/** Options of {@link RunStore.recheckConcurrencyLimit}; no `limit` = the queue has none here. */
+export interface RecheckConcurrencyLimitOptions {
+	limit?: number;
+}
+
+export type RecheckConcurrencyLimitResult =
+	| { kind: "ok"; run: RunRecord }
+	/** Over the limit: the run is back in `queued` with a backoff `run_after` (nothing to enqueue). */
+	| { kind: "limited" }
+	/** This execution no longer owns the run. */
+	| { kind: "lost" };
+
 export type AcquireWithLimitResult =
 	| { kind: "acquired"; run: RunRecord }
 	/** Stale or duplicate job (wrong seq, not `queued`/`waiting`): no-op, like `acquire` → null. */
@@ -612,6 +624,23 @@ export interface RunStore {
 		seq: number,
 		options: ConcurrencyLimitOptions
 	): Promise<AcquireWithLimitResult>;
+
+	/**
+	 * Decision 25 after a Postgres-transport claim (`RunClaimStore.claimRuns` already moved the run
+	 * to `running` without checking the key). One transaction: `SELECT queue, concurrency_key,
+	 * concurrency_waits ... WHERE id AND execution_id AND status = 'running' FOR UPDATE` (none →
+	 * `lost`). With `limit` and a key: the same advisory lock as {@link acquireWithConcurrencyLimit},
+	 * then `count(*)` of the key's OTHER `running` runs; `>= limit` → back to `queued`,
+	 * `execution_id = NULL`, `run_after = now() + concurrencyLimitedDelayMs(concurrency_waits)`,
+	 * `concurrency_waits + 1` (`enqueue_seq`, `attempt` and `started_at` untouched) → `limited`.
+	 * Otherwise `concurrency_waits = 0`, `started_at = coalesce(started_at, now())` → `ok` with the
+	 * updated record. No `limit` → always `ok`.
+	 */
+	recheckConcurrencyLimit(
+		runId: string,
+		executionId: string,
+		options: RecheckConcurrencyLimitOptions
+	): Promise<RecheckConcurrencyLimitResult>;
 
 	/**
 	 * Decision 6. Own short transaction: `SET LOCAL statement_timeout = timeoutMs`,

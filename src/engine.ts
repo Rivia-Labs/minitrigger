@@ -1926,7 +1926,13 @@ export function createEngine(config: EngineConfig): Engine {
 				await transport.startWorkers({
 					...(options.queues ? { queues: options.queues } : {}),
 					processRun: async (queue, data) => {
-						const execution = executeRun(deps, { runId: data.runId, seq: data.seq, queue });
+						const execution = executeRun(deps, {
+							runId: data.runId,
+							seq: data.seq,
+							queue,
+							// Postgres transport only: the run arrives already claimed (never over BullMQ).
+							...(data.claimed ? { claimed: data.claimed } : {}),
+						});
 						inFlight.add(execution);
 						try {
 							await execution;

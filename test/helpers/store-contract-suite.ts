@@ -27,7 +27,7 @@ export interface StoreHarness {
 	/** Raw column overwrite of a run row (the SQL tests' `UPDATE runs SET ...`). */
 	patchRun(
 		runId: string,
-		patch: { status?: RunStatus; executionId?: null; runAfter?: null }
+		patch: { status?: RunStatus; executionId?: string | null; runAfter?: null }
 	): Promise<void>;
 }
 

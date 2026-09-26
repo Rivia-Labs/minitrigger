@@ -65,6 +65,13 @@ export interface RunJob {
 	 * `acquireWithConcurrencyLimit`; unknown or omitted => plain `acquire`.
 	 */
 	queue?: string;
+	/**
+	 * Postgres transport: the run as `store.claim.claimRuns` returned it, already `running` under
+	 * its DB-generated `executionId`. The executor skips `acquire`; a keyed run goes through
+	 * `recheckConcurrencyLimit` instead (decision 25), and a `limited` result is NOT enqueued (the
+	 * queue's poll finds the run at its new `run_after`). Never set by the BullMQ transport.
+	 */
+	claimed?: RunRecord;
 }
 
 /**
@@ -95,17 +102,36 @@ type Outcome =
  */
 export async function executeRun(deps: ExecutorDeps, job: RunJob): Promise<void> {
 	const log = deps.config.logger;
-	const executionId = randomUUID();
 
 	let run: RunRecord | null;
+	let executionId: string;
 	try {
 		const limit =
 			job.queue === undefined
 				? undefined
 				: deps.registry.queues.get(job.queue)?.concurrencyKey?.limit;
-		if (limit === undefined) {
+		if (job.claimed) {
+			run = job.claimed;
+			executionId = claimedExecutionId(job.claimed);
+			if (run.concurrencyKey !== null) {
+				const check = await deps.store.runs.recheckConcurrencyLimit(
+					run.id,
+					executionId,
+					limit === undefined ? {} : { limit }
+				);
+				if (check.kind === "limited") {
+					// Decision 25: back to `queued` with a backoff `run_after`; no attempt spent, nothing
+					// published, nothing enqueued (the queue's poll finds it at the new `run_after`).
+					log.debug({ runId: run.id }, "concurrency key at its limit; run requeued with backoff");
+					return;
+				}
+				run = check.kind === "ok" ? check.run : null;
+			}
+		} else if (limit === undefined) {
+			executionId = randomUUID();
 			run = await deps.store.runs.acquire(job.runId, executionId, job.seq);
 		} else {
+			executionId = randomUUID();
 			const acquired = await deps.store.runs.acquireWithConcurrencyLimit(
 				job.runId,
 				executionId,
@@ -162,6 +188,14 @@ export async function executeRun(deps: ExecutorDeps, job: RunJob): Promise<void>
 	} finally {
 		deps.active.delete(state);
 	}
+}
+
+/** The execution id a Postgres-transport claim wrote (`gen_random_uuid()`); never null there. */
+function claimedExecutionId(run: RunRecord): string {
+	if (run.executionId === null) {
+		throw new MinitriggerError(`claimed run ${run.id} has no execution id`);
+	}
+	return run.executionId;
 }
 
 /** Decision 20 for a run acquired after `stop()` began: release (no attempt) and re-enqueue. */

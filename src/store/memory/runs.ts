@@ -9,6 +9,7 @@ import type {
 	NewRun,
 	NewRunDebounce,
 	Ownership,
+	RecheckConcurrencyLimitResult,
 	RecoverStalledResult,
 	RunStore,
 	SerializedError,
@@ -462,6 +463,44 @@ export function createRunStore(exec: Exec): RunStore {
 				const run = acquireRow(tx, runId, executionId, seq);
 				if (!run) throw new Error("acquireWithConcurrencyLimit: run was not acquired");
 				return { kind: "acquired", run };
+			});
+		},
+
+		recheckConcurrencyLimit(runId, executionId, options) {
+			return exec.run((tx): RecheckConcurrencyLimitResult => {
+				const row = tx.db.runs.get(uuid(runId));
+				const execId = uuid(executionId);
+				if (row?.status !== "running" || row.executionId !== execId) {
+					return { kind: "lost" };
+				}
+				if (options.limit !== undefined && row.concurrencyKey !== null) {
+					let running = 0;
+					for (const r of tx.db.runs.values()) {
+						if (
+							r.id !== row.id &&
+							r.status === "running" &&
+							r.queue === row.queue &&
+							r.concurrencyKey === row.concurrencyKey
+						) {
+							running++;
+						}
+					}
+					if (running >= options.limit) {
+						updateRun(tx, row, {
+							status: "queued",
+							executionId: null,
+							runAfter: tx.now + concurrencyLimitedDelayMs(row.concurrencyWaits),
+							concurrencyWaits: row.concurrencyWaits + 1,
+							updatedAt: tx.now,
+						});
+						return { kind: "limited" };
+					}
+				}
+				const next = updateRun(tx, row, {
+					concurrencyWaits: 0,
+					startedAt: row.startedAt ?? tx.now,
+				});
+				return { kind: "ok", run: mapRun(next) };
 			});
 		},
 

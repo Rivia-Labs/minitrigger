@@ -27,9 +27,9 @@ export interface RunJobData {
 	seq: number;
 	/**
 	 * Set only by the Postgres transport (`src/pg/transport.ts`, decision 28(a)): the run already
-	 * claimed in the same statement that picked up this job, so the executor (Task 9) skips its own
-	 * `acquire()` and runs it directly. Type-only addition for this task: the BullMQ path below
-	 * (`enqueueRun`) never sets it on a job it adds -- it would be dead weight to serialize into
+	 * claimed in the same statement that picked up this job, so the executor (`RunJob.claimed`)
+	 * skips its own `acquire()` and runs it directly. The BullMQ path below (`enqueueRun`) never
+	 * sets it on a job it adds -- it would be dead weight to serialize into
 	 * Redis (a BullMQ job is a real persisted payload, unlike a Postgres claim's in-memory result)
 	 * and unsafe as stale data if that same job were ever redelivered.
 	 */

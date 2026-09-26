@@ -10,6 +10,7 @@ import type {
 	NewRun,
 	NewRunDebounce,
 	Ownership,
+	RecheckConcurrencyLimitResult,
 	RunStatus,
 	RunStore,
 	SerializedError,
@@ -600,6 +601,57 @@ export function createRunStore(exec: SqlExecutor, ctx: SqlContext): RunStore {
 				const run = await acquireRow(db, runId, executionId, seq);
 				if (!run) throw new Error("acquireWithConcurrencyLimit: locked run was not acquired");
 				return { kind: "acquired", run };
+			});
+		},
+
+		recheckConcurrencyLimit(runId, executionId, options) {
+			return atomic(exec, async (db): Promise<RecheckConcurrencyLimitResult> => {
+				const { rows: locked } = await db.query<{
+					queue: string;
+					concurrency_key: string | null;
+					concurrency_waits: number;
+				}>(
+					`SELECT queue, concurrency_key, concurrency_waits FROM ${runs}
+					 WHERE ${OWNED} FOR UPDATE`,
+					[runId, executionId]
+				);
+				const target = locked[0];
+				if (!target) return { kind: "lost" };
+				if (options.limit !== undefined && target.concurrency_key !== null) {
+					// Same lock key as acquireWithConcurrencyLimit: claim re-checks and BullMQ-style
+					// acquisitions of one key serialize against each other.
+					await db.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [
+						`${ctx.schema}:${target.queue}:${target.concurrency_key}`,
+					]);
+					const { rows: counted } = await db.query<{ n: number }>(
+						`SELECT count(*)::int AS n FROM ${runs}
+						 WHERE queue = $1 AND concurrency_key = $2 AND status = 'running' AND id <> $3`,
+						[target.queue, target.concurrency_key, runId]
+					);
+					if ((counted[0]?.n ?? 0) >= options.limit) {
+						// Backoff from the PRE-increment waits; the claim never reset them, so it keeps
+						// growing across claims (time from the DB, decision 17).
+						const delayMs = concurrencyLimitedDelayMs(target.concurrency_waits);
+						await db.query(
+							`UPDATE ${runs}
+							 SET status = 'queued', execution_id = NULL, run_after = ${nowPlusMs("$2")},
+							     concurrency_waits = concurrency_waits + 1, updated_at = now()
+							 WHERE id = $1`,
+							[runId, delayMs]
+						);
+						return { kind: "limited" };
+					}
+				}
+				const { rows } = await db.query<RunRow>(
+					`UPDATE ${runs}
+					 SET concurrency_waits = 0, started_at = coalesce(started_at, now())
+					 WHERE id = $1
+					 RETURNING ${RUN_COLUMNS}`,
+					[runId]
+				);
+				const row = rows[0];
+				if (!row) throw new Error("recheckConcurrencyLimit: locked run disappeared");
+				return { kind: "ok", run: mapRun(row) };
 			});
 		},
 
