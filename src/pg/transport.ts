@@ -16,7 +16,7 @@
 import { randomUUID } from "node:crypto";
 import type { Job } from "bullmq";
 import type { EngineLogger } from "../config.js";
-import { ConfigError } from "../errors.js";
+import { ConfigError, MinitriggerError } from "../errors.js";
 import type {
 	CloseWorkersOptions,
 	CloseWorkersResult,
@@ -117,6 +117,17 @@ export function createPgTransport(options: PgTransportOptions): Transport {
 	let queueWorkers: Map<string, QueueWorker> | undefined;
 	let systemWorker: SystemWorker | undefined;
 	let unsubscribeWake: (() => void) | undefined;
+	/** Set at the top of `closeWorkers`; permanent (mirrors the BullMQ transport's own `closing`). */
+	let closing = false;
+
+	/** Mirrors the BullMQ transport's `assertNotClosing()`: same error type and message. */
+	function assertNotClosing(): void {
+		if (closing) {
+			throw new MinitriggerError(
+				"the transport is closing (engine.stop() was called); no new worker"
+			);
+		}
+	}
 
 	async function enqueueRun(input: EnqueueRunInput): Promise<void> {
 		// The row's `run_after` (delayed or not) was already written by the store; the NOTIFY is
@@ -149,7 +160,13 @@ export function createPgTransport(options: PgTransportOptions): Transport {
 
 	async function removeSystemJob(jobId: string): Promise<void> {
 		// Never removes a currently-locked (active) row -- decision 10, same as the BullMQ transport.
-		await store.systemJobs.remove(jobId);
+		// Best-effort (Transport contract, src/queue/transport.ts): callers (execute-run.ts's
+		// after-resolution cleanup, the reconciler's case 5) don't wrap this themselves.
+		try {
+			await store.systemJobs.remove(jobId);
+		} catch (error) {
+			logger.debug({ jobId, err: error }, "removeSystemJob failed; best-effort, ignoring");
+		}
 	}
 
 	async function upsertJobScheduler(input: UpsertJobSchedulerInput): Promise<void> {
@@ -189,6 +206,7 @@ export function createPgTransport(options: PgTransportOptions): Transport {
 	}
 
 	async function startWorkers(opts: StartWorkersOptions): Promise<void> {
+		assertNotClosing();
 		if (queueWorkers) {
 			throw new ConfigError("startWorkers() was already called on this transport");
 		}
@@ -260,39 +278,50 @@ export function createPgTransport(options: PgTransportOptions): Transport {
 	}
 
 	async function closeWorkers(opts: CloseWorkersOptions): Promise<CloseWorkersResult> {
+		// Permanent: once a transport starts closing it never accepts a new `startWorkers()` (item
+		// 3, fix round 1) -- set unconditionally, even on the "workers were never started" path
+		// below, so a `startWorkers()` racing a `stop()` called before `start()` finished is refused
+		// too.
+		closing = true;
 		unsubscribeWake?.();
 		unsubscribeWake = undefined;
 		const workers = queueWorkers;
 		const sysWorker = systemWorker;
 		queueWorkers = undefined;
 		systemWorker = undefined;
-		if (!workers || !sysWorker) return { stillActive: [] };
 
-		for (const w of workers.values()) w.stopClaiming();
-		sysWorker.stopClaiming();
+		let stillActive: StillActiveJob[] = [];
+		if (workers && sysWorker) {
+			for (const w of workers.values()) w.stopClaiming();
+			sysWorker.stopClaiming();
 
-		// Drained in parallel, each bounded independently by `timeoutMs`, so the total wall time is
-		// ~timeoutMs regardless of how many queues this process runs (not N * timeoutMs).
-		const [queueDrains, systemStragglers] = await Promise.all([
-			Promise.all(
-				[...workers.entries()].map(async ([queue, w]) => ({
-					queue,
-					items: await w.drain(opts.timeoutMs),
-				}))
-			),
-			sysWorker.drain(opts.timeoutMs),
-		]);
+			// Drained in parallel, each bounded independently by `timeoutMs`, so the total wall time
+			// is ~timeoutMs regardless of how many queues this process runs (not N * timeoutMs).
+			const [queueDrains, systemStragglers] = await Promise.all([
+				Promise.all(
+					[...workers.entries()].map(async ([queue, w]) => ({
+						queue,
+						items: await w.drain(opts.timeoutMs),
+					}))
+				),
+				sysWorker.drain(opts.timeoutMs),
+			]);
 
-		const stillActive: StillActiveJob[] = [];
-		for (const { queue, items } of queueDrains) {
-			for (const run of items) {
-				stillActive.push({ queue, jobId: `${run.id}-${run.enqueueSeq}` });
+			const active: StillActiveJob[] = [];
+			for (const { queue, items } of queueDrains) {
+				for (const run of items) {
+					active.push({ queue, jobId: `${run.id}-${run.enqueueSeq}` });
+				}
 			}
-		}
-		for (const rec of systemStragglers) {
-			stillActive.push({ queue: SYSTEM_QUEUE_LABEL, jobId: rec.jobId });
+			for (const rec of systemStragglers) {
+				active.push({ queue: SYSTEM_QUEUE_LABEL, jobId: rec.jobId });
+			}
+			stillActive = active;
 		}
 
+		// Always called, even when `startWorkers` never ran (item 2, fix round 1): the engine does
+		// leader/pub-sub/subscription shutdown inside `beforeClose` regardless of whether this
+		// process ever claimed a run (`src/engine.ts`'s `stop()`).
 		if (opts.beforeClose) {
 			await opts.beforeClose(stillActive).catch((error: unknown) => {
 				try {

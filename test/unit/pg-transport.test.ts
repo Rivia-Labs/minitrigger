@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { ConfigError } from "../../src/errors.js";
+import { ConfigError, MinitriggerError } from "../../src/errors.js";
 import { channelName } from "../../src/pg/listener.js";
 import type { NotifyBatcher } from "../../src/pg/notify-batcher.js";
 import { createPgTransport, type PgTransportOptions } from "../../src/pg/transport.js";
@@ -89,6 +89,20 @@ function fakeClaim() {
 		setNextDue(d: Date | null) {
 			nextDue = d;
 		},
+	};
+}
+
+/** Like {@link fakeClaim}, but with a separate backlog per queue name (for multi-queue tests). */
+function fakeClaimPerQueue(backlogs: Record<string, RunRecord[]>) {
+	const calls: ClaimRunsInput[] = [];
+	return {
+		claimRuns: vi.fn(async (input: ClaimRunsInput) => {
+			calls.push(input);
+			const backlog = backlogs[input.queue] ?? [];
+			return backlog.splice(0, input.limit);
+		}),
+		nextDueAt: vi.fn(async () => null),
+		calls,
 	};
 }
 
@@ -249,6 +263,24 @@ describe("createPgTransport", () => {
 		await expect(transport.resumeQueue("q1")).resolves.toBeUndefined();
 		await expect(transport.isQueuePaused("q1")).resolves.toBe(true);
 		await expect(transport.isQueuePaused("q2")).resolves.toBe(false);
+	});
+
+	it("removeSystemJob swallows a store error (best-effort, never throws)", async () => {
+		const options = makeOptions();
+		const systemJobsStore = options.store.systemJobs;
+		const boom = new Error("connection reset");
+		(systemJobsStore.remove as ReturnType<typeof vi.fn>).mockRejectedValueOnce(boom);
+		const transport = createPgTransport(options);
+
+		await expect(transport.removeSystemJob("wp-w1-expire")).resolves.toBeUndefined();
+		const logger = options.logger as ReturnType<typeof recordingLogger>;
+		expect(logger.calls.find(c => c.fields.err === boom)).toMatchObject({
+			fields: { jobId: "wp-w1-expire", err: boom },
+		});
+
+		// A subsequent call that doesn't throw still resolves normally.
+		await expect(transport.removeSystemJob("wp-w2-expire")).resolves.toBeUndefined();
+		expect(systemJobsStore.remove).toHaveBeenCalledWith("wp-w2-expire");
 	});
 
 	it("enqueueSystem upserts a system_jobs row with a generated jobId when none is given", async () => {
@@ -420,6 +452,39 @@ describe("createPgTransport", () => {
 		await transport.closeWorkers({ timeoutMs: 100 });
 	});
 
+	it("onSlotFreed notifies the wake channel only for a queue with globalConcurrency", async () => {
+		const claim = fakeClaimPerQueue({
+			q1: [run("r-q1", { queue: "q1", enqueueSeq: 1 })],
+			q2: [run("r-q2", { queue: "q2", enqueueSeq: 1 })],
+		});
+		const options = makeOptions({
+			store: {
+				claim,
+				systemJobs: fakeSystemJobs(new Date(T0)).store,
+				queues: fakeQueues(),
+			} as unknown as SqlStore,
+			queues: [
+				{ name: "q1", concurrency: 1 },
+				{ name: "q2", concurrency: 1, globalConcurrency: 3 },
+			],
+		});
+		const batcher = options.batcher as ReturnType<typeof fakeBatcher>;
+		const transport = createPgTransport(options);
+
+		await transport.startWorkers({ processRun: async () => {}, processSystem: async () => {} });
+		// The claim, the (immediately-resolving) process, its `.finally()` and `onFinished` all
+		// chain off already-settled promises: a couple of flushes drain the whole chain.
+		await flush();
+		await flush();
+
+		const q1WakeCalls = batcher.calls.filter(c => c.payload === "q1").length;
+		const q2WakeCalls = batcher.calls.filter(c => c.payload === "q2").length;
+		expect(q1WakeCalls).toBe(0);
+		expect(q2WakeCalls).toBe(1);
+
+		await transport.closeWorkers({ timeoutMs: 100 });
+	});
+
 	it("startWorkers rejects an unknown queue name in the `queues` filter", async () => {
 		const options = makeOptions();
 		const transport = createPgTransport(options);
@@ -441,6 +506,41 @@ describe("createPgTransport", () => {
 			transport.startWorkers({ processRun: async () => {}, processSystem: async () => {} })
 		).rejects.toThrow(ConfigError);
 		await transport.closeWorkers({ timeoutMs: 100 });
+	});
+
+	it("closeWorkers before startWorkers still invokes beforeClose (with an empty stillActive)", async () => {
+		const options = makeOptions();
+		const transport = createPgTransport(options);
+		const beforeClose = vi.fn(async () => {});
+
+		const result = await transport.closeWorkers({ timeoutMs: 100, beforeClose });
+
+		expect(beforeClose).toHaveBeenCalledTimes(1);
+		expect(beforeClose).toHaveBeenCalledWith([]);
+		expect(result).toEqual({ stillActive: [] });
+	});
+
+	it("startWorkers after closeWorkers rejects, even if workers were never started", async () => {
+		const options = makeOptions();
+		const transport = createPgTransport(options);
+
+		await transport.closeWorkers({ timeoutMs: 100 });
+
+		await expect(
+			transport.startWorkers({ processRun: async () => {}, processSystem: async () => {} })
+		).rejects.toThrow(MinitriggerError);
+	});
+
+	it("startWorkers rejects after closeWorkers even when workers WERE started first", async () => {
+		const options = makeOptions({ queues: [{ name: "q1", concurrency: 1 }] });
+		const transport = createPgTransport(options);
+		await transport.startWorkers({ processRun: async () => {}, processSystem: async () => {} });
+		await flush();
+		await transport.closeWorkers({ timeoutMs: 100 });
+
+		await expect(
+			transport.startWorkers({ processRun: async () => {}, processSystem: async () => {} })
+		).rejects.toThrow(MinitriggerError);
 	});
 
 	it("closeWorkers stops claiming, drains and reports still-active runs to beforeClose", async () => {
