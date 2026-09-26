@@ -119,12 +119,15 @@ export function createRunStore(exec: SqlExecutor, ctx: SqlContext): RunStore {
 			input.maxAttempts,
 			input.delayMs,
 			input.concurrencyKey ?? null,
-			outbox !== undefined,
+			// `pending: false` (transport "postgres", decision 28(j)): claimable right after commit.
+			outbox !== undefined && outbox.pending !== false,
 		];
 		// `::text`: pg_notify returns `void`, which some ORM raw-query paths cannot deserialize
 		// (Prisma: "Failed to deserialize column of type 'void'"); the column is never read.
 		const notify = sendNotify
-			? `, pg_notify($${params.push(outbox.channel)}::text, '')::text AS notified`
+			? `, pg_notify($${params.push(outbox.channel)}::text, ${
+					outbox.payload === undefined ? "''" : `$${params.push(outbox.payload)}::text`
+				})::text AS notified`
 			: "";
 		const insertRun = (source: string) =>
 			`INSERT INTO ${runs} (id, task_id, queue, payload, status, attempt, max_attempts,

@@ -34,10 +34,11 @@ export interface PgListenerOptions {
 	channels: readonly string[];
 	logger: EngineLogger;
 	/**
-	 * Called for every notification on any of {@link channels}. Wrapped in `try/catch` (logged,
-	 * throttled): a throw here must never take down the listener's connection.
+	 * Called for every notification on any of {@link channels} (optional: consumers can also
+	 * register with {@link PgListener.subscribe}). Wrapped in `try/catch` (logged, throttled): a
+	 * throw here must never take down the listener's connection.
 	 */
-	onNotification(channel: string, payload: string): void;
+	onNotification?(channel: string, payload: string): void;
 	/** Called after every successful (re)connect, right after all the `LISTEN`s. */
 	onConnected?(): void;
 	reconnectMinMs?: number;
@@ -58,6 +59,15 @@ export interface PgListener {
 	start(): Promise<void>;
 	/** True while the dedicated client is connected and `LISTEN`ing on every channel. */
 	isListening(): boolean;
+	/**
+	 * Registers `handler` for the notifications of `channels` (a subset of the channels given at
+	 * construction: this never adds a `LISTEN`). Returns the unsubscribe. Works before `start()`
+	 * and across reconnects; a throwing handler is logged (throttled) like `onNotification`.
+	 */
+	subscribe(
+		channels: readonly string[],
+		handler: (channel: string, payload: string) => void
+	): () => void;
 	/** Stops everything; ends the client and never reconnects again. Bounded. Idempotent. */
 	close(): Promise<void>;
 }
@@ -91,6 +101,8 @@ export function createPgListener(options: PgListenerOptions): PgListener {
 	let listening = false;
 	let reconnectTimer: ReturnType<typeof setTimeout> | undefined;
 	let reconnectAttempt = 0;
+	/** Consumers registered with `subscribe()`, per channel. */
+	const consumers = new Map<string, Set<(channel: string, payload: string) => void>>();
 	// One throttle per kind: a connection failure must not hide a notification-handler failure.
 	const lastWarnAt = { connection: 0, notification: 0 };
 
@@ -114,6 +126,15 @@ export function createPgListener(options: PgListenerOptions): PgListener {
 			{ err: error, channels },
 			`pg listener could not LISTEN on [${channels.join(", ")}]; retrying`
 		);
+	}
+
+	/** One handler call, isolated: a throw is logged (throttled) and never reaches the socket. */
+	function deliver(channel: string, call: () => void): void {
+		try {
+			call();
+		} catch (error) {
+			warn("notification", { err: error, channel }, "pg listener onNotification threw; ignoring");
+		}
 	}
 
 	function destroy(c: Client): void {
@@ -185,14 +206,13 @@ export function createPgListener(options: PgListenerOptions): PgListener {
 		});
 		c.on("notification", (message: Notification) => {
 			if (client !== c) return;
-			try {
-				onNotification(message.channel, message.payload ?? "");
-			} catch (error) {
-				warn(
-					"notification",
-					{ err: error, channel: message.channel },
-					"pg listener onNotification threw; ignoring"
-				);
+			const payload = message.payload ?? "";
+			// Postgres only delivers channels this session LISTENs on; no channel filter needed.
+			deliver(message.channel, () => onNotification?.(message.channel, payload));
+			const handlers = consumers.get(message.channel);
+			if (!handlers) return;
+			for (const handler of Array.from(handlers)) {
+				deliver(message.channel, () => handler(message.channel, payload));
 			}
 		});
 		let timer: ReturnType<typeof setTimeout> | undefined;
@@ -244,6 +264,24 @@ export function createPgListener(options: PgListenerOptions): PgListener {
 			await connect();
 		},
 		isListening: () => listening,
+		subscribe(subscribed, handler) {
+			const entries = [...new Set(subscribed)];
+			for (const channel of entries) {
+				let set = consumers.get(channel);
+				if (!set) {
+					set = new Set();
+					consumers.set(channel, set);
+				}
+				set.add(handler);
+			}
+			return () => {
+				for (const channel of entries) {
+					const set = consumers.get(channel);
+					set?.delete(handler);
+					if (set?.size === 0) consumers.delete(channel);
+				}
+			};
+		},
 		async close() {
 			if (closed) return;
 			closed = true;

@@ -1,7 +1,7 @@
 /**
  * The seam between `createEngine` (lifecycle, leader loop, hand-back, core) and a transport
- * backend (spec §3.1): `src/backends/bullmq.ts` (Redis + BullMQ) today, `src/backends/postgres.ts`
- * next. Type-only: importing this module never loads `bullmq`/`ioredis`.
+ * backend (spec §3.1): `src/backends/bullmq.ts` (Redis + BullMQ) and `src/backends/postgres.ts`
+ * (decision 28). Type-only: importing this module never loads `bullmq`/`ioredis`.
  * @internal
  */
 
@@ -73,7 +73,9 @@ export interface BackendRuntime {
 	warnPoolSizing(queues: readonly string[] | undefined): void;
 	/**
 	 * Waits (bounded) for the subscriber created by `core.getPubSub()` to be ready; throws a
-	 * `MinitriggerError` (transient infrastructure, never `ConfigError`) on timeout.
+	 * `MinitriggerError` (transient infrastructure, never `ConfigError`) on timeout. Postgres: the
+	 * `LISTEN` connection, then the `NOTIFY` self-test (spec §3.8: after the queue states, before
+	 * the workers).
 	 */
 	awaitSubscriberReady(pubsub: PubSub): Promise<void>;
 	/**
@@ -92,7 +94,12 @@ export interface BackendRuntime {
 	beforeClose(): Promise<void>;
 	/** Ends the open `runs.readStream` iterations (after `runs.subscribe` ones end). */
 	closeReaders(): void;
-	/** Last step of `stop()` before the pool: the backend's own remaining connections. */
+	/**
+	 * Last step of `stop()` before the pool: the backend's own remaining connections (Postgres:
+	 * flushes the batched NOTIFYs, e.g. the hand-back's wake, then closes the listener). MUST be
+	 * bounded -- `stop()` awaits it before the pool's own bounded `end()`, so an unbounded close
+	 * would hang `stop()` on a dead connection.
+	 */
 	close(): Promise<void>;
 	/** Whether the transport's connection is up (`stop()` skips waits on it when it isn't). */
 	isReady(): boolean;

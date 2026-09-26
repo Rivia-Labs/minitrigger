@@ -11,7 +11,6 @@
 
 import type { Redis } from "ioredis";
 import type { ClientConfig } from "pg";
-import { DEFAULTS } from "../config.js";
 import type { EngineBackend } from "../engine.js";
 import { checkEnvironment } from "../env-check.js";
 import { ConfigError, MinitriggerError } from "../errors.js";
@@ -27,7 +26,13 @@ import { createTransport, type Transport } from "../queue/transport.js";
 import { createSqlTxRunStore } from "../store/sql/index.js";
 import type { Json } from "../store/types.js";
 import { createStreams } from "../streams.js";
-import { dedicatedClientConfig, recommendedPoolMax, withTimeout } from "./shared.js";
+import {
+	assertSchemaTransport,
+	dedicatedClientConfig,
+	warnPoolSizing,
+	warnScaledPoolSizing,
+	withTimeout,
+} from "./shared.js";
 import type { BackendContext, BackendRuntime, BackendStartStep } from "./types.js";
 
 /** Review 3 item 1: bound on the pub/sub subscriber's SUBSCRIBE in start() (same as the PING). */
@@ -39,7 +44,7 @@ const OUTBOX_ENQUEUE_WARN_MAX_IDS = 20;
 
 /** Builds the BullMQ backend. Throws `ConfigError` without a `redis` config. @internal */
 export function createBullmqBackend(ctx: BackendContext): BackendRuntime {
-	const { resolved, registry, pool, ownsPool, store, logger } = ctx;
+	const { resolved, registry, pool, store, logger } = ctx;
 	if (resolved.redis === undefined) {
 		throw new ConfigError('redis is required with transport "bullmq"');
 	}
@@ -138,7 +143,8 @@ export function createBullmqBackend(ctx: BackendContext): BackendRuntime {
 		},
 		streams,
 		readStream: readRunStream,
-		onScaled: () => warnScaledPoolSizing(),
+		onScaled: () =>
+			warnScaledPoolSizing(ctx, allQueues, queue => transport.workerConcurrency(queue)),
 		createRunInTransaction: (tx, input) =>
 			createSqlTxRunStore(tx, resolved.schema).create({
 				...input,
@@ -191,6 +197,9 @@ export function createBullmqBackend(ctx: BackendContext): BackendRuntime {
 			autoMigrate: false,
 		});
 		step.assertNotAbandoned();
+		// Decision 15 amendment: the schema's transport marker (mixed modes refused).
+		await assertSchemaTransport(store, resolved);
+		step.assertNotAbandoned();
 		await claimPrefix();
 		step.assertNotAbandoned();
 	}
@@ -222,58 +231,6 @@ export function createBullmqBackend(ctx: BackendContext): BackendRuntime {
 					`"${resolved.schema}": each schema needs its own prefix (they share queues and ` +
 					"schedule ticks otherwise). Use another prefix, or, if schema " +
 					`"${owner}" was retired, delete the Redis key "${key}"`
-			);
-		}
-	}
-
-	/**
-	 * Low item (b): warns when the pool is smaller than the README's sizing guide (total worker
-	 * concurrency of the started queues + 5) and, for an injected pool, when it has no
-	 * `connectionTimeoutMillis` (a heartbeat would then wait for a connection without limit instead
-	 * of failing with a warn, decision 6). The engine-created pool is sized and bounded by default.
-	 */
-	function warnPoolSizing(queueFilter: readonly string[] | undefined): void {
-		const started = queueFilter ? allQueues.filter(q => queueFilter.includes(q.name)) : allQueues;
-		const recommended = recommendedPoolMax(started);
-		const poolOptions = pool.options as { max?: number; connectionTimeoutMillis?: number };
-		const max = ownsPool
-			? (resolved.poolMax ?? recommendedPoolMax(allQueues))
-			: (poolOptions.max ?? DEFAULTS.poolMax);
-		if (max < recommended) {
-			logger.warn(
-				{ poolMax: max, recommended, injected: !ownsPool },
-				`postgres pool.max (${max}) is below the total worker concurrency + ` +
-					`${DEFAULTS.poolHeadroom} (${recommended}): runs will wait for connections and ` +
-					"heartbeats may fail; raise pool.max or lower the queues' concurrency"
-			);
-		}
-		if (!ownsPool && !poolOptions.connectionTimeoutMillis) {
-			logger.warn(
-				{},
-				"the injected pg.Pool has no connectionTimeoutMillis: on a saturated pool, heartbeats " +
-					"wait for a connection without limit instead of failing with a warning; set one " +
-					"(e.g. 10000)"
-			);
-		}
-	}
-
-	/** `queues.scale()`: the same pool guide as {@link warnPoolSizing}, over the live worker concurrency. */
-	function warnScaledPoolSizing(): void {
-		const concurrency = allQueues.reduce(
-			(sum, q) => sum + (transport.workerConcurrency(q.name) ?? 0),
-			0
-		);
-		const recommended = Math.max(DEFAULTS.poolMax, concurrency + DEFAULTS.poolHeadroom);
-		const poolOptions = pool.options as { max?: number };
-		const max = ownsPool
-			? (resolved.poolMax ?? recommendedPoolMax(allQueues))
-			: (poolOptions.max ?? DEFAULTS.poolMax);
-		if (max < recommended) {
-			logger.warn(
-				{ poolMax: max, recommended },
-				`postgres pool.max (${max}) is below this process's worker concurrency + ` +
-					`${DEFAULTS.poolHeadroom} (${recommended}) after queues.scale(): runs will wait for ` +
-					"connections and heartbeats may fail"
 			);
 		}
 	}
@@ -398,7 +355,7 @@ export function createBullmqBackend(ctx: BackendContext): BackendRuntime {
 		backend,
 		transport,
 		beforeStart,
-		warnPoolSizing,
+		warnPoolSizing: queueFilter => warnPoolSizing(ctx, allQueues, queueFilter),
 		awaitSubscriberReady,
 		dropSubscriber,
 		onWorkersStartFailed: closeWorkerConnections,

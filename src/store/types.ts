@@ -274,6 +274,17 @@ export interface NewRun {
 		 * near-instant delivery. `outbox_pending` is set either way, so the poll always finds it.
 		 */
 		notify?: boolean;
+		/**
+		 * The NOTIFY payload (default `''`). `transport: "postgres"` passes the run's queue: the
+		 * wake channel's payload is a hint of which queue to claim (decision 28(b)).
+		 */
+		payload?: string;
+		/**
+		 * `outbox_pending` of the inserted row (default `true`). `false` with `transport:
+		 * "postgres"` (decision 28(j)): the committed row is claimable right away (there is no
+		 * outbox sweep in that mode; `true` would leave the run unclaimable forever).
+		 */
+		pending?: boolean;
 	};
 }
 

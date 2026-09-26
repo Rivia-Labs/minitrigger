@@ -62,6 +62,12 @@ export interface ReconcilerOptions {
 	 * `ceil(stale / (batchSize * maxPagesPerTick))` ticks.
 	 */
 	maxPagesPerTick?: number;
+	/**
+	 * Cases 1/2 (lost enqueues). Default `true`. `false` with `transport: "postgres"` (decision 1
+	 * amendment): the `runs` row IS the queue there, so a due `queued`/`waiting` run is backlog, not
+	 * a lost enqueue; both cases are skipped and the report carries `skippedLostEnqueues: true`.
+	 */
+	recoverLostEnqueues?: boolean;
 	/** Phase 8 hook: bidirectional reconciliation of schedules. Called last, isolated like the rest. */
 	reconcileSchedules?: () => Promise<void>;
 	/**
@@ -103,6 +109,8 @@ export interface ReconcileReport {
 	expiredWaitpoints: number;
 	/** Decision 27: queues whose Redis pause flag had to be re-synced from Postgres. */
 	queueStates: number;
+	/** Set when cases 1/2 did not run ({@link ReconcilerOptions.recoverLostEnqueues} `false`). */
+	skippedLostEnqueues?: true;
 	/** Number of case-level or per-item failures encountered (logged, never thrown). */
 	errors: number;
 }
@@ -124,6 +132,7 @@ export function createReconciler(options: ReconcilerOptions): Reconciler {
 		onCanceled,
 		onStatusChange,
 	} = options;
+	const recoverLostEnqueues = options.recoverLostEnqueues ?? true;
 	const maxPagesPerTick = Math.max(1, options.maxPagesPerTick ?? DEFAULT_MAX_PAGES_PER_TICK);
 	/** Per-case keyset cursors, kept across ticks (per reconciler instance; no global state). */
 	const cursors: { staleQueued: StaleCursor | null; staleWaiting: StaleCursor | null } = {
@@ -359,11 +368,15 @@ export function createReconciler(options: ReconcilerOptions): Reconciler {
 				report.queueStates += await reconcileQueues();
 			});
 		}
-		// Read AFTER reconcileQueues re-applied the Redis flags: a queue just paused this tick is
-		// already excluded from cases 1/2 below (rather than one tick behind).
-		const pausedQueues = await listPausedQueues();
-		await runCase("staleQueued", report, () => reconcileStaleQueued(report, pausedQueues));
-		await runCase("staleWaiting", report, () => reconcileStaleWaiting(report, pausedQueues));
+		if (recoverLostEnqueues) {
+			// Read AFTER reconcileQueues re-applied the Redis flags: a queue just paused this tick is
+			// already excluded from cases 1/2 below (rather than one tick behind).
+			const pausedQueues = await listPausedQueues();
+			await runCase("staleQueued", report, () => reconcileStaleQueued(report, pausedQueues));
+			await runCase("staleWaiting", report, () => reconcileStaleWaiting(report, pausedQueues));
+		} else {
+			report.skippedLostEnqueues = true;
+		}
 		await runCase("orphanWaiting", report, () => reconcileOrphanWaiting(report));
 		await runCase("stalled", report, () => reconcileStalled(report));
 		await runCase("expiredWaitpoints", report, () => reconcileExpiredWaitpoints(report));

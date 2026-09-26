@@ -149,6 +149,21 @@ describe("checkEnvironment", () => {
 		expect(report.warnings).toEqual([]);
 	});
 
+	it("without redis (transport postgres) the eviction-policy check does not run at all", async () => {
+		const logger = fakeLogger();
+		const report = await checkEnvironment({ pool: allGoodPool(), schema: "mt_test", logger });
+		expect(report.warnings).toEqual([]);
+		expect(logger.calls).toEqual([]);
+		// And a failing Postgres check is still reported without mentioning Redis.
+		const badPool = fakePool({ server_version_num: [{ server_version_num: "120000" }] });
+		await expect(checkEnvironment({ pool: badPool, schema: "mt_test" })).rejects.toThrow(
+			/Postgres server version/
+		);
+		await expect(checkEnvironment({ pool: badPool, schema: "mt_test" })).rejects.not.toThrow(
+			/maxmemory/
+		);
+	});
+
 	it("collects a warning for CONFIG blocked on managed Redis without throwing", async () => {
 		const logger = fakeLogger();
 		const redis: RedisConfigClient = {

@@ -83,6 +83,38 @@ describe("createPgListener", () => {
 		await listener.close();
 	});
 
+	it("subscribe() routes notifications of its channels to the handler until unsubscribed", async () => {
+		const { factory, clients } = fakeClientFactory();
+		const main: Array<[string, string]> = [];
+		const listener = createPgListener({
+			clientConfig: {},
+			channels: ["wake", "status", "cancel"],
+			logger: silent,
+			onNotification: (c, p) => main.push([c, p]),
+			createClient: factory,
+		});
+		const seen: Array<[string, string]> = [];
+		const throwing = listener.subscribe(["status"], () => {
+			throw new Error("boom");
+		});
+		const off = listener.subscribe(["status", "cancel"], (c, p) => seen.push([c, p]));
+		await listener.start();
+		clients[0]?.emit("notification", { channel: "status", payload: "1" });
+		clients[0]?.emit("notification", { channel: "cancel", payload: "2" });
+		clients[0]?.emit("notification", { channel: "wake", payload: "3" });
+		expect(seen).toEqual([
+			["status", "1"],
+			["cancel", "2"],
+		]);
+		// The main callback sees everything, subscribers only their channels.
+		expect(main).toHaveLength(3);
+		off();
+		throwing();
+		clients[0]?.emit("notification", { channel: "status", payload: "4" });
+		expect(seen).toHaveLength(2);
+		await listener.close();
+	});
+
 	it("a throwing onNotification is logged and does not kill the client", async () => {
 		const { factory, clients } = fakeClientFactory();
 		const warnings: unknown[] = [];

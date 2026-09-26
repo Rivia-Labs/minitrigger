@@ -1,4 +1,5 @@
 /** `schema_meta` (migration 009): per-schema facts, e.g. the transport in use (decision 28). */
+import { MinitriggerError } from "../../errors.js";
 import type { SchemaMetaStore } from "../types.js";
 import { direct, type SqlContext, type SqlExecutor } from "./db.js";
 
@@ -29,7 +30,9 @@ export function createSchemaMetaStore(exec: SqlExecutor, ctx: SqlContext): Schem
 			if (inserted) return inserted.value;
 			const existing = await get(key);
 			if (existing === null) {
-				throw new Error(`schema_meta: key "${key}" conflicted but could not be read back`);
+				throw new MinitriggerError(
+					`schema_meta: key "${key}" conflicted but could not be read back`
+				);
 			}
 			return existing;
 		},

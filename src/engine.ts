@@ -9,11 +9,13 @@
 import { randomUUID } from "node:crypto";
 import { Pool } from "pg";
 import { createBullmqBackend } from "./backends/bullmq.js";
-import { recommendedPoolMax, withTimeout } from "./backends/shared.js";
-import type { BackendRuntime } from "./backends/types.js";
+import { createPostgresBackend } from "./backends/postgres.js";
+import { withTimeout } from "./backends/shared.js";
+import type { BackendContext, BackendRuntime } from "./backends/types.js";
 import {
 	assertTimerMs,
 	assertTtlWithinRetention,
+	derivePoolMax,
 	type EngineConfig,
 	type EngineLogger,
 	MAX_QUEUE_SCALE_CONCURRENCY,
@@ -1517,12 +1519,6 @@ export function createEngine(config: EngineConfig): Engine {
 	const registry = buildRegistry(resolved.tasks);
 	validateTasks(registry, resolved);
 
-	// The Postgres-only transport (`transport: "postgres"`) is not implemented yet: refused before
-	// anything (the pool) is created. Task 10b replaces this guard with that backend.
-	if (resolved.transport === "postgres") {
-		throw new ConfigError('transport "postgres" is not implemented yet');
-	}
-
 	const ownsPool = typeof resolved.postgres === "string";
 	const allQueues = Array.from(registry.queues.values());
 	const pool =
@@ -1532,7 +1528,9 @@ export function createEngine(config: EngineConfig): Engine {
 					// Low (b): sized by the README guide unless given, and a bounded wait for a free
 					// connection, so a heartbeat on a saturated pool fails with a warn (decision 6)
 					// instead of waiting forever.
-					max: resolved.poolMax ?? recommendedPoolMax(allQueues),
+					max:
+						resolved.poolMax ??
+						derivePoolMax(allQueues, resolved.systemConcurrency, resolved.transport),
 					connectionTimeoutMillis: resolved.poolConnectionTimeoutMs,
 				})
 			: resolved.postgres.pool;
@@ -1569,7 +1567,7 @@ export function createEngine(config: EngineConfig): Engine {
 		if (!boundCore) throw new MinitriggerError("internal: engine core used before it was built");
 		return boundCore;
 	};
-	const runtime: BackendRuntime = createBullmqBackend({
+	const backendContext: BackendContext = {
 		resolved,
 		registry,
 		pool,
@@ -1577,9 +1575,14 @@ export function createEngine(config: EngineConfig): Engine {
 		store,
 		logger,
 		isShuttingDown: () => shuttingDown,
+		// Review focus 6: the Postgres cancel re-read only looks at runs executing here.
 		isActiveLocally: runId => requireCore().active.get(runId) !== undefined,
 		notifyStatus: info => requireCore().notifyStatus(info),
-	});
+	};
+	const runtime: BackendRuntime =
+		resolved.transport === "postgres"
+			? createPostgresBackend(backendContext)
+			: createBullmqBackend(backendContext);
 	const { transport } = runtime;
 
 	const core = createEngineCore(resolved, registry, runtime.backend, {
@@ -1604,6 +1607,8 @@ export function createEngine(config: EngineConfig): Engine {
 		graceMs: resolved.reconciler.graceMs,
 		stallTimeoutMs: resolved.stallTimeoutMs,
 		batchSize: resolved.reconciler.batchSize,
+		// Decision 1 amendment: with transport "postgres" a due run is backlog, not a lost enqueue.
+		recoverLostEnqueues: resolved.transport === "bullmq",
 		reconcileQueues: core.syncQueueStates,
 		reconcileSchedules: createReconcileSchedulesHook({
 			store,
@@ -1813,7 +1818,11 @@ export function createEngine(config: EngineConfig): Engine {
 				throw new MinitriggerError("engine.stop() was called while start() was in progress");
 			}
 			const afterWorkers = runtime.afterWorkersStarted();
-			if (afterWorkers) await afterWorkers;
+			if (afterWorkers) {
+				await afterWorkers;
+				// stop() may have begun while it was pending: the leader loop must not start.
+				assertStartNotAbandoned();
+			}
 			startLeaderLoop();
 		})();
 		startPromise = attempt.then(
@@ -1851,7 +1860,7 @@ export function createEngine(config: EngineConfig): Engine {
 		core.endSubscriptions(
 			startFailed
 				? new MinitriggerError(
-						"runs.subscribe() ended before the run reached a terminal status: the Redis pub/sub " +
+						"runs.subscribe() ended before the run reached a terminal status: the pub/sub " +
 							"subscriber it used was discarded because engine.start() failed; subscribe again " +
 							"(after a successful start(), or on an engine that only triggers)"
 					)
@@ -2112,7 +2121,8 @@ export function createEngine(config: EngineConfig): Engine {
 							stopLeaderLoop().catch((error: unknown) =>
 								logger.warn({ err: error }, "error stopping the leader loop")
 							),
-							// Decision 26 (BullMQ): the outbox listener's bounded close.
+							// The backend's bounded close step (BullMQ: the outbox listener; Postgres:
+							// the LISTEN connection).
 							runtime.beforeClose(),
 						]);
 						await handBackActiveRuns();
