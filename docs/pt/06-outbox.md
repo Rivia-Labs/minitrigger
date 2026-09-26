@@ -31,13 +31,68 @@ try {
 
 ## Requisitos do `tx`
 
-`tx` é um `PoolClient`/`Client` do node-postgres no qual você já rodou `BEGIN` (ou qualquer objeto
-com o mesmo formato `query(text, values)` vinculado a uma transação aberta — a costura para
-adaptadores de ORM). **Passar o `Pool` em si é rejeitado**: as queries dele rodariam fora da sua
-transação.
+`tx` é um `PoolClient`/`Client` do node-postgres no qual você já rodou `BEGIN`, uma transação de
+ORM embrulhada pelo [adaptador](#com-um-orm-typeorm-knex-drizzle-prisma) dela, ou qualquer objeto
+com o mesmo formato `query(text, values)` vinculado a uma transação aberta. **Passar o `Pool` em
+si é rejeitado**: as queries dele rodariam fora da sua transação.
 
 O engine só roda statements parametrizados e qualificados por schema no seu client — nunca `SET`,
 `LISTEN` ou outro estado de sessão.
+
+## Com um ORM (TypeORM, knex, Drizzle, Prisma)
+
+Cada ORM tem um adaptador pequeno num subpath próprio que transforma o handle de transação do ORM
+no client `tx`. Os adaptadores não importam nada dos ORMs (nenhuma dependência extra; o ORM que
+você não usa nunca é carregado) e mandam o SQL do engine pela API de query crua do próprio ORM,
+**na conexão da transação**, sempre com parâmetros (bind), nunca interpolando valores. A run faz
+commit ou rollback junto com a transação do ORM; todo o resto desta página vale igual.
+
+```ts
+// TypeORM (0.3.x / 1.x, driver postgres)
+import { typeormTx } from "@rivia-labs/minitrigger/typeorm";
+await dataSource.transaction(async manager => {
+  const order = await manager.save(Order, { customerId, total });
+  await engine.trigger(sendReceipt, { orderId: order.id }, { tx: typeormTx(manager) });
+});
+
+// knex (client pg)
+import { knexTx } from "@rivia-labs/minitrigger/knex";
+await knex.transaction(async trx => {
+  const [order] = await trx("orders").insert({ customer_id: customerId, total }).returning("id");
+  await engine.trigger(sendReceipt, { orderId: order.id }, { tx: knexTx(trx) });
+});
+
+// Drizzle (driver node-postgres ou postgres.js): passe também a tag `sql` do drizzle
+import { sql } from "drizzle-orm";
+import { drizzleTx } from "@rivia-labs/minitrigger/drizzle";
+await db.transaction(async tx => {
+  const [order] = await tx.insert(orders).values({ customerId, total }).returning();
+  await engine.trigger(sendReceipt, { orderId: order.id }, { tx: drizzleTx(tx, sql) });
+});
+
+// Prisma (transação interativa, PostgreSQL)
+import { prismaTx } from "@rivia-labs/minitrigger/prisma";
+await prisma.$transaction(async tx => {
+  const order = await tx.order.create({ data: { customerId, total } });
+  await engine.trigger(sendReceipt, { orderId: order.id }, { tx: prismaTx(tx) });
+});
+```
+
+| Subpath | Embrulha | Executa via | Rejeitado com `ConfigError` |
+|---|---|---|---|
+| `/typeorm` → `typeormTx(managerOuQueryRunner)` | o `manager` de `dataSource.transaction(...)`, ou um `QueryRunner` depois de `startTransaction()` | `queryRunner.query(sql, params, true)` | `dataSource.manager` (sem transação), runner sem transação ativa ou liberado (checado a cada query), driver que não é `postgres` |
+| `/knex` → `knexTx(trx)` | o `trx` de `knex.transaction(...)` | `trx.raw(sql, bindings)`: cada `$n` vira `?` (um binding por ocorrência) e todo `?` literal é escapado como `\?` | a instância `knex` em si, transação já concluída (checado a cada query), client que não é `pg` |
+| `/drizzle` → `drizzleTx(tx, sql)` | o `tx` de `db.transaction(...)` | `` tx.execute(sql`...`) `` montado com a sua tag `sql`, cada `$n` virando `sql.param(valor)` | o `db` em si, tag `sql` ausente |
+| `/prisma` → `prismaTx(tx)` | o `tx` de `prisma.$transaction(async tx => ...)` | `tx.$queryRawUnsafe(sql, ...valores)` (placeholders `$n` como estão) | o `PrismaClient` em si (cada statement faria autocommit) |
+
+- Os wrappers são explícitos de propósito: passar o handle cru do ORM como `tx` é rejeitado com um
+  `ConfigError` que diz qual adaptador usar (um manager do TypeORM até tem um `query()` que seria
+  chamado com o formato de resultado errado).
+- Testados contra Postgres real com TypeORM 1.1, knex 3.3, drizzle-orm 0.45 (node-postgres e
+  postgres.js) e Prisma 7.10 (gerador `prisma-client` + `@prisma/adapter-pg`). No Prisma, lembre do
+  `timeout` da transação interativa (5 s por padrão), como para qualquer statement dela.
+- Qualquer outro driver/ORM funciona do mesmo jeito: passe um objeto com `query(text, values)` que
+  rode o statement `$1..$n` na conexão da transação e resolva para `{ rows }`.
 
 ## NOTIFY/LISTEN + varredura de 2s como rede de segurança
 

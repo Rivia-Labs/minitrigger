@@ -61,7 +61,7 @@ Atualizado em 2026-09-25. Leia junto com `CLAUDE.md` (decisões e notas de imple
 ### Próximas ondas (decididas pelo dono em 2026-09-25)
 
 1. ✅ (0.3.0, não publicado no npm ainda) Propostas da comparação com `@rivia-labs/oban-ts`, por valor: outbox transacional (`trigger(..., { tx })`), pacote `@rivia-labs/minitrigger` público (LICENSE MIT, subpath `/testing`, Node >= 22), gestão de filas e operações em lote, helpers de teste, telemetria (`durationMs`, `attachDefaultLogger`), skills de Claude Code e docs em PT.
-2. Adapters de ORM para o outbox (TypeORM, Knex, Drizzle, Prisma), depois do `tx` com `pg`.
+2. ✅ Adapters de ORM para o outbox (`/typeorm`, `/knex`, `/drizzle`, `/prisma`), testados contra TypeORM 1.1, Knex 3.3, Drizzle 0.45 (node-postgres e postgres.js) e Prisma 7.10.
 3. **Modo só-Postgres** (`transport: "postgres" | "bullmq"`, BullMQ continua padrão): fazer depois das propostas atuais. Escopo mínimo avaliado: fábricas de backend, fetch+acquire direto em `runs` com `SKIP LOCKED`, LISTEN/NOTIFY + timer + poll, ticks de cron pelo líder, pub/sub por NOTIFY com payload enxuto, `globalConcurrency` em SQL; `rateLimit` e streams com `ConfigError` no MVP. Exige emendas às decisões 1, 8, 14, 15, 16, 21 e 22 (aprovação do dono antes de implementar). Estimativa ~3 semanas; medir paridade com `pnpm bench` antes de pensar em trocar o padrão.
 
 ### Auditoria externa (2026-09-25)

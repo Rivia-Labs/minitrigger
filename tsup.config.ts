@@ -8,7 +8,16 @@ export default defineConfig({
 	// error classes from the main entry but hits the testing entry's own copy of the throw site.
 	// Verified for both ESM and CJS output by `scripts/check-pack.mjs` (tsup's CJS splitting is
 	// newer/less exercised than its ESM splitting, so it's checked for real, not assumed).
-	entry: { index: "src/index.ts", "testing/index": "src/testing/index.ts" },
+	// ORM adapter subpaths (decision 26): tiny entries that import only the shared error classes
+	// (same chunk rule: `instanceof ConfigError` holds across entries) and nothing from any ORM.
+	entry: {
+		index: "src/index.ts",
+		"testing/index": "src/testing/index.ts",
+		"typeorm/index": "src/adapters/typeorm.ts",
+		"knex/index": "src/adapters/knex.ts",
+		"drizzle/index": "src/adapters/drizzle.ts",
+		"prisma/index": "src/adapters/prisma.ts",
+	},
 	format: ["esm", "cjs"],
 	target: "node22",
 	platform: "node",

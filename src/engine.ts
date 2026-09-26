@@ -872,6 +872,13 @@ export function createEngineCore(
 			// Decision 26: nothing is enqueued or published here (the caller's transaction is not
 			// committed); the engine that claims the run after the commit does both.
 			const result = await createRunInCallerTransaction(options.tx, input);
+			// Only id/taskId/kind are read from `result.run` here, and that is intentional, not
+			// incidental: an ORM adapter (decision 26) can normalize a raw query's rows in ways that
+			// lose fidelity outside those two string fields -- e.g. `rowCount` (dropped by adapters
+			// whose ORM returns a plain row array, `toQueryResult` in src/adapters/shared.ts) and
+			// timestamp columns (some adapters' drivers return them as strings, not `Date`). Do not
+			// start reading other fields (e.g. `updatedAt`) off a tx-path `result.run` without
+			// checking every adapter handles that column consistently.
 			return { id: result.run.id, taskId: result.run.taskId, kind: result.kind };
 		}
 		const result = await store.runs.create(input);
@@ -2583,6 +2590,14 @@ export function resolveDebounce(
  * each run on a different pooled connection, outside the caller's transaction). @internal
  */
 export function validateTransactionClient(tx: unknown): TransactionClient {
+	const orm = ormHandleHint(tx);
+	if (orm !== undefined) {
+		throw new ConfigError(
+			`trigger options.tx looks like ${orm.what}; wrap it with ${orm.wrap} from ` +
+				`"@rivia-labs/minitrigger/${orm.subpath}" (e.g. { tx: ${orm.wrap} }) so the run commits ` +
+				"or rolls back with that transaction"
+		);
+	}
 	if (
 		tx === null ||
 		typeof tx !== "object" ||
@@ -2601,6 +2616,37 @@ export function validateTransactionClient(tx: unknown): TransactionClient {
 		);
 	}
 	return tx as TransactionClient;
+}
+
+/**
+ * Decision 26: a raw ORM transaction handle passed as `tx` is recognized (structurally, nothing is
+ * imported) only to point at its adapter subpath; it is never wrapped implicitly. A TypeORM
+ * manager even has a `query()` that would "work" with the wrong result shape.
+ */
+function ormHandleHint(tx: unknown): { what: string; wrap: string; subpath: string } | undefined {
+	if (tx === null || (typeof tx !== "object" && typeof tx !== "function")) return undefined;
+	const has = (key: string) => typeof (tx as Record<string, unknown>)[key] === "function";
+	if (has("$queryRawUnsafe")) {
+		return { what: "a Prisma client", wrap: "prismaTx(tx)", subpath: "prisma" };
+	}
+	if (typeof tx === "function" && has("raw")) {
+		return { what: "a knex transaction/instance", wrap: "knexTx(trx)", subpath: "knex" };
+	}
+	if (has("query") && (has("startTransaction") || "queryRunner" in tx)) {
+		return {
+			what: "a TypeORM EntityManager/QueryRunner",
+			wrap: "typeormTx(manager)",
+			subpath: "typeorm",
+		};
+	}
+	if (has("execute") && has("select") && !has("query")) {
+		return {
+			what: "a Drizzle transaction/database",
+			wrap: "drizzleTx(tx, sql)",
+			subpath: "drizzle",
+		};
+	}
+	return undefined;
 }
 
 /** Decision 25: validates `trigger`'s `concurrencyKey` against the task's queue. @internal */

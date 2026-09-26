@@ -1,6 +1,6 @@
 ---
 name: minitrigger-outbox
-description: Find dual writes (a business database write followed by a separate engine.trigger() call outside that transaction) and refactor them to minitrigger's transactional trigger / outbox pattern (trigger(task, payload, { tx })), so the business write and the run commit or roll back together. Use when the user reports "the job never queued after a crash" / "order saved but email never sent" style bugs, or asks to wrap a trigger in a transaction.
+description: Find dual writes (a business database write followed by a separate engine.trigger() call outside that transaction) and refactor them to minitrigger's transactional trigger / outbox pattern (trigger(task, payload, { tx })), with node-postgres or through the TypeORM/knex/Drizzle/Prisma adapters (typeormTx/knexTx/drizzleTx/prismaTx), so the business write and the run commit or roll back together. Use when the user reports "the job never queued after a crash" / "order saved but email never sent" style bugs, or asks to wrap a trigger in a transaction.
 when_to_use: "the job never got queued", "order saved but the email job never ran", "wrap this trigger in a transaction", "use the outbox pattern", "trigger inside a transaction"
 ---
 
@@ -25,10 +25,10 @@ write it's meant to accompany:
 
 ## The fix
 
-`tx` must be a node-postgres `PoolClient`/`Client` (or any object with the same
-`query(text, values)` shape bound to an open transaction — the seam for ORM adapters) on which
-`BEGIN` has already run. Passing the `Pool` itself is **rejected** — its queries would run outside
-the transaction.
+`tx` must be a node-postgres `PoolClient`/`Client` on which `BEGIN` has already run, an ORM
+transaction wrapped by its adapter (below), or any object with the same `query(text, values)`
+shape bound to an open transaction. Passing the `Pool` itself is **rejected** — its queries would
+run outside the transaction.
 
 ```ts
 import { Pool } from "pg";
@@ -61,6 +61,33 @@ schema-scoped channel and dispatches the committed run(s) within milliseconds. I
 notification is lost (listener reconnecting, no started engine at commit time, a pooler that
 breaks `LISTEN`), every started engine also sweeps every `outbox.pollIntervalMs` (default 2 s), so
 the run is still dispatched — just not at millisecond latency.
+
+### The code base uses an ORM
+
+Don't open a raw `pg` client next to the ORM: wrap the ORM's own transaction handle with the
+adapter subpath for it, inside the transaction that already holds the business write. Pick the
+one matching the project's dependencies (`package.json`):
+
+| ORM in the project | Import | `tx` value (inside the ORM's transaction callback) |
+|---|---|---|
+| `typeorm` (postgres driver) | `import { typeormTx } from "@rivia-labs/minitrigger/typeorm"` | `typeormTx(manager)` — the `manager` of `dataSource.transaction(async manager => ...)`, or a `QueryRunner` after `startTransaction()` |
+| `knex` (pg client) | `import { knexTx } from "@rivia-labs/minitrigger/knex"` | `knexTx(trx)` — the `trx` of `knex.transaction(async trx => ...)` |
+| `drizzle-orm` (node-postgres or postgres.js) | `import { drizzleTx } from "@rivia-labs/minitrigger/drizzle"` + `import { sql } from "drizzle-orm"` | `drizzleTx(tx, sql)` — the `tx` of `db.transaction(async tx => ...)` |
+| `@prisma/client` (PostgreSQL) | `import { prismaTx } from "@rivia-labs/minitrigger/prisma"` | `prismaTx(tx)` — the `tx` of `prisma.$transaction(async tx => ...)` (interactive form, not the array form) |
+
+```ts
+await dataSource.transaction(async manager => {
+	const order = await manager.save(Order, { customerId, total });
+	await engine.trigger(sendReceipt, { orderId: order.id }, { tx: typeormTx(manager) });
+});
+```
+
+Common mistakes the adapters reject with a `ConfigError` (fix them, don't work around them):
+`dataSource.manager`, the `knex` instance, the drizzle `db` or the `PrismaClient` itself (not a
+transaction, so the trigger would autocommit on its own); passing the raw ORM handle as `tx`
+without the wrapper; `drizzleTx(tx)` without the `sql` tag. With Prisma, also check the
+interactive transaction's `timeout` still fits. The trigger must be inside the same callback as the
+business write — a trigger after `await dataSource.transaction(...)` returned is still a dual write.
 
 ## Worked before/after example
 

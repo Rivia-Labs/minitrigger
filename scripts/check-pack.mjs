@@ -17,8 +17,11 @@
  *      core/error classes in a common chunk both entries import) rather than each bundling its
  *      own copy, in **both** module formats: tsup's CJS chunk splitting is newer/less exercised
  *      than its ESM splitting, so this is checked for real, not assumed.
- *   5. a `tsc --moduleResolution node10` check of the main entry and `/testing` (resolved through
- *      `typesVersions`, since node10 ignores `exports`).
+ *   5. a `tsc --moduleResolution node10` check of the main entry, `/testing` and the ORM adapter
+ *      subpaths (resolved through `typesVersions`, since node10 ignores `exports`).
+ *   6. the ORM adapter subpaths (`/typeorm`, `/knex`, `/drizzle`, `/prisma`, decision 26) load in
+ *      ESM and CJS with no ORM installed, import no module outside the package (only the shared
+ *      error chunk), and throw `ConfigError`s that are `instanceof` the main entry's class.
  *   4. (best-effort) a one-file `tsc --strict --module NodeNext --moduleResolution NodeNext`
  *      check against the installed `.d.ts` resolves `createEngine`/`defineTask`'s types — this
  *      step is skipped with a warning (not a failure) if this repo's own `typescript` isn't
@@ -28,7 +31,7 @@
  * toolchain — no new dependency.
  */
 import { execFileSync, execSync } from "node:child_process";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -36,6 +39,9 @@ import { fileURLToPath } from "node:url";
 const REPO_ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
 
 const PKG_NAME = "@rivia-labs/minitrigger";
+
+/** ORM adapter subpaths and the function each exports (decision 26). */
+const ADAPTERS = { typeorm: "typeormTx", knex: "knexTx", drizzle: "drizzleTx", prisma: "prismaTx" };
 
 const PEER_VERSIONS = {
 	bullmq: "^6.3.0",
@@ -137,6 +143,9 @@ async function main() {
 		writeFileSync(join(installDir, "cjs-testing-check.cjs"), cjsTestingCheckSource());
 		run("node", ["cjs-testing-check.cjs"], { cwd: installDir });
 
+		console.log("\n--- ORM adapter subpaths (ESM + CJS, no ORM installed) ---");
+		checkAdapters(installDir);
+
 		console.log("\n--- type resolution (plus, best-effort) ---");
 		ok = checkTypes(installDir) && ok;
 
@@ -225,6 +234,7 @@ function checkTypes(installDir) {
 		[
 			`import { createEngine, defineTask, type Engine } from "${PKG_NAME}";`,
 			`import { createTestEngine, type TestEngine } from "${PKG_NAME}/testing";`,
+			...adapterTypeCheckLines(),
 			"const _engine: (config: Parameters<typeof createEngine>[0]) => Engine = createEngine;",
 			"const _define: typeof defineTask = defineTask;",
 			"const _testEngine: (config: Parameters<typeof createTestEngine>[0]) => TestEngine =",
@@ -291,6 +301,7 @@ function checkTypesNode10(installDir) {
 		[
 			`import { createEngine, type Engine } from "${PKG_NAME}";`,
 			`import { createTestEngine, type TestEngine } from "${PKG_NAME}/testing";`,
+			...adapterTypeCheckLines(),
 			"const _engine: (config: Parameters<typeof createEngine>[0]) => Engine = createEngine;",
 			"const _testEngine: (config: Parameters<typeof createTestEngine>[0]) => TestEngine =",
 			"\tcreateTestEngine;",
@@ -326,13 +337,100 @@ function checkTypesNode10(installDir) {
 			`node "${join(REPO_ROOT, "node_modules/typescript/bin/tsc")}" --noEmit -p "${tsconfigFile}"`,
 			{ cwd: installDir, stdio: "pipe", encoding: "utf8" }
 		);
-		console.log("type check OK: main entry and /testing resolve under moduleResolution node10");
+		console.log(
+			"type check OK: main entry, /testing and the adapter subpaths resolve under moduleResolution node10"
+		);
 		return true;
 	} catch (err) {
 		console.error(
 			`node10 type check FAILED:\n${err.stdout ?? ""}${err.stderr ?? err.message ?? ""}`
 		);
 		return false;
+	}
+}
+
+/**
+ * Type-level use of every adapter subpath: each wrapper's return value is accepted as
+ * `trigger`'s `options.tx` type (`TransactionClient` from the main entry).
+ */
+function adapterTypeCheckLines() {
+	const lines = [`import type { TransactionClient } from "${PKG_NAME}";`];
+	for (const [subpath, fn] of Object.entries(ADAPTERS)) {
+		lines.push(`import { ${fn} } from "${PKG_NAME}/${subpath}";`);
+		lines.push(`const _${fn}: (...args: never[]) => TransactionClient = ${fn};`);
+		lines.push(`void _${fn};`);
+	}
+	return lines;
+}
+
+/**
+ * Loads each adapter subpath in ESM and CJS (no ORM is installed in the check dir, proving the
+ * adapters need none), checks a bad handle throws a `ConfigError` that is `instanceof` the main
+ * entry's class, and scans the adapter's built files for any bare import/require: only relative
+ * chunk imports are allowed (an ORM import would make every consumer install that ORM).
+ */
+function checkAdapters(installDir) {
+	const pkgDir = join(installDir, "node_modules", ...PKG_NAME.split("/"));
+	for (const [subpath, fn] of Object.entries(ADAPTERS)) {
+		for (const entry of [`dist/${subpath}/index.js`, `dist/${subpath}/index.cjs`]) {
+			// Walks the entry and every chunk it loads (transitively): all of it is what a consumer
+			// of the subpath loads, so all of it must be package-free and small.
+			const seen = new Set();
+			const pending = [entry];
+			let bytes = 0;
+			while (pending.length > 0) {
+				const file = pending.pop();
+				if (seen.has(file)) continue;
+				seen.add(file);
+				const source = readFileSync(join(pkgDir, file), "utf8");
+				bytes += Buffer.byteLength(source);
+				for (const [, spec] of source.matchAll(
+					/(?:^import[^'"\n]*|require\()\s*['"]([^'"]+)['"]/gm
+				)) {
+					if (!spec.startsWith(".")) {
+						throw new Error(
+							`${file} (loaded by ${entry}) imports "${spec}": adapters must import no package`
+						);
+					}
+					pending.push(join(dirname(file), spec));
+				}
+			}
+			if (bytes > 16 * 1024) {
+				throw new Error(
+					`${entry} loads ${bytes} bytes (${seen.size} files); adapters must stay tiny`
+				);
+			}
+			console.log(`${entry}: ${seen.size} file(s), ${bytes} bytes, no package imports`);
+		}
+		const body = (mainImport, adapterImport) =>
+			[
+				mainImport,
+				adapterImport,
+				`if (typeof ${fn} !== "function") throw new Error("${fn} is not a function");`,
+				"let threw = false;",
+				`try { ${fn}({}); } catch (e) {`,
+				`\tif (!(e instanceof ConfigError)) throw new Error("${fn} error is not instanceof the main entry's ConfigError: " + e);`,
+				"\tthrew = true;",
+				"}",
+				`if (!threw) throw new Error("${fn}({}) did not throw");`,
+				`console.log("OK: ${PKG_NAME}/${subpath} (${fn})");`,
+			].join("\n");
+		writeFileSync(
+			join(installDir, `adapter-${subpath}.mjs`),
+			body(
+				`import { ConfigError } from "${PKG_NAME}";`,
+				`import { ${fn} } from "${PKG_NAME}/${subpath}";`
+			)
+		);
+		writeFileSync(
+			join(installDir, `adapter-${subpath}.cjs`),
+			body(
+				`const { ConfigError } = require("${PKG_NAME}");`,
+				`const { ${fn} } = require("${PKG_NAME}/${subpath}");`
+			)
+		);
+		run("node", [`adapter-${subpath}.mjs`], { cwd: installDir });
+		run("node", [`adapter-${subpath}.cjs`], { cwd: installDir });
 	}
 }
 

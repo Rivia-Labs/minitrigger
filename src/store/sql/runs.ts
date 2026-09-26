@@ -120,8 +120,10 @@ export function createRunStore(exec: SqlExecutor, ctx: SqlContext): RunStore {
 			input.concurrencyKey ?? null,
 			outbox !== undefined,
 		];
+		// `::text`: pg_notify returns `void`, which some ORM raw-query paths cannot deserialize
+		// (Prisma: "Failed to deserialize column of type 'void'"); the column is never read.
 		const notify = sendNotify
-			? `, pg_notify($${params.push(outbox.channel)}::text, '') AS notified`
+			? `, pg_notify($${params.push(outbox.channel)}::text, '')::text AS notified`
 			: "";
 		const insertRun = (source: string) =>
 			`INSERT INTO ${runs} (id, task_id, queue, payload, status, attempt, max_attempts,
@@ -134,9 +136,15 @@ export function createRunStore(exec: SqlExecutor, ctx: SqlContext): RunStore {
 		if (idem) {
 			const key = params.push(idem.key);
 			const ttl = params.push(idem.ttlMs);
+			// Explicit casts on every parameter: an ORM adapter's raw-query path (decision 26, e.g.
+			// Prisma's `$queryRawUnsafe`) can send all bind values with a declared type of `text`
+			// instead of leaving them untyped for Postgres to infer from context. Postgres has no
+			// implicit/assignment cast from `text` to `uuid` (unlike an untyped literal), so `$1`
+			// (run_id) landing in a `uuid` column without `::uuid` fails only through such an
+			// adapter -- node-postgres itself sends parameters untyped and never hits this.
 			sql = `WITH claim AS (
 			     INSERT INTO ${ctx.t("idempotency_keys")} AS k (task_id, key, run_id, expires_at)
-			     VALUES ($2, $${key}, $1,
+			     VALUES ($2::text, $${key}::text, $1::uuid,
 			       CASE WHEN $${ttl}::float8 IS NULL THEN NULL ELSE ${nowPlusMs(`$${ttl}`)} END)
 			     ON CONFLICT (task_id, key) DO UPDATE
 			       SET run_id = EXCLUDED.run_id, expires_at = EXCLUDED.expires_at
@@ -157,7 +165,7 @@ export function createRunStore(exec: SqlExecutor, ctx: SqlContext): RunStore {
 		const { rows: owners } = await db.query<RunRow>(
 			`SELECT ${RUN_COLUMNS} FROM ${runs}
 			 WHERE id = (SELECT run_id FROM ${ctx.t("idempotency_keys")}
-			             WHERE task_id = $1 AND key = $2)`,
+			             WHERE task_id = $1::text AND key = $2::text)`,
 			[input.taskId, idem.key]
 		);
 		const owner = owners[0];

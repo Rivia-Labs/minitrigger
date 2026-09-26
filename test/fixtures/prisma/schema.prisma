@@ -1,0 +1,14 @@
+// Minimal Prisma schema for the ORM adapter integration test (test/integration/adapters.test.ts).
+// Only raw queries are used; the model exists so the generated client has a typed delegate.
+generator client {
+  provider = "prisma-client"
+  output   = "../../../dist-test/prisma-client"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+model Probe {
+  id String @id
+}
