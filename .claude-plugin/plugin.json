@@ -1,0 +1,23 @@
+{
+  "name": "minitrigger",
+  "displayName": "minitrigger",
+  "version": "0.1.0",
+  "description": "Skills to install minitrigger (durable tasks/workflows for Node.js on BullMQ + Redis + Postgres) in any project, refactor dual writes to the transactional outbox pattern, write and review tasks/steps, test them with the in-memory test engine, and debug stuck runs/queues/schedules.",
+  "license": "MIT",
+  "author": {
+    "name": "rivia-labs"
+  },
+  "keywords": [
+    "durable-execution",
+    "workflow",
+    "bullmq",
+    "postgres",
+    "redis",
+    "outbox",
+    "cron",
+    "background-jobs"
+  ],
+  "skills": ["./skills/"],
+  "repository": "https://github.com/igorabreu29/minitrigger",
+  "homepage": "https://github.com/igorabreu29/minitrigger#readme"
+}
