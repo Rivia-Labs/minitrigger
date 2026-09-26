@@ -10,7 +10,7 @@ import { randomUUID } from "node:crypto";
 import { Queue } from "bullmq";
 import { Redis } from "ioredis";
 import { afterEach, beforeAll, describe, expect, it } from "vitest";
-import type { EngineConfig, EngineLogger } from "../../src/config.js";
+import type { BullmqTransportConfig, CommonConfig, EngineLogger } from "../../src/config.js";
 import { createEngine, type Engine } from "../../src/engine.js";
 import { type AnyTask, defineTask } from "../../src/task.js";
 import { useTestNamespace, waitFor } from "../helpers/namespace.js";
@@ -23,7 +23,10 @@ const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 const engines: Engine[] = [];
 const cleanups: (() => Promise<void>)[] = [];
 
-function makeEngine(tasks: AnyTask[], overrides: Partial<EngineConfig> = {}): Engine {
+function makeEngine(
+	tasks: AnyTask[],
+	overrides: Partial<CommonConfig> & Partial<BullmqTransportConfig> = {}
+): Engine {
 	const engine = createEngine({
 		postgres: ns.databaseUrl,
 		redis: ns.redisUrl,

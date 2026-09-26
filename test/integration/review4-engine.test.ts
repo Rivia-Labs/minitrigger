@@ -10,7 +10,7 @@
 import { randomUUID } from "node:crypto";
 import { escapeIdentifier, Pool } from "pg";
 import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
-import type { EngineConfig, EngineLogger } from "../../src/config.js";
+import type { BullmqTransportConfig, CommonConfig, EngineLogger } from "../../src/config.js";
 import { createEngine, type Engine } from "../../src/engine.js";
 import { MinitriggerError } from "../../src/errors.js";
 import type { LeaderElectorConfig } from "../../src/leader.js";
@@ -50,7 +50,10 @@ const quiet: EngineLogger = { debug() {}, info() {}, warn() {}, error() {} };
 const engines: Engine[] = [];
 const pools: Pool[] = [];
 
-function makeEngine(tasks: AnyTask[], overrides: Partial<EngineConfig> = {}): Engine {
+function makeEngine(
+	tasks: AnyTask[],
+	overrides: Partial<CommonConfig> & Partial<BullmqTransportConfig> = {}
+): Engine {
 	const engine = createEngine({
 		postgres: ns.databaseUrl,
 		redis: ns.redisUrl,

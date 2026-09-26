@@ -7,7 +7,7 @@
 import { randomUUID } from "node:crypto";
 import { escapeIdentifier } from "pg";
 import { afterEach, beforeAll, describe, expect, it } from "vitest";
-import type { EngineConfig, EngineLogger } from "../../src/config.js";
+import type { BullmqTransportConfig, CommonConfig, EngineLogger } from "../../src/config.js";
 import { createEngine, type Engine } from "../../src/engine.js";
 import { type AnyTask, defineTask } from "../../src/task.js";
 import { useTestNamespace, waitFor } from "../helpers/namespace.js";
@@ -44,7 +44,10 @@ afterEach(async () => {
 	await Promise.all(engines.splice(0).map(engine => engine.stop()));
 });
 
-async function startedEngine(tasks: AnyTask[], overrides: Partial<EngineConfig> = {}) {
+async function startedEngine(
+	tasks: AnyTask[],
+	overrides: Partial<CommonConfig> & Partial<BullmqTransportConfig> = {}
+) {
 	const engine = createEngine({
 		postgres: ns.databaseUrl,
 		redis: ns.redisUrl,

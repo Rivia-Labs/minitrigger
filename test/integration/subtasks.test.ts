@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { escapeIdentifier } from "pg";
 import { afterEach, beforeAll, describe, expect, it } from "vitest";
-import type { EngineConfig, EngineLogger } from "../../src/config.js";
+import type { BullmqTransportConfig, CommonConfig, EngineLogger } from "../../src/config.js";
 import { createEngine, type Engine } from "../../src/engine.js";
 import { AbortTaskRunError } from "../../src/errors.js";
 import { createRetention } from "../../src/retention.js";
@@ -21,7 +21,10 @@ const testLogger: EngineLogger = { debug: noop, info: noop, warn: noop, error: n
 
 const engines: Engine[] = [];
 
-async function startedEngine(tasks: AnyTask[], overrides: Partial<EngineConfig> = {}) {
+async function startedEngine(
+	tasks: AnyTask[],
+	overrides: Partial<CommonConfig> & Partial<BullmqTransportConfig> = {}
+) {
 	const engine = createEngine({
 		postgres: ns.databaseUrl,
 		redis: ns.redisUrl,

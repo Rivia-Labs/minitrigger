@@ -3,7 +3,7 @@ import { Queue } from "bullmq";
 import { Redis } from "ioredis";
 import { escapeIdentifier } from "pg";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
-import type { EngineConfig, EngineLogger } from "../../src/config.js";
+import type { BullmqTransportConfig, CommonConfig, EngineLogger } from "../../src/config.js";
 import { createEngine, type Engine } from "../../src/engine.js";
 import { AbortTaskRunError, SerializationError } from "../../src/errors.js";
 import { type AnyTask, defineTask, type TokenHandle } from "../../src/task.js";
@@ -30,7 +30,10 @@ const testLogger: EngineLogger = {
 
 const engines: Engine[] = [];
 
-async function startedEngine(tasks: AnyTask[], overrides: Partial<EngineConfig> = {}) {
+async function startedEngine(
+	tasks: AnyTask[],
+	overrides: Partial<CommonConfig> & Partial<BullmqTransportConfig> = {}
+) {
 	const engine = createEngine({
 		postgres: ns.databaseUrl,
 		redis: ns.redisUrl,

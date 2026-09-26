@@ -4,7 +4,12 @@
 import { randomUUID } from "node:crypto";
 import { Client, escapeIdentifier } from "pg";
 import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
-import type { EngineConfig, EngineLogger } from "../../src/config.js";
+import type {
+	BullmqTransportConfig,
+	CommonConfig,
+	EngineConfig,
+	EngineLogger,
+} from "../../src/config.js";
 import { createEngine, type Engine, type RunEvent } from "../../src/engine.js";
 import { ConfigError } from "../../src/errors.js";
 import { defineTask, type RunHandle } from "../../src/task.js";
@@ -16,7 +21,10 @@ const silent: EngineLogger = { debug() {}, info() {}, warn() {}, error() {} };
 const engines: Engine[] = [];
 const t = (table: string) => `${escapeIdentifier(ns.schema)}.${escapeIdentifier(table)}`;
 
-function makeEngine(tasks: EngineConfig["tasks"], overrides: Partial<EngineConfig> = {}): Engine {
+function makeEngine(
+	tasks: EngineConfig["tasks"],
+	overrides: Partial<CommonConfig> & Partial<BullmqTransportConfig> = {}
+): Engine {
 	const engine = createEngine({
 		postgres: ns.databaseUrl,
 		redis: ns.redisUrl,

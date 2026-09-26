@@ -1,7 +1,7 @@
 /** Phase 7: `engine.events.on(...)` local run events. */
 import { randomUUID } from "node:crypto";
 import { afterEach, beforeAll, describe, expect, it } from "vitest";
-import type { EngineConfig, EngineLogger } from "../../src/config.js";
+import type { BullmqTransportConfig, CommonConfig, EngineLogger } from "../../src/config.js";
 import { createEngine, type Engine, type RunEvent } from "../../src/engine.js";
 import { AbortTaskRunError } from "../../src/errors.js";
 import { type AnyTask, defineTask } from "../../src/task.js";
@@ -18,7 +18,10 @@ const testLogger: EngineLogger = {
 };
 const engines: Engine[] = [];
 
-function makeEngine(tasks: AnyTask[], overrides: Partial<EngineConfig> = {}): Engine {
+function makeEngine(
+	tasks: AnyTask[],
+	overrides: Partial<CommonConfig> & Partial<BullmqTransportConfig> = {}
+): Engine {
 	const engine = createEngine({
 		postgres: ns.databaseUrl,
 		redis: ns.redisUrl,

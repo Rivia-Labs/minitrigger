@@ -7,7 +7,12 @@ import { Queue } from "bullmq";
 import { Redis } from "ioredis";
 import { escapeIdentifier } from "pg";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
-import type { EngineConfig, EngineLogger } from "../../src/config.js";
+import type {
+	BullmqTransportConfig,
+	CommonConfig,
+	EngineConfig,
+	EngineLogger,
+} from "../../src/config.js";
 import { createEngine, type Engine } from "../../src/engine.js";
 import { ConfigError } from "../../src/errors.js";
 import { defineTask } from "../../src/task.js";
@@ -22,7 +27,10 @@ const engines: Engine[] = [];
 let raw: Redis;
 const rawQueues: Array<{ queue: Queue; connection: Redis }> = [];
 
-function makeEngine(tasks: EngineConfig["tasks"], overrides: Partial<EngineConfig> = {}): Engine {
+function makeEngine(
+	tasks: EngineConfig["tasks"],
+	overrides: Partial<CommonConfig> & Partial<BullmqTransportConfig> = {}
+): Engine {
 	const engine = createEngine({
 		postgres: ns.databaseUrl,
 		redis: ns.redisUrl,

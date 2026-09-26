@@ -5,7 +5,7 @@
 import { randomUUID } from "node:crypto";
 import { Client, escapeIdentifier, type PoolClient } from "pg";
 import { afterEach, beforeAll, describe, expect, it } from "vitest";
-import type { EngineConfig, EngineLogger } from "../../src/config.js";
+import type { BullmqTransportConfig, CommonConfig, EngineLogger } from "../../src/config.js";
 import { createEngine, type Engine } from "../../src/engine.js";
 import { ConfigError } from "../../src/errors.js";
 import { migrate } from "../../src/migrations/migrate.js";
@@ -29,7 +29,7 @@ const logger: EngineLogger = {
 const engines: Engine[] = [];
 function makeEngine(
 	tasks: AnyTask[],
-	overrides: Partial<EngineConfig> = {},
+	overrides: Partial<CommonConfig> & Partial<BullmqTransportConfig> = {},
 	namespace = ns
 ): Engine {
 	const engine = createEngine({

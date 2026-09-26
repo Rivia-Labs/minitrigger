@@ -1555,6 +1555,13 @@ export function createEngine(config: EngineConfig): Engine {
 	}
 
 	const store: Store = createSqlStore(pool, resolved.schema);
+	// The Postgres-only transport (`transport: "postgres"`) is not implemented yet (task 2 of the
+	// Postgres transport plan only resolves its config); everything from here down is BullMQ-only
+	// and is moving to `src/backends/bullmq.ts` in a later task, at which point this guard becomes
+	// that backend's entry point instead of a dead end.
+	if (resolved.redis === undefined) {
+		throw new ConfigError('transport "postgres" is not implemented yet');
+	}
 	const connections = createRedisConnections(resolved.redis, {
 		onError: (error, purpose) =>
 			logger.debug({ err: error, purpose }, "redis connection error (ioredis reconnects)"),

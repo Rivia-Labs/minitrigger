@@ -3,7 +3,11 @@ import { Queue } from "bullmq";
 import { Redis } from "ioredis";
 import { escapeIdentifier } from "pg";
 import { afterEach, beforeAll, describe, expect, it } from "vitest";
-import { type EngineConfig, type EngineLogger } from "../../src/config.js";
+import {
+	type BullmqTransportConfig,
+	type CommonConfig,
+	type EngineLogger,
+} from "../../src/config.js";
 import { createEngine, type Engine } from "../../src/engine.js";
 import {
 	AbortTaskRunError,
@@ -36,7 +40,7 @@ const cleanups: Array<() => Promise<void>> = [];
 
 function makeEngine(
 	tasks: AnyTask[],
-	overrides: Partial<EngineConfig> = {},
+	overrides: Partial<CommonConfig> & Partial<BullmqTransportConfig> = {},
 	namespace: TestNamespace = ns
 ): Engine {
 	const engine = createEngine({

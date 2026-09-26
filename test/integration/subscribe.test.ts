@@ -4,7 +4,7 @@
  */
 import { randomUUID } from "node:crypto";
 import { afterEach, beforeAll, describe, expect, it } from "vitest";
-import type { EngineConfig, EngineLogger } from "../../src/config.js";
+import type { BullmqTransportConfig, CommonConfig, EngineLogger } from "../../src/config.js";
 import { createEngine, type Engine, type RunStatusUpdate } from "../../src/engine.js";
 import { type AnyTask, defineTask } from "../../src/task.js";
 import { useTestNamespace, waitFor } from "../helpers/namespace.js";
@@ -14,7 +14,10 @@ const shortId = () => randomUUID().slice(0, 8);
 const silent: EngineLogger = { debug() {}, info() {}, warn() {}, error() {} };
 const engines: Engine[] = [];
 
-function makeEngine(tasks: AnyTask[], overrides: Partial<EngineConfig> = {}): Engine {
+function makeEngine(
+	tasks: AnyTask[],
+	overrides: Partial<CommonConfig> & Partial<BullmqTransportConfig> = {}
+): Engine {
 	const engine = createEngine({
 		postgres: ns.databaseUrl,
 		redis: ns.redisUrl,

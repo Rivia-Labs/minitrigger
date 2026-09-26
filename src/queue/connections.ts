@@ -1,4 +1,5 @@
 import { Redis } from "ioredis";
+import type { RedisLike } from "../config.js";
 
 /** What a dedicated connection is used for; see {@link RedisConnections.dedicated}. */
 export type DedicatedPurpose = "worker" | "subscriber" | "stream";
@@ -62,7 +63,7 @@ export interface RedisConnectionsOptions {
 }
 
 export function createRedisConnections(
-	input: string | { connection: Redis },
+	input: string | { connection: RedisLike },
 	options: RedisConnectionsOptions = {}
 ): RedisConnections {
 	const owned: Redis[] = [];
@@ -84,7 +85,12 @@ export function createRedisConnections(
 		};
 	}
 
-	const injected = input.connection;
+	// `RedisLike` is a structural subset of the public types (config.ts's `EngineConfig.redis`, so
+	// they never need to import `ioredis`); this module is only reachable by the BullMQ backend, so
+	// an injected connection is, in practice, always a real `ioredis` `Redis` instance -- the cast
+	// crosses back to it here, the one place that actually needs `.duplicate()` to return something
+	// usable as a `Worker`/subscriber connection.
+	const injected = input.connection as unknown as Redis;
 
 	return {
 		shared: () => injected,

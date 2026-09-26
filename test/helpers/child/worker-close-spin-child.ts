@@ -14,7 +14,12 @@
 import { randomUUID } from "node:crypto";
 import net from "node:net";
 import { escapeIdentifier, Pool } from "pg";
-import type { EngineConfig, EngineLogger } from "../../../src/config.js";
+import type {
+	BullmqTransportConfig,
+	CommonConfig,
+	EngineConfig,
+	EngineLogger,
+} from "../../../src/config.js";
 import { createEngine } from "../../../src/engine.js";
 import { type AnyTask, defineTask } from "../../../src/task.js";
 
@@ -93,7 +98,10 @@ async function redisProxy(): Promise<{ url: string; kill(): Promise<void> }> {
 	};
 }
 
-function baseConfig(tasks: AnyTask[], overrides: Partial<EngineConfig>): EngineConfig {
+function baseConfig(
+	tasks: AnyTask[],
+	overrides: Partial<CommonConfig> & Partial<BullmqTransportConfig>
+): EngineConfig {
 	return {
 		postgres: databaseUrl,
 		redis: redisUrl,

@@ -11,7 +11,7 @@
 import { randomUUID } from "node:crypto";
 import { Pool, type PoolClient } from "pg";
 import { afterEach, beforeAll, describe, expect, it } from "vitest";
-import type { EngineConfig, EngineLogger } from "../../src/config.js";
+import type { BullmqTransportConfig, CommonConfig, EngineLogger } from "../../src/config.js";
 import { createEngine, type Engine, type RunEvent } from "../../src/engine.js";
 import { createSqlStore } from "../../src/store/sql/index.js";
 import { RUN_COLUMNS } from "../../src/store/sql/resolve.js";
@@ -25,7 +25,10 @@ const testLogger: EngineLogger = { debug() {}, info() {}, warn() {}, error() {} 
 const engines: Engine[] = [];
 const pools: Pool[] = [];
 
-function makeEngine(tasks: AnyTask[], overrides: Partial<EngineConfig> = {}): Engine {
+function makeEngine(
+	tasks: AnyTask[],
+	overrides: Partial<CommonConfig> & Partial<BullmqTransportConfig> = {}
+): Engine {
 	const engine = createEngine({
 		postgres: ns.databaseUrl,
 		redis: ns.redisUrl,

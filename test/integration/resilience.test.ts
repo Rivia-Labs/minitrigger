@@ -7,7 +7,7 @@
 import { randomUUID } from "node:crypto";
 import { escapeIdentifier } from "pg";
 import { afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
-import type { EngineConfig, EngineLogger } from "../../src/config.js";
+import type { BullmqTransportConfig, CommonConfig, EngineLogger } from "../../src/config.js";
 import { createEngine, type Engine } from "../../src/engine.js";
 import { createSqlStore } from "../../src/store/sql/index.js";
 import type { Store } from "../../src/store/types.js";
@@ -35,7 +35,11 @@ function loggerFor(engine: string): EngineLogger {
 const engines: Engine[] = [];
 let store: Store;
 
-function makeEngine(tasks: AnyTask[], overrides: Partial<EngineConfig> = {}, name = "a"): Engine {
+function makeEngine(
+	tasks: AnyTask[],
+	overrides: Partial<CommonConfig> & Partial<BullmqTransportConfig> = {},
+	name = "a"
+): Engine {
 	const engine = createEngine({
 		postgres: ns.databaseUrl,
 		redis: ns.redisUrl,
