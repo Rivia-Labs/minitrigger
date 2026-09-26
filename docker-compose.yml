@@ -5,6 +5,9 @@ services:
       POSTGRES_USER: minitrigger
       POSTGRES_PASSWORD: minitrigger
       POSTGRES_DB: minitrigger
+    # The integration project runs its files in parallel, each with its own engines and pools;
+    # the default 100 connections is hit at peak ("too many clients already").
+    command: ["postgres", "-c", "max_connections=300"]
     ports:
       - "54329:5432"
     healthcheck:

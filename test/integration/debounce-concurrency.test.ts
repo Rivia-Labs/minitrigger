@@ -206,13 +206,18 @@ describe("debounce (decision 24)", () => {
 		});
 		const a = makeEngine([task]);
 		const b = makeEngine([task]);
-		await a.start();
+		// No worker runs during the burst: an acquisition between two triggers clears the key, and
+		// the next trigger then legitimately creates a second pending run (decision 24). With a
+		// worker up, a trigger stalled past `delay` (e.g. waiting on a pool connection under load)
+		// would make this test depend on timing instead of on the collapse itself.
 		const handles = await Promise.all(
 			Array.from({ length: 20 }, (_, n) =>
 				(n % 2 === 0 ? a : b).trigger(task, { n }, { debounce: { key: "race", delay: 500 } })
 			)
 		);
 		expect(new Set(handles.map(h => h.id)).size).toBe(1);
+		expect(await runsOf(a, task.id)).toHaveLength(1);
+		await a.start();
 		await waitAllCompleted(a, task.id, 1);
 		const run = await a.runs.get(handles[0]?.id ?? "");
 		expect(run?.attempt).toBe(1);
