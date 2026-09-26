@@ -5,7 +5,7 @@
   "description": "Skills to install minitrigger (durable tasks/workflows for Node.js on BullMQ + Redis + Postgres) in any project, refactor dual writes to the transactional outbox pattern, write and review tasks/steps, test them with the in-memory test engine, and debug stuck runs/queues/schedules.",
   "license": "MIT",
   "author": {
-    "name": "rivia-labs"
+    "name": "igorabreu29"
   },
   "keywords": [
     "durable-execution",

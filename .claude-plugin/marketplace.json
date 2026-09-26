@@ -1,6 +1,6 @@
 {
   "name": "minitrigger",
-  "owner": { "name": "rivia-labs" },
+  "owner": { "name": "igorabreu29" },
   "description": "Claude Code plugin for adopting @rivia-labs/minitrigger (durable tasks/workflows on BullMQ + Redis + Postgres) in TypeScript/Node.js projects.",
   "plugins": [
     {
