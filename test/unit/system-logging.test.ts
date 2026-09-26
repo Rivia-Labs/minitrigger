@@ -2,7 +2,7 @@
  * Audit item (d): failures of the `waitpoint-expire` and `retention` system jobs are logged
  * (then rethrown, so BullMQ records the failure) instead of vanishing with `removeOnFail`.
  */
-import { DelayedError, type Job } from "bullmq";
+import type { Job } from "bullmq";
 import { describe, expect, it, vi } from "vitest";
 import type { EngineLogger } from "../../src/config.js";
 import {
@@ -10,6 +10,7 @@ import {
 	createSystemDispatcher,
 	type SystemDeps,
 } from "../../src/executor/index.js";
+import { SystemJobDelayed } from "../../src/executor/system.js";
 import { buildRegistry } from "../../src/registry.js";
 import type { Store } from "../../src/store/types.js";
 
@@ -65,7 +66,7 @@ describe("system jobs: failures are logged", () => {
 		expect(error?.message).toMatch(/waitpoint-expire/);
 	});
 
-	it("waitpoint-expire: the not_due re-delay (DelayedError) is not logged as a failure", async () => {
+	it("waitpoint-expire: the not_due re-delay (SystemJobDelayed) is not logged as a failure", async () => {
 		const { d, logger } = deps({
 			waitpoints: { expire: async () => ({ kind: "not_due", delayMs: 10 }) },
 		});
@@ -74,7 +75,7 @@ describe("system jobs: failures are logged", () => {
 
 		await expect(
 			dispatch("waitpoint-expire", { waitpointId: "w1" }, job({}, { moveToDelayed }))
-		).rejects.toBeInstanceOf(DelayedError);
+		).rejects.toBeInstanceOf(SystemJobDelayed);
 
 		expect(logger.calls.some(c => c.level === "error")).toBe(false);
 	});

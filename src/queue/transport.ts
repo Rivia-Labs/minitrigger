@@ -1,6 +1,7 @@
-import { Job, Queue, Worker } from "bullmq";
+import { DelayedError, Job, Queue, Worker } from "bullmq";
 import type { EngineLogger } from "../config.js";
 import { ConfigError, MinitriggerError } from "../errors.js";
+import { SystemJobDelayed } from "../executor/system.js";
 import { validateQueueName, validateSqlIdentifier } from "../utils/identifiers.js";
 import type { RedisConnections } from "./connections.js";
 import { runJobId, SCHEDULE_TICK_JOB_NAME, systemQueueName } from "./ids.js";
@@ -592,7 +593,14 @@ export function createTransport(options: CreateTransportOptions): Transport {
 		const systemWorker = new Worker(
 			sysQueueName,
 			job =>
-				trackActive(SYSTEM_QUEUE_LABEL, job.id, () => opts.processSystem(job.name, job.data, job)),
+				trackActive(SYSTEM_QUEUE_LABEL, job.id, () =>
+					opts.processSystem(job.name, job.data, job).catch((error: unknown) => {
+						// The handler already moved the job with `job.moveToDelayed`; BullMQ needs its
+						// own `DelayedError` to leave it there instead of failing it.
+						if (error instanceof SystemJobDelayed) throw new DelayedError();
+						throw error;
+					})
+				),
 			{
 				connection: connections.dedicated("worker"),
 				prefix,
