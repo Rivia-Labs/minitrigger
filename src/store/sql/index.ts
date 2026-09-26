@@ -9,7 +9,7 @@ import type {
 	SystemJobStore,
 } from "../types.js";
 import { createRunClaimStore } from "./claim.js";
-import { createSqlContext, type SqlExecutor, type SqlQueryable } from "./db.js";
+import { checkOut, createSqlContext, type SqlExecutor, type SqlQueryable } from "./db.js";
 import { createIdempotencyStore } from "./idempotency.js";
 import { createLogStore } from "./logs.js";
 import { createQueueStateStore } from "./queues.js";
@@ -56,7 +56,7 @@ export function createSqlStore(pool: Pool, schema: string): SqlStore {
 		meta: createSchemaMetaStore(poolExec, ctx),
 
 		async withTransaction<T>(fn: (tx: StoreTx) => Promise<T>): Promise<T> {
-			const client = await pool.connect();
+			const { client, release } = await checkOut(pool);
 			try {
 				await client.query("BEGIN");
 
@@ -73,14 +73,14 @@ export function createSqlStore(pool: Pool, schema: string): SqlStore {
 
 				const result = await fn(tx);
 				await client.query("COMMIT");
-				client.release();
+				release();
 				return result;
 			} catch (err) {
 				await client.query("ROLLBACK").catch(() => {
 					// Best-effort: the connection may already be unusable, which is why we also
 					// destroy the client below regardless of whether ROLLBACK itself succeeded.
 				});
-				client.release(err instanceof Error ? err : new Error(String(err)));
+				release(err instanceof Error ? err : new Error(String(err)));
 				throw err;
 			}
 		},

@@ -1,4 +1,5 @@
 import { escapeIdentifier, type Pool } from "pg";
+import { checkOut } from "../store/sql/db.js";
 import { validateSqlIdentifier } from "../utils/identifiers.js";
 import { MIGRATIONS } from "./index.js";
 
@@ -22,7 +23,7 @@ export async function migrate(pool: Pool, schema: string): Promise<MigrateResult
 	validateSqlIdentifier("schema", schema);
 	const quotedSchema = escapeIdentifier(schema);
 
-	const client = await pool.connect();
+	const { client, release } = await checkOut(pool);
 	let queryError: Error | undefined;
 	try {
 		await client.query("BEGIN");
@@ -83,7 +84,7 @@ export async function migrate(pool: Pool, schema: string): Promise<MigrateResult
 		});
 		throw error;
 	} finally {
-		client.release(queryError);
+		release(queryError);
 	}
 }
 

@@ -1,4 +1,4 @@
-import { escapeIdentifier, type Pool, type QueryResultRow } from "pg";
+import { escapeIdentifier, type Pool, type PoolClient, type QueryResultRow } from "pg";
 
 /**
  * The minimal client a transaction-bound repository needs: node-postgres `PoolClient`/`Client`
@@ -56,22 +56,49 @@ function wrap(client: SqlQueryable): Db {
 }
 
 /**
+ * A client checked out of `pool` with a no-op `error` listener attached until `release`. pg-pool
+ * removes its own listener from a checked-out client, and `pg` emits an `error` event when the
+ * socket ends unexpectedly (a terminated backend, a failover) -- even after the in-flight query
+ * already rejected, or while the client sits idle in a transaction. Without a listener that event
+ * is an uncaught exception that crashes the host process. The failure itself still surfaces as the
+ * rejection of the next (or current) query. `release(err)` detaches the listener first (pg-pool
+ * re-adds its own), so a reused client never accumulates listeners.
+ */
+export async function checkOut(
+	pool: Pool
+): Promise<{ client: PoolClient; release(err?: Error): void }> {
+	const client = await pool.connect();
+	const onError = () => {};
+	client.on("error", onError);
+	let released = false;
+	return {
+		client,
+		release(err) {
+			if (released) return;
+			released = true;
+			client.removeListener("error", onError);
+			client.release(err);
+		},
+	};
+}
+
+/**
  * Runs `fn` atomically. On a pool executor it opens BEGIN/COMMIT on a dedicated client and
  * destroys the client on failure; on a tx executor it runs inside the caller's transaction.
  * Never hold one of these open while user code runs (SPEC §6).
  */
 export async function atomic<T>(exec: SqlExecutor, fn: (db: Db) => Promise<T>): Promise<T> {
 	if (exec.kind === "tx") return fn(wrap(exec.client));
-	const client = await exec.pool.connect();
+	const { client, release } = await checkOut(exec.pool);
 	try {
 		await client.query("BEGIN");
 		const result = await fn(wrap(client));
 		await client.query("COMMIT");
-		client.release();
+		release();
 		return result;
 	} catch (err) {
 		await client.query("ROLLBACK").catch(() => {});
-		client.release(err instanceof Error ? err : new Error(String(err)));
+		release(err instanceof Error ? err : new Error(String(err)));
 		throw err;
 	}
 }
