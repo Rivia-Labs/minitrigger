@@ -73,6 +73,49 @@ export function defineDebounceConcurrencyContractSuite(get: () => StoreHarness):
 			expect((await s().runs.list({ taskId: "task-d", limit: 10 })).items).toHaveLength(1);
 		});
 
+		it("a pending run already due no longer absorbs a trigger: its key is released and a new run opens", async () => {
+			const first = await s().runs.create(newRun({ payload: { n: 1 }, debounce: debounce() }));
+			if (first.kind !== "created") throw new Error("expected created");
+			// Its delay has elapsed (run_after = now() - 1s) but nothing acquired it yet.
+			await get().advance(11_000);
+			const before = await s().runs.get(first.run.id);
+
+			const second = await s().runs.create(newRun({ payload: { n: 2 }, debounce: debounce() }));
+			if (second.kind !== "created") throw new Error(`expected created, got ${second.kind}`);
+			expect(second.run.id).not.toBe(first.run.id);
+			expect(second.run.debounceKey).toBe("k1");
+			expect(second.run.payload).toEqual({ n: 2 });
+			expect(second.enqueue.delayMs).toBeGreaterThan(10_000 - SLACK_MS);
+
+			const old = await s().runs.get(first.run.id);
+			expect(old?.debounceKey).toBeNull();
+			expect(old?.status).toBe("queued");
+			expect(old?.payload).toEqual({ n: 1 });
+			expect(old?.runAfter?.getTime()).toBe(before?.runAfter?.getTime());
+			expect(old?.enqueueSeq).toBe(before?.enqueueSeq);
+
+			// The next trigger collapses into the new run, never into the due one.
+			const third = await s().runs.create(newRun({ payload: { n: 3 }, debounce: debounce() }));
+			if (third.kind !== "debounced") throw new Error(`expected debounced, got ${third.kind}`);
+			expect(third.run.id).toBe(second.run.id);
+			expect((await s().runs.get(first.run.id))?.payload).toEqual({ n: 1 });
+		});
+
+		it("maxDelay reached: the pinned run stops absorbing once due and the key rolls to a new run", async () => {
+			const opts = debounce({ delayMs: 1_000, maxDelayMs: 3_000 });
+			const first = await s().runs.create(newRun({ debounce: opts }));
+			for (let i = 0; i < 3; i++) {
+				await get().advance(900);
+				const collapsed = await s().runs.create(newRun({ payload: { n: i }, debounce: opts }));
+				expect(collapsed.run.id).toBe(first.run.id);
+			}
+			await get().advance(1_000); // past the 3 s deadline
+			const next = await s().runs.create(newRun({ payload: { n: 9 }, debounce: opts }));
+			expect(next.kind).toBe("created");
+			expect(next.run.id).not.toBe(first.run.id);
+			expect((await s().runs.get(first.run.id))?.debounceKey).toBeNull();
+		});
+
 		it("payload first keeps the original payload", async () => {
 			const first = await s().runs.create(newRun({ debounce: debounce({ payload: "first" }) }));
 			const second = await s().runs.create(

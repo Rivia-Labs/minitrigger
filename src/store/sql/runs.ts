@@ -187,13 +187,22 @@ export function createRunStore(exec: SqlExecutor, ctx: SqlContext): RunStore {
 		input: NewRun,
 		debounce: NewRunDebounce
 	): Promise<CreateOnce> {
-		const { rows: found } = await db.query<{ id: string; enqueue_seq: number }>(
-			`SELECT id, enqueue_seq FROM ${runs}
+		const { rows: found } = await db.query<{ id: string; enqueue_seq: number; due: boolean }>(
+			`SELECT id, enqueue_seq, run_after <= now() AS due FROM ${runs}
 			 WHERE task_id = $1 AND debounce_key = $2 AND status = 'queued'
 			 FOR UPDATE`,
 			[input.taskId, debounce.key]
 		);
-		const existing = found[0];
+		let existing = found[0];
+		if (existing?.due) {
+			// Decision 24: a pending run already due (its delay/maxDelay deadline reached) no longer
+			// absorbs triggers. Its key is released (nothing else on the row changes, so the run keeps
+			// its payload, run_after and seq) and this trigger opens a new window below. Otherwise a
+			// key triggered faster than acquisition keeps the row locked by collapses and a
+			// `SKIP LOCKED` claim (decision 28(a)) never gets it.
+			await db.query(`UPDATE ${runs} SET debounce_key = NULL WHERE id = $1`, [existing.id]);
+			existing = undefined;
+		}
 		if (existing) {
 			// Audit item 1: `enqueue_seq` (and thus `updated_at`'s worth of rescheduling) only
 			// advances when the recomputed `run_after` actually differs from the locked row's

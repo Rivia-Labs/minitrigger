@@ -125,8 +125,14 @@ NULL), now())`, status stays `waiting`, return `EnqueueRequest`. Otherwise retur
 
 **Debounced create** (dec. 24; `NewRun.delayMs` ignored, `idempotency` together with `debounce`
 throws). Loop (bounded; exhausted → `MinitriggerError`, not a plain `Error`), each attempt one tx:
-`SELECT id, enqueue_seq FROM runs WHERE task_id AND debounce_key AND status='queued' FOR UPDATE`.
-Found → `UPDATE runs SET run_after = least(now()+delay, debounce_deadline), payload = CASE last
+`SELECT id, enqueue_seq, run_after <= now() AS due FROM runs WHERE task_id AND debounce_key AND
+status='queued' FOR UPDATE`. Found but **due** (its delay/`maxDelay` deadline already reached, not
+acquired yet) → it no longer absorbs triggers: `UPDATE runs SET debounce_key = NULL WHERE id` (only
+the key; payload, `run_after`, `enqueue_seq`, `updated_at` untouched, no enqueue) and the trigger
+continues as "Not found" below, opening a new pending run with its own window. Without this, a key
+triggered faster than acquisition keeps the due row locked by collapses and the Postgres transport's
+`SKIP LOCKED` claim never gets it; the memory store applies the same rule (`runAfter <= now`).
+Found (not due) → `UPDATE runs SET run_after = least(now()+delay, debounce_deadline), payload = CASE last
 THEN $new ELSE payload END, enqueue_seq = CASE WHEN least(now()+delay, debounce_deadline) IS
 DISTINCT FROM run_after THEN enqueue_seq+1 ELSE enqueue_seq END, updated_at = now() RETURNING`
 (the `enqueue_seq`/`run_after` comparison reads the row as it stood BEFORE this UPDATE, simultaneous-

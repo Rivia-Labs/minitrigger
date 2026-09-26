@@ -172,51 +172,43 @@ describeTransports("debounce-concurrency", transport => {
 			expect(waited).toBeLessThan(2_500);
 		});
 
-		// Postgres mode skipped, OPEN ISSUE (task 11 report, NEEDS_CONTEXT): a hot debounce key keeps
-		// the pending row locked by the collapse's `FOR UPDATE` almost continuously, and the claim's
-		// `SKIP LOCKED` (decision 28(a), spec §4 "Claim demora") skips it every pass, so no run ever
-		// starts while the burst lasts (verified: a blocking claim makes this pass). Needs an owner
-		// decision on the claim/collapse design.
-		it.skipIf(transport === "postgres")(
-			"a continuous burst faster than acquisition still runs periodically (audit item 1)",
-			async () => {
-				const task = defineTask({ id: `deb-burst-${shortId()}`, run: async () => "ok" });
-				const engine = makeEngine([task]);
-				await engine.start();
-				let stop = false;
-				// A few concurrent hammers (not one sequential loop) so there is almost always a collapse
-				// in flight -- including right when a worker is about to acquire the pinned job -- far
-				// faster than a single request/response round trip could manage alone. Kept modest (not a
-				// wider fan-out) since vitest runs integration files in parallel against the same shared
-				// local Postgres/Redis: this only needs to be fast enough to win the race sometimes, not
-				// to maximize DB load.
-				const hammers = Array.from({ length: 6 }, () =>
-					(async () => {
-						while (!stop) {
-							await engine.trigger(task, undefined, {
-								debounce: { key: "k", delay: 150, maxDelay: 250 },
-							});
-						}
-					})()
+		it("a continuous burst faster than acquisition still runs periodically (audit item 1)", async () => {
+			const task = defineTask({ id: `deb-burst-${shortId()}`, run: async () => "ok" });
+			const engine = makeEngine([task]);
+			await engine.start();
+			let stop = false;
+			// A few concurrent hammers (not one sequential loop) so there is almost always a collapse
+			// in flight -- including right when a worker is about to acquire the pinned job -- far
+			// faster than a single request/response round trip could manage alone. Kept modest (not a
+			// wider fan-out) since vitest runs integration files in parallel against the same shared
+			// local Postgres/Redis: this only needs to be fast enough to win the race sometimes, not
+			// to maximize DB load.
+			const hammers = Array.from({ length: 6 }, () =>
+				(async () => {
+					while (!stop) {
+						await engine.trigger(task, undefined, {
+							debounce: { key: "k", delay: 150, maxDelay: 250 },
+						});
+					}
+				})()
+			);
+			try {
+				// The bug: the collapse UPDATE always bumped enqueue_seq (and re-enqueued) even once
+				// run_after was already pinned at the deadline, fencing every job the instant a newer
+				// trigger's collapse committed -- with triggers this fast, no run ever acquired while
+				// the burst kept going, breaking the README promise that a key "runs periodically".
+				// The fix leaves an unchanged run_after (and its seq/job) alone, so a few runs must
+				// complete WHILE the burst is still in flight.
+				await waitFor(
+					async () =>
+						(await runsOf(engine, task.id)).filter(r => r.status === "completed").length >= 3,
+					{ timeoutMs: 12_000, intervalMs: 25 }
 				);
-				try {
-					// The bug: the collapse UPDATE always bumped enqueue_seq (and re-enqueued) even once
-					// run_after was already pinned at the deadline, fencing every job the instant a newer
-					// trigger's collapse committed -- with triggers this fast, no run ever acquired while
-					// the burst kept going, breaking the README promise that a key "runs periodically".
-					// The fix leaves an unchanged run_after (and its seq/job) alone, so a few runs must
-					// complete WHILE the burst is still in flight.
-					await waitFor(
-						async () =>
-							(await runsOf(engine, task.id)).filter(r => r.status === "completed").length >= 3,
-						{ timeoutMs: 12_000, intervalMs: 25 }
-					);
-				} finally {
-					stop = true;
-					await Promise.all(hammers);
-				}
+			} finally {
+				stop = true;
+				await Promise.all(hammers);
 			}
-		);
+		});
 
 		it("two processes racing the same key make one run", async () => {
 			const task = defineTask({
