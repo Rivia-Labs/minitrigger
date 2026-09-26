@@ -24,6 +24,11 @@ const ADAPTER = "knexTx";
  * occurrence) and every literal `?` (jsonb operators, string literals) is escaped as `\?`, so
  * values always travel as bind parameters.
  *
+ * knex applies your `postProcessResponse` hook to these raw results too (it offers no public way
+ * to skip it per query). A key-renaming hook (e.g. snake_case -> camelCase) is fine: the engine's
+ * `tx` path only reads the new run's `id`, which every case transform keeps. A hook that renames
+ * `id` itself or reshapes the result beyond `{ rows }`/a row array is not supported.
+ *
  * Throws `ConfigError` for the knex instance itself (not a transaction: each statement would
  * autocommit) or a transaction that already committed/rolled back.
  */

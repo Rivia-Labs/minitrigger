@@ -480,3 +480,52 @@ describe("drizzleTx: reused after its transaction ended (pool max 1)", () => {
 		}
 	});
 });
+
+// ---------------------------------------------------------------- TypeORM: non-transactional manager
+// Review 3 item 2: the real `dataSource.manager` (no own `queryRunner`, no `startTransaction`)
+// used to pass as a plain client: the INSERT ran in autocommit, then trigger threw a TypeError --
+// leaving a committed run (outbox_pending) even when the caller's business transaction rolled back.
+describe("TypeORM: raw dataSource.manager / DataSource as tx", () => {
+	let ds: DataSource;
+	beforeAll(async () => {
+		ds = new DataSource({ type: "postgres", url: ns.databaseUrl, poolSize: 2 });
+		await ds.initialize();
+	});
+	afterAll(() => ds.destroy());
+
+	it.each([
+		["dataSource.manager", () => ds.manager],
+		["the DataSource", () => ds],
+	])("%s: ConfigError pointing at the adapter, and no run row", async (_label, handle) => {
+		const { task } = recorder();
+		const engine = makeEngine([task]);
+		const count = async () =>
+			Number(
+				(
+					await ns.pool.query<{ n: string }>(
+						`SELECT count(*) AS n FROM ${t("runs")} WHERE task_id = $1`,
+						[task.id]
+					)
+				).rows[0]?.n
+			);
+		await expect(
+			engine.trigger(
+				task,
+				{ n: 7, tags: [], note: "" },
+				{
+					tx: handle() as unknown as TransactionClient,
+				}
+			)
+		).rejects.toThrow(ConfigError);
+		await expect(
+			engine.trigger(
+				task,
+				{ n: 7, tags: [], note: "" },
+				{
+					tx: handle() as unknown as TransactionClient,
+				}
+			)
+		).rejects.toThrow(/@rivia-labs\/minitrigger\/typeorm/);
+		expect(await count()).toBe(0);
+	});
+});

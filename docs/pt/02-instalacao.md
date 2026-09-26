@@ -70,14 +70,20 @@ partir do disco:
 
 ```bash
 gh release download v0.2.0 -R igorabreu29/minitrigger -p "*.tgz"
-pnpm add ./rivia-labs-minitrigger-0.2.0.tgz bullmq ioredis pg
+pnpm add ./minitrigger-0.2.0.tgz bullmq ioredis pg
 pnpm add -D @types/pg
 ```
+
+(o tarball da `v0.2.0` se chama `minitrigger-0.2.0.tgz` — sem escopo, ver nota abaixo; a partir da
+`v0.3.0` é `rivia-labs-minitrigger-<versão>.tgz`, e o comando de instalação usa
+`@rivia-labs/minitrigger` como na seção "Recomendada: registry npm" acima.)
 
 O tarball já contém o `dist/` buildado — nada é compilado na instalação: sem precisar do
 `allowBuilds` do pnpm, e sem puxar transitivamente `ioredis`/`msgpackr-extract` só para rodar um
 script de build. É também fixo e reproduzível: um artefato específico por versão, não "o que quer
-que o `HEAD` contenha agora".
+que o `HEAD` contenha agora". O `files` do `package.json` também inclui o plugin de Claude Code
+deste pacote (`.claude-plugin`, `skills`, `docs/pt`) — nada disso é importado pela biblioteca em
+si, é só conteúdo extra para quem instala dentro de um projeto Claude Code.
 
 > Releases até `v0.2.0` (inclusive) foram publicadas sob o nome sem escopo `minitrigger` (o
 > tarball e seu `package.json` dizem `minitrigger`, não `@rivia-labs/minitrigger`) — isso só

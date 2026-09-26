@@ -1,6 +1,6 @@
 import { Job, Queue, Worker } from "bullmq";
 import type { EngineLogger } from "../config.js";
-import { ConfigError } from "../errors.js";
+import { ConfigError, MinitriggerError } from "../errors.js";
 import { validateQueueName, validateSqlIdentifier } from "../utils/identifiers.js";
 import type { RedisConnections } from "./connections.js";
 import { runJobId, SCHEDULE_TICK_JOB_NAME, systemQueueName } from "./ids.js";
@@ -100,7 +100,8 @@ export interface CloseWorkersOptions {
 	/**
 	 * Called after the wait (timed out or not) and BEFORE any `Queue`/connection is closed, with
 	 * the jobs still active at that point. The engine uses it to release still-running runs and
-	 * re-enqueue them (decision 20), which needs the queues to still be open. Errors are ignored.
+	 * re-enqueue them (decision 20), which needs the queues to still be open. Errors are logged
+	 * (`warn`) and closing continues.
 	 */
 	beforeClose?: (stillActive: StillActiveJob[]) => Promise<void>;
 }
@@ -539,11 +540,24 @@ export function createTransport(options: CreateTransportOptions): Transport {
 		}
 	}
 
+	/**
+	 * Review 3: `closeWorkers()` may run while `createWorkers` awaits (a stop() that gave up on a
+	 * slow start()); a Worker created after it would never be closed.
+	 */
+	function assertNotClosing(): void {
+		if (closing) {
+			throw new MinitriggerError(
+				"the transport is closing (engine.stop() was called); no new worker"
+			);
+		}
+	}
+
 	async function createWorkers(
 		opts: StartWorkersOptions,
 		targets: typeof resolvedQueues
 	): Promise<void> {
 		for (const qc of targets) {
+			assertNotClosing();
 			const worker = new Worker<RunJobData>(
 				qc.name,
 				job => trackActive(qc.name, job.id, () => opts.processRun(qc.name, job.data, job)),
@@ -574,6 +588,7 @@ export function createTransport(options: CreateTransportOptions): Transport {
 		}
 
 		// The system worker always starts (decision 8): `queues` only filters task queues.
+		assertNotClosing();
 		const systemWorker = new Worker(
 			sysQueueName,
 			job =>
@@ -617,7 +632,17 @@ export function createTransport(options: CreateTransportOptions): Transport {
 
 		const stillActive = raceResult === timedOut ? Array.from(activeJobs.values()) : [];
 		if (opts.beforeClose) {
-			await opts.beforeClose(stillActive).catch(() => {});
+			// Logged, never rethrown: the workers, queues and connections must still close.
+			await opts.beforeClose(stillActive).catch((error: unknown) => {
+				try {
+					logger?.warn(
+						{ err: error, stillActive: stillActive.length },
+						"closeWorkers: beforeClose failed; closing the workers anyway"
+					);
+				} catch {
+					// A broken injected logger must not abort the close either.
+				}
+			});
 		}
 		// Redis not reachable (engine stopping during an outage): nothing BullMQ does from here on
 		// can complete, so don't wait the close grace out; force-close the workers and bound the

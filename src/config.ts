@@ -125,7 +125,7 @@ export interface EngineConfig {
 		pollIntervalMs?: number;
 		/** Rows claimed per `claimOutbox` statement; a full batch triggers another one right away. Default 500. */
 		batchSize?: number;
-		/** Upper bound of the dedicated LISTEN client's reconnect backoff. Default 30 000 ms. */
+		/** Upper bound of the dedicated LISTEN client's reconnect backoff. Default 30 000 ms, minimum 500 ms. */
 		reconnectMaxMs?: number;
 		/**
 		 * `false` skips the `pg_notify` call in the `trigger(..., { tx })` insert statement (the run
@@ -186,6 +186,12 @@ export const MAX_TIMER_MS = 2_147_483_647;
 
 /** Item 6: below this, the outbox listener's poll fallback becomes a busy-loop against Postgres. */
 export const MIN_OUTBOX_POLL_INTERVAL_MS = 100;
+
+/**
+ * Review 3: lowest `outbox.reconnectMaxMs`, the outbox listener's first reconnect delay
+ * (`RECONNECT_MIN_MS` in `src/outbox.ts`).
+ */
+export const MIN_OUTBOX_RECONNECT_MAX_MS = 500;
 
 /** Item 6: above this, one `claimOutbox` batch could hold a statement/transaction open too long. */
 export const MAX_OUTBOX_BATCH_SIZE = 10_000;
@@ -343,9 +349,13 @@ export function resolveConfig(config: EngineConfig): ResolvedConfig {
 			1,
 			MAX_OUTBOX_BATCH_SIZE
 		),
-		reconnectMaxMs: timerMs(
+		// Review 3: the listener's reconnect backoff starts at 500 ms; a smaller cap collapses the
+		// backoff to the cap itself, a near-continuous reconnect loop while Postgres is down.
+		reconnectMaxMs: intInRange(
 			"outbox.reconnectMaxMs",
-			config.outbox?.reconnectMaxMs ?? DEFAULTS.outbox.reconnectMaxMs
+			config.outbox?.reconnectMaxMs ?? DEFAULTS.outbox.reconnectMaxMs,
+			MIN_OUTBOX_RECONNECT_MAX_MS,
+			MAX_TIMER_MS
 		),
 		notify: outboxNotify,
 	};

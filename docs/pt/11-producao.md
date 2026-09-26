@@ -12,6 +12,18 @@ migrations de fato pendentes) lança `ConfigError` nomeando cada problema encont
 (`checkEnvironment`, exportada da raiz do pacote junto com seus tipos) pode ser chamada
 isoladamente também, por exemplo num health check ou antes de `migrate()` num script de deploy.
 
+## `start()` limita as esperas por Redis
+
+Primeiro um `PING` na conexão compartilhada (timeout de 5 s) antes de qualquer outra coisa — um
+Redis totalmente inacessível falha rápido em vez de travar. Depois disso, abre (ou reaproveita) a
+conexão dedicada de pub/sub e espera o `SUBSCRIBE` dela ficar pronto — também limitado a 5 s. A
+conexão compartilhada funcionar não é suficiente: uma conexão NOVA (o subscriber) ainda pode nunca
+ficar pronta (Redis recusando conexões novas por `maxclients`, ou caindo bem depois daquele
+primeiro `PING`), o que sem esse limite travaria `start()` para sempre (o subscriber tem
+`maxRetriesPerRequest: null`, que tenta de novo indefinidamente). Passados os 5 s, `start()`
+rejeita com `ConfigError` nomeando a causa provável (checar `maxclients`/`CLIENT LIST` ou a rede)
+em vez de travar; corrija e chame `start()` de novo.
+
 ## Dimensionamento do pool
 
 O pool precisa de `max >= concorrência total dos workers + 5` (as próprias queries de bookkeeping
@@ -29,7 +41,38 @@ sua aplicação** — injetar o pool da sua aplicação faz as queries da biblio
 sua aplicação por conexões; um `pool.max` pequeno demais pode causar falhas intermitentes de
 heartbeat/aquisição sob carga.
 
-Advisory locks: migrations usam `pg_advisory_xact_lock` dentro de uma transação; o líder
+## Conexões Redis por engine
+
+Todo uso não-bloqueante (produtores `Queue` do BullMQ de cada fila de task mais a `-system`, o
+publish do outbox, o escritor de streams, as checagens de ambiente) compartilha a **única**
+conexão dada ao engine (connection string, ou sua própria instância `ioredis` injetada) — nenhum
+socket extra para isso. Dois usos precisam de conexão própria, porque BullMQ/ioredis não permitem
+comandos bloqueantes nem modo subscriber de pub/sub numa conexão também usada para comandos
+normais:
+
+- **Um `duplicate()` por worker iniciado** (um worker de fila de task por fila iniciada, mais o
+  worker sempre ligado da `-system`): esta biblioteca cria esse duplicado (rastreado, fechado pelo
+  `stop()`). O BullMQ então cria **mais uma** conexão própria, internamente, para a busca
+  bloqueante (`BZPOPMIN`) que cada `Worker` precisa — invisível à contagem desta biblioteca, mas um
+  socket real com o Redis, aberto e fechado pelo próprio `Worker`. Cada fila iniciada (incluindo a
+  `-system`) custa **2** conexões reais, não 1.
+- **Uma conexão de subscriber de pub/sub**, criada sob demanda na primeira vez que é necessária
+  (`start()` assinando o cancelamento entre processos, ou o primeiro `runs.subscribe()` num engine
+  que nunca chamou `start()`) e reaproveitada depois para todo canal que este engine assina — nunca
+  mais que uma, criada uma única vez por engine.
+
+Então um engine iniciado com `N` filas de task (o padrão: toda fila declarada, a menos que
+`start({ queues })` restrinja) segura, uma vez rodando: `1` (compartilhada) + `2 × (N + 1)` (worker
++ o duplicado bloqueante do próprio BullMQ, por fila incluindo a `-system`) + `1` (subscriber) =
+`2N + 4` conexões Redis fixas. Um engine só de disparo (nunca chamou `start()`) segura só a conexão
+compartilhada, mais o subscriber se algum dia chamar `runs.subscribe()`. Além do custo fixo,
+`runs.readStream()` abre mais um `duplicate()` **por leitor aberto no momento**, fechado quando
+aquela iteração termina (ou no `stop()`) — não é um custo fixo, mas vale orçar se você espera
+muitos leitores concorrentes.
+
+## Advisory locks
+
+Migrations usam `pg_advisory_xact_lock` dentro de uma transação; o líder
 (dono do reconciliador/retenção) usa `pg_try_advisory_lock` num client dedicado mantido fora do
 pool enquanto segura o lock — nunca numa conexão emprestada do pool, já que uma conexão pooled pode
 ser reciclada silenciosamente enquanto o lock ainda parece estar sendo segurado.
@@ -144,6 +187,28 @@ reenfileira toda run a partir de Postgres dentro de aproximadamente
   sem lock em `runs`, nada a preparar.
 - **APIs novas:** `engine.queues` (pause/resume/list/scale) e `engine.runs.cancelMany`/
   `retryFailed`; `EngineClient` agora inclui `queues`.
+- **Trigger transacional (outbox), decisão 26.** `trigger(task, payload, { tx })` insere a run na
+  sua própria transação em vez de enfileirar na hora — veja [06. Outbox transacional](06-outbox.md).
+  Config nova `outbox.*` (`pollIntervalMs`, `batchSize`, `reconnectMaxMs`, `notify`) — veja
+  [03. Configuração](03-configuracao.md#outbox-trigger-transacional).
+- **Adaptadores de ORM para o outbox:** subpaths `@rivia-labs/minitrigger/typeorm|knex|drizzle|prisma`
+  (`typeormTx`, `knexTx`, `drizzleTx`, `prismaTx`) transformam o handle de transação do próprio ORM
+  no client `tx` acima.
+- **`attachDefaultLogger(engine, logger?)`**, log estruturado opt-in sobre `engine.events` — veja
+  [09. Observabilidade](09-observabilidade.md).
+- **Helpers de teste**, do subpath `/testing`: `assertTriggered`/`refuteTriggered`/`allTriggered` e
+  `runTask` (testa a lógica de uma task isoladamente, sem engine/store/fila) — veja
+  [10. Testes](10-testes.md).
+- **Leituras continuam funcionando durante o `stop()`, escritas não.** Enquanto `stop()` está
+  drenando (workers fechando, runs ativas terminando, conexões sendo liberadas), chamadas de
+  leitura — `runs.get`/`list`/`logs`/`steps`, `runs.cancel`, `tokens.complete`, `queues.list`,
+  `schedules.list` — continuam funcionando até `stop()` terminar de fechar tudo (seu último passo,
+  antes de fechar um pool criado pelo engine); só depois disso lançam `"this engine was stopped;
+  create a new one"`. Chamadas que iniciam trabalho novo — `trigger`, `runs.replay`/`subscribe`/
+  `readStream`/`cancelMany`/`retryFailed`, `queues.pause`/`resume`/`scale`, `schedules.upsert`/
+  `delete` — lançam esse mesmo erro assim que `stop()` **começa**, não quando termina, já que
+  começar trabalho novo enquanto o engine está saindo lutaria contra o shutdown. Um `TestEngine`
+  nunca lança isso por conta própria (não tem `stop()`).
 
 ## Upgrade 0.1.x/anterior para 0.2.0
 

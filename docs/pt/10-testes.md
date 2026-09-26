@@ -100,7 +100,18 @@ it("aprova quando o token resolve com valor truthy", async () => {
 - `ctx.logger` cai em `result.logs`; `ctx.progress.set`, em ordem de chamada, em `result.progress`;
   `ctx.stream(name, ...)`, por nome de stream, em `result.streams`.
 - Validação de payload/output reutiliza os mesmos checks reais de `Serializable`/tamanho
-  (`config.limits`, sobrescrevível via `options.limits`).
+  (`config.limits`, sobrescrevível via `options.limits`). Um `payload` inválido lança (como
+  `trigger()` faria). Um output de **task** inválido (o valor que o próprio `run` devolve) volta
+  como `result.error`, não lançado — igual a uma run falhada em produção, `retryable: false`
+  (determinístico: retentar não ajudaria). Um output de **step** inválido
+  (`ctx.step.run` devolve um valor não serializável ou grande demais) é diferente: como em
+  produção, é um `SerializationError` comum devolvido ao próprio código da task, não fatal — não
+  capturado, vira um `result.error` normal com `retryable: true` (a task poderia capturá-lo, ou
+  uma tentativa futura com output menor poderia funcionar).
+- Se a task lança com steps em voo, `runTask` espera até `options.settleTimeoutMs` (padrão: o
+  padrão de `stallTimeoutMs`, 60 s) por eles antes de reportar o erro, espelhando o limite de
+  produção (`stallTimeoutMs`); um erro fatal (nome de step inválido, step duplicado ou aninhado)
+  nunca espera, e um retorno bem-sucedido sempre espera por todo step.
 - **O que isso *não* testa:** replay, memoização entre tentativas, suspensão, detecção de não
   determinismo, timeouts reais de waitpoint, ou qualquer outra coisa que depende de durabilidade.
   Use `createTestEngine` para isso; use `runTask` para a lógica que uma task calcula dados seus

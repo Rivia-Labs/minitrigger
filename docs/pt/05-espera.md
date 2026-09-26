@@ -128,11 +128,26 @@ const { retried, skipped, hasMore, nextCursor } = await engine.runs.retryFailed(
   `cursor`.
 - `cancelMany` cancela as runs `queued`/`running`/`waiting` que casam com o filtro, cada uma
   exatamente como `runs.cancel()` (descendentes pendentes também, execuções em andamento abortadas,
-  eventos e `runs.subscribe` notificados), cada uma em sua própria transação curta.
+  eventos e `runs.subscribe` notificados), cada uma em sua própria transação curta. Uma run que
+  falha ao cancelar (hiccup de store/Redis) entra em `failed` (`{ runId, error }`) sem travar o
+  resto do lote; para retentar só essas, chame `cancelMany` de novo com o **mesmo** `cursor` desta
+  chamada (não `nextCursor` — os candidatos desta página continuam `queued`/`running`/`waiting`,
+  já que falharam ao cancelar, então são casados de novo a partir do mesmo ponto de partida); sem
+  cursor nenhum (começar do zero) também os retenta, junto com tudo antes dessa página.
 - `retryFailed` retenta as runs `failed` de nível raiz que casam com o filtro, como
   `runs.replay()`: uma run **nova** da mesma task com o mesmo payload (a tentativa recomeça; a run
-  falhada original fica como estava; a chave de concorrência dela é mantida). Cada run falhada é
-  retentada no máximo uma vez, mesmo com chamadas concorrentes. Runs com pai ficam de fora (a falha
-  delas já foi entregue ao pai: retente o pai). `skipped` lista runs cuja task este processo não
-  registra (`task_not_registered`) ou que uma chamada concorrente retentou primeiro
-  (`already_retried`).
+  falhada original fica como estava; a chave de concorrência dela é mantida só enquanto a fila
+  ainda declarar `concurrencyKey`, igual a `runs.replay()`). Uma run retentada por esta chamada é
+  **excluída da candidatura** em toda chamada futura (casada pela chave de idempotência
+  `__retry:<id>`, decisão 9): paginar com `nextCursor` é seguro mesmo com outras chamadas retentando
+  runs ao mesmo tempo, e repetir o mesmo filtro do início (ex.: uma varredura diária) só retenta
+  cada run falhada uma vez — você não precisa rastrear quais já tratou. Runs com pai ficam de fora
+  (a falha delas já foi entregue ao pai: retente o pai). `skipped` lista runs cuja task este
+  processo não registra (`task_not_registered`), que uma chamada concorrente retentou primeiro na
+  pequena janela entre listar e criar a retentativa (`already_retried`, raro na prática dado o
+  acima), ou cujo payload guardado não valida mais (`invalid_payload`).
+- **Em tabelas `runs` grandes, passe `createdFrom`** (ex.: "não mais que 24h") nas duas chamadas:
+  sem ele, a query da primeira página ainda precisa avançar a partir da linha mais antiga que
+  casa, o que para `cancelMany`/`retryFailed` significa varrer todo o histórico já finalizado antes
+  de chegar a algo recente — medido em ~143 ms só para a query da primeira página numa tabela
+  `runs` com 1M de linhas finalizadas.

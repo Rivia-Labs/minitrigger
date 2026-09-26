@@ -124,7 +124,11 @@ morreu ainda expira sozinho. **Não é um step**: não é memoizado, então um r
 termina no marcador de fim do escritor. Quando o stream terminou com erro, a iteração **lança** um
 `MinitriggerError` (com o `Name: message` original) depois de entregar os chunks escritos antes
 dele. Cada leitor usa sua própria conexão Redis, fechada quando a iteração termina (ou em
-`stop()`, que termina a iteração de forma limpa, sem erro, como `runs.subscribe`).
+`stop()`, que termina a iteração de forma limpa, sem erro, como `runs.subscribe`). Um erro do
+Redis nessa conexão durante a leitura (ex.: `LOADING` logo depois de um restart do Redis, `NOAUTH`)
+também **lança** para fora da iteração, diferente do fim limpo do `stop()` — não termina mais o
+stream silenciosamente como se tivesse alcançado o marcador de fim do escritor, o que descartaria
+os chunks que o leitor ainda não tinha recebido sem nenhum indício de que algo deu errado.
 
 **Leitores param no primeiro marcador de fim.** Se uma run retenta depois de um erro de stream, a
 próxima tentativa que chama `ctx.stream` com o mesmo nome acrescenta ao mesmo stream, depois desse
@@ -140,11 +144,17 @@ import { attachDefaultLogger } from "@rivia-labs/minitrigger";
 const detach = attachDefaultLogger(engine); // usa o próprio config.logger do engine
 // attachDefaultLogger(engine, pino());     // ou um logger explícito compatível com pino/console
 
+// um TestEngine não tem `.logger` próprio -- o segundo argumento é obrigatório nele:
+// attachDefaultLogger(testEngine, pino());
+
 // depois, para parar:
 detach();
 ```
 
-Opt-in — nem `createEngine` nem `start()` chama isso por você. Assina `engine.events` e escreve uma
+Opt-in — nem `createEngine` nem `start()` chama isso por você. `engine` pode ser qualquer engine
+que exponha `events` — um `Engine` de verdade ou um `TestEngine` — mas o argumento `logger` só é
+opcional para um `Engine` (que carrega seu próprio `config.logger`); um `TestEngine` não tem
+nenhum, então é obrigatório nele (omitir lança `ConfigError`). Assina `engine.events` e escreve uma
 linha estruturada por transição de run:
 
 | Evento | Nível | Campos extras |
@@ -159,5 +169,15 @@ Toda linha também carrega `runId`, `taskId`, `attempt`. **Segurança por padrã
 falha/retentativa nunca inclui o `SerializedError` completo (sem `stack`, sem `cause` encadeado) e
 nunca o payload ou output da run — só `error.name`/`error.message`. `run:queued`/`run:waiting` não
 são logados (mais barulhentos, menos acionáveis por padrão); assine-os você mesmo via
-`engine.events.on` se precisar. Uma chamada de log que lança (um `logger` customizado quebrado) é
-capturada e reportada uma vez via `logger.error`, nunca relançada dentro de `engine.events`.
+`engine.events.on` se precisar. O filtro de nível do seu próprio logger continua valendo (ex.: um
+logger pino configurado em `warn` descarta as linhas `info`) — com uma exceção: o **logger padrão
+embutido** (`config.logger` não configurado) normalmente descarta `debug`/`info` por completo, o
+que faria `run:started`/`run:completed` desaparecerem silenciosamente, contra o próprio motivo de
+anexar um logger; `attachDefaultLogger` trata esse caso à parte, mandando suas linhas `info` para
+`console.info` (mesmo prefixo `[minitrigger]` do `warn`/`error`) em vez de descartá-las — qualquer
+outro logger fica exatamente como configurado.
+Uma chamada de log que lança (um `logger` customizado quebrado) é capturada; só a *primeira* falha
+dessas é reportada via `logger.error` (um logger quebrado, senão, se reportaria a si mesmo em todo
+evento) — falhas seguintes na mesma chamada de `attachDefaultLogger()` são descartadas em silêncio,
+e uma chamada a `logger.error` que ela mesma lança ao reportar também é engolida. Nada é relançado
+dentro de `engine.events`.

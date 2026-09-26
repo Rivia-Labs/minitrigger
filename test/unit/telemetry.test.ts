@@ -3,10 +3,12 @@
  * exercised against a minimal fake `Engine` (only `events`/`logger` are used) so this stays a fast
  * unit test instead of needing a real engine/infra.
  */
-import { describe, expect, it } from "vitest";
-import type { EngineLogger } from "../../src/config.js";
+import { describe, expect, it, vi } from "vitest";
+import { defaultLogger, type EngineLogger } from "../../src/config.js";
 import type { Engine, EngineEvents, RunEvent, RunEventName } from "../../src/engine.js";
+import { defineTask } from "../../src/index.js";
 import { attachDefaultLogger } from "../../src/telemetry.js";
+import { createTestEngine } from "../../src/testing/index.js";
 
 type Call = {
 	level: "debug" | "info" | "warn" | "error";
@@ -182,5 +184,79 @@ describe("attachDefaultLogger", () => {
 		expect(calls).toHaveLength(1);
 		expect(calls[0]?.fields).toMatchObject({ event: "run:started" });
 		off();
+	});
+});
+
+describe("attachDefaultLogger (external review)", () => {
+	it("reports a failing logging call only once, not once per failure", () => {
+		const calls: Call[] = [];
+		const logger: EngineLogger = {
+			debug: () => {},
+			info: () => {
+				throw new Error("broken logger");
+			},
+			warn: () => {},
+			error: (fields, message) => {
+				calls.push({ level: "error", fields, message });
+			},
+		};
+		const { engine, emit } = fakeEngine(logger);
+		const off = attachDefaultLogger(engine);
+		emit(event({ name: "run:started" }));
+		emit(event({ name: "run:completed" }));
+		emit(event({ name: "run:started" }));
+		expect(calls).toHaveLength(1);
+		off();
+	});
+
+	it("never throws even when logger.error itself throws while reporting", () => {
+		const logger: EngineLogger = {
+			debug: () => {},
+			info: () => {
+				throw new Error("broken info");
+			},
+			warn: () => {},
+			error: () => {
+				throw new Error("broken error");
+			},
+		};
+		const { engine, emit } = fakeEngine(logger);
+		const off = attachDefaultLogger(engine);
+		expect(() => emit(event({ name: "run:started" }))).not.toThrow();
+		off();
+	});
+
+	it("with the built-in default logger (which drops info), info lines still reach the console", () => {
+		const info = vi.spyOn(console, "info").mockImplementation(() => {});
+		try {
+			const { engine, emit } = fakeEngine(defaultLogger);
+			const off = attachDefaultLogger(engine);
+			emit(event({ name: "run:started" }));
+			emit(event({ name: "run:completed", durationMs: 3 }));
+			expect(info).toHaveBeenCalledTimes(2);
+			expect(info.mock.calls[1]?.[0]).toContain('run "my-task" completed');
+			expect(info.mock.calls[1]?.[1]).toMatchObject({ durationMs: 3 });
+			off();
+		} finally {
+			info.mockRestore();
+		}
+	});
+
+	it("accepts a TestEngine (no engine.logger) with an explicit logger", async () => {
+		const task = defineTask({ id: "telemetry-test-engine", run: async () => "ok" });
+		const engine = createTestEngine({ tasks: [task] });
+		const { logger, calls } = fakeLogger();
+		const off = attachDefaultLogger(engine, logger);
+		await engine.runInline(task);
+		expect(calls.map(c => c.message)).toEqual([
+			'run "telemetry-test-engine" started',
+			'run "telemetry-test-engine" completed',
+		]);
+		off();
+		await engine.stop();
+		// Without a logger there is nothing to log to: a type error, not a silent no-op.
+		// @ts-expect-error -- a TestEngine carries no `logger`
+		const check = () => attachDefaultLogger(engine);
+		void check;
 	});
 });

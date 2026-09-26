@@ -15,7 +15,7 @@ export interface TypeormQueryRunnerLike {
 		query: string,
 		parameters: any[] | undefined,
 		useStructuredResult: true
-	): Promise<{ records?: unknown }>;
+	): Promise<{ records?: unknown } | unknown[]>;
 }
 
 /** The parts of a TypeORM `EntityManager` the adapter uses (the transactional one has a runner). */
@@ -27,6 +27,21 @@ const ADAPTER = "typeormTx";
 const EXPECTED =
 	"the EntityManager passed to dataSource.transaction(async manager => ...) or a QueryRunner " +
 	"after queryRunner.startTransaction()";
+
+/**
+ * The rows of what `queryRunner.query(sql, params, true)` resolved to: a structured `QueryResult`
+ * (`{ records }`, TypeORM 0.3+/1.x) or a raw row array (a runner that ignores
+ * `useStructuredResult`). Anything else is passed through unchanged so `toQueryResult` throws a
+ * `ConfigError`: treating an unknown shape as zero rows would silently lose the created run.
+ */
+function structuredRecords(result: unknown): unknown {
+	if (Array.isArray(result)) return result;
+	if (result !== null && typeof result === "object" && "records" in result) {
+		const { records } = result as { records: unknown };
+		return Array.isArray(records) ? records : result;
+	}
+	return result;
+}
 
 function driverType(handle: object): unknown {
 	const source =
@@ -87,8 +102,8 @@ export function typeormTx(
 	assertActive();
 	return {
 		async query(text, values) {
-			const result = await assertActive().query(text, values ?? [], true);
-			return toQueryResult(ADAPTER, result.records ?? []);
+			const result: unknown = await assertActive().query(text, values ?? [], true);
+			return toQueryResult(ADAPTER, structuredRecords(result));
 		},
 	};
 }

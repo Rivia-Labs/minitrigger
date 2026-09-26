@@ -56,8 +56,13 @@ export interface OutboxListenerOptions {
 	/** From {@link outboxChannel}. */
 	channel: string;
 	logger: EngineLogger;
-	/** Claims and enqueues one batch; resolves `true` when there may be more to claim. */
-	dispatchBatch(): Promise<boolean>;
+	/**
+	 * Claims and enqueues one batch; resolves `true` when there may be more to claim. `signal`
+	 * fires on {@link OutboxListener.close}: a batch still running then (e.g. waiting for a pool
+	 * connection past the close bound) should not claim anymore, since a claim nobody enqueues is
+	 * only recovered by the reconciler after `graceMs`.
+	 */
+	dispatchBatch(signal: AbortSignal): Promise<boolean>;
 	pollIntervalMs?: number;
 	reconnectMinMs?: number;
 	reconnectMaxMs?: number;
@@ -100,20 +105,27 @@ export function createOutboxListener(options: OutboxListenerOptions): OutboxList
 	let reconnectAttempt = 0;
 	let sweeping: Promise<void> | undefined;
 	let sweepAgain = false;
-	let lastWarnAt = 0;
+	const closing = new AbortController();
+	// One throttle per kind: a connection failure must not hide a sweep failure (or vice versa).
+	const lastWarnAt = { connection: 0, sweep: 0 };
 
-	function warn(fields: Record<string, unknown>, message: string): void {
+	function warn(
+		kind: keyof typeof lastWarnAt,
+		fields: Record<string, unknown>,
+		message: string
+	): void {
 		const now = Date.now();
-		if (now - lastWarnAt < WARN_THROTTLE_MS) {
+		if (now - lastWarnAt[kind] < WARN_THROTTLE_MS) {
 			logger.debug(fields, message);
 			return;
 		}
-		lastWarnAt = now;
+		lastWarnAt[kind] = now;
 		logger.warn(fields, message);
 	}
 
 	function warnConnectFailure(error: unknown): void {
 		warn(
+			"connection",
 			{ err: error, channel },
 			"outbox listener could not LISTEN; retrying (runs triggered with { tx } are still " +
 				`dispatched by the ${pollIntervalMs} ms poll)`
@@ -164,12 +176,12 @@ export function createOutboxListener(options: OutboxListenerOptions): OutboxList
 		client = c;
 		c.on("error", error => {
 			if (client !== c) return;
-			warn({ err: error, channel }, "outbox listener connection error; reconnecting");
+			warn("connection", { err: error, channel }, "outbox listener connection error; reconnecting");
 			discard(c);
 		});
 		c.on("end", () => {
 			if (client !== c) return;
-			warn({ channel }, "outbox listener connection ended; reconnecting");
+			warn("connection", { channel }, "outbox listener connection ended; reconnecting");
 			discard(c);
 		});
 		c.on("notification", (message: Notification) => {
@@ -227,10 +239,13 @@ export function createOutboxListener(options: OutboxListenerOptions): OutboxList
 				do {
 					sweepAgain = false;
 					let more = true;
-					while (more && !closed) more = await dispatchBatch();
+					// `closed` is re-checked before every batch; a batch already running when close()
+					// fires sees `closing.signal` aborted.
+					while (more && !closed) more = await dispatchBatch(closing.signal);
 				} while (sweepAgain && !closed);
 			} catch (error) {
 				warn(
+					"sweep",
 					{ err: error, channel },
 					"outbox sweep failed; retrying on the next notification or poll"
 				);
@@ -271,6 +286,7 @@ export function createOutboxListener(options: OutboxListenerOptions): OutboxList
 		async close() {
 			if (closed) return;
 			closed = true;
+			closing.abort();
 			clearInterval(pollTimer);
 			clearTimeout(reconnectTimer);
 			reconnectTimer = undefined;

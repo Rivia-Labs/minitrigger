@@ -898,7 +898,16 @@ export function createRunStore(exec: SqlExecutor, ctx: SqlContext): RunStore {
 		},
 
 		listStaleQueued(graceMs, limit, after, excludeQueues) {
-			return listStale("r.status = 'queued'", graceMs, limit, after ?? null, excludeQueues ?? []);
+			// A committed `{ tx }` run not yet claimed by the outbox sweep (decision 26) is the
+			// sweep's to dispatch: recovering it here too only duplicates the `run:queued` event.
+			// Once claimed (flag cleared), a lost enqueue is the reconciler's again.
+			return listStale(
+				"r.status = 'queued' AND NOT r.outbox_pending",
+				graceMs,
+				limit,
+				after ?? null,
+				excludeQueues ?? []
+			);
 		},
 
 		listStaleWaiting(graceMs, limit, after, excludeQueues) {

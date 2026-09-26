@@ -62,6 +62,12 @@ export interface RunTaskOptions {
 	children?: Record<string, ChildStub>;
 	/** `ctx.signal`; never fires on its own when omitted. */
 	signal?: AbortSignal;
+	/**
+	 * When the task throws with steps still in flight, how long to wait for them before reporting
+	 * the error anyway (production bounds this wait by `stallTimeoutMs`; default: its default,
+	 * 60 s). A fatal error never waits; a successful return always waits for every step.
+	 */
+	settleTimeoutMs?: number;
 	/** `ctx.run.attempt` (default 1) -- set it to exercise attempt-dependent logic. */
 	attempt?: number;
 	/** Overrides the size limits normally read from `EngineConfig.limits` (see `config.ts`). */
@@ -119,8 +125,13 @@ class MissingTestDoubleError extends ConfigError {}
  * Runs `task.run(payload, ctx)` directly. Never rejects for an error the task's own `run` threw
  * (or an invalid output) -- that comes back as `result.error`, exactly like `TestEngine#runInline`.
  * It DOES reject (synchronously, before `run` is even called) for an invalid `payload`, and
- * (whenever the task's own code reaches it) for a `ctx.step.waitForToken`/`trigger*` call missing
- * its `options.tokens`/`options.children` stub -- both are test-authoring mistakes, not task bugs.
+ * (after the task finishes, even if the task's own code caught it) for a
+ * `ctx.step.waitForToken`/`trigger*` call missing its `options.tokens`/`options.children` stub --
+ * both are test-authoring mistakes, not task bugs.
+ *
+ * Like production: steps started but never awaited are settled before it returns; after a fatal
+ * error (invalid step name/argument, duplicate or nested step) every later `ctx.step.*` call
+ * rethrows it and it is the reported `result.error` (`retryable: false`).
  */
 export async function runTask<T extends AnyTask>(
 	task: T,
@@ -129,6 +140,7 @@ export async function runTask<T extends AnyTask>(
 	const [rawPayload, options = {}] = args as [unknown, RunTaskOptions | undefined];
 	const payload = rawPayload === undefined ? null : rawPayload;
 	const limits = { ...DEFAULTS.limits, ...options.limits };
+	const settleTimeoutMs = options.settleTimeoutMs ?? DEFAULTS.stallTimeoutMs;
 
 	assertSerializable(payload, {
 		label: `payload of task "${task.id}"`,
@@ -141,6 +153,15 @@ export async function runTask<T extends AnyTask>(
 	const triggered: RunTaskTriggered[] = [];
 	const streams: Record<string, (Json | string)[]> = {};
 	const usedNames = new Set<string>();
+	/** Names registered by `createToken` (production's `StepContext.tokens`), for `waitForToken(name)`. */
+	const tokenNames = new Set<string>();
+	/** Step promises not settled yet (production's `state.inFlight`), drained before returning. */
+	const inFlight = new Set<Promise<unknown>>();
+	/**
+	 * The first missing test double: rethrown at the end of `runTask` even if the task's own code
+	 * caught it (otherwise a `try/catch` in the task would let a test pass without the double).
+	 */
+	let missingDoubleError: MissingTestDoubleError | undefined;
 	let fatal = false;
 	/**
 	 * The first fatal error (mirrors production's `state.fatalError`): kept even if the task's own
@@ -161,6 +182,60 @@ export async function runTask<T extends AnyTask>(
 		fatal = true;
 		fatalError ??= error;
 		return error;
+	}
+
+	function missingDouble(message: string): MissingTestDoubleError {
+		const error = new MissingTestDoubleError(message);
+		missingDoubleError ??= error;
+		return error;
+	}
+
+	/**
+	 * Registers a step call, mirroring production's `StepContext.register()`: nested call check,
+	 * then the earlier fatal error (user code that caught a code bug must not keep running steps),
+	 * then duplicate names. Must run synchronously at call time.
+	 */
+	function register(method: string, name: string): void {
+		assertNotNested(method, name);
+		if (fatal) throw fatalError;
+		markUsed(name);
+	}
+
+	/**
+	 * Tracks a step promise as in flight until it settles. The `then(remove, remove)` also marks a
+	 * rejection handled, like production's `rejected()`/`trackInFlight`: `void ctx.step.run("a:b")`
+	 * must not become an `unhandledRejection` (awaiters still see the rejection).
+	 */
+	function track<R>(promise: Promise<R>): Promise<R> {
+		inFlight.add(promise);
+		const remove = () => {
+			inFlight.delete(promise);
+		};
+		promise.then(remove, remove);
+		return promise;
+	}
+
+	/**
+	 * Waits for in-flight steps, like production before a terminal write. With `timeoutMs`, gives
+	 * up after that long (production's bounded `settleBeforeFail`) and returns `false`.
+	 */
+	async function settleInFlight(timeoutMs?: number): Promise<boolean> {
+		const drain = (async () => {
+			while (inFlight.size > 0) await Promise.allSettled([...inFlight]);
+		})();
+		if (timeoutMs === undefined) {
+			await drain;
+			return true;
+		}
+		let timer: NodeJS.Timeout | undefined;
+		const expired = new Promise<false>(resolve => {
+			timer = setTimeout(() => resolve(false), timeoutMs);
+		});
+		try {
+			return await Promise.race([drain.then(() => true as const), expired]);
+		} finally {
+			clearTimeout(timer);
+		}
 	}
 
 	/** Throws (fatal, like production's `register()`) when called from inside a `step.run` fn. */
@@ -217,11 +292,7 @@ export async function runTask<T extends AnyTask>(
 		return value as Json;
 	}
 
-	function childStub(
-		taskArg: AnyTask,
-		name: string,
-		method: string
-	): { id: string; stub: ChildStub } {
+	function childTaskId(taskArg: AnyTask, name: string, method: string): string {
 		if (taskArg === null || typeof taskArg !== "object" || typeof taskArg.id !== "string") {
 			throw markFatal(
 				new ConfigError(
@@ -229,27 +300,36 @@ export async function runTask<T extends AnyTask>(
 				)
 			);
 		}
-		const stub = options.children?.[taskArg.id];
+		return taskArg.id;
+	}
+
+	function childStub(taskId: string, name: string, method: string): ChildStub {
+		const stub =
+			options.children !== undefined && Object.hasOwn(options.children, taskId)
+				? options.children[taskId]
+				: undefined;
 		if (stub === undefined) {
-			throw new MissingTestDoubleError(
-				`runTask: step "${name}" calls ctx.step.${method}(..., task) for task "${taskArg.id}", but ` +
-					`no stub was given for it; pass { children: { "${taskArg.id}": (payload) => output } } ` +
+			throw missingDouble(
+				`runTask: step "${name}" calls ctx.step.${method}(..., task) for task "${taskId}", but ` +
+					`no stub was given for it; pass { children: { "${taskId}": (payload) => output } } ` +
 					"to runTask(task, payload, options)"
 			);
 		}
-		return { id: taskArg.id, stub };
+		return stub;
 	}
 
 	async function run(name: string, fn: () => unknown): Promise<unknown> {
 		validateName(name);
-		assertNotNested("run", name);
-		markUsed(name);
 		if (typeof fn !== "function") {
 			throw markFatal(
 				new ConfigError(`ctx.step.run("${name}", fn): fn must be a function, got ${typeof fn}`)
 			);
 		}
+		register("run", name);
 		const output = normalizeOutput(await stepScope.run(name, fn));
+		// A nested step (or another code bug) inside fn failed the run, even if fn caught it: like
+		// production, do not record an output computed around it.
+		if (fatal) throw fatalError;
 		// Item 4(b): NOT wrapped in `markFatal` -- mirrors production (`step-context.ts`'s `run()`),
 		// where an oversized/non-serializable step output is an ordinary `SerializationError` handed
 		// back to the task's own code, not a fatal/no-retry condition. Uncaught, it becomes a normal
@@ -264,17 +344,16 @@ export async function runTask<T extends AnyTask>(
 
 	async function sleep(name: string, duration: Duration): Promise<void> {
 		validateName(name);
-		assertNotNested("sleep", name);
-		markUsed(name);
 		parseDurationArg(duration);
+		register("sleep", name);
 		steps.push({ name, kind: "sleep", output: null });
 	}
 
 	async function createToken(name: string, opts?: { timeout?: Duration }): Promise<TokenHandle> {
 		validateName(name);
-		assertNotNested("createToken", name);
-		markUsed(name);
 		if (opts?.timeout !== undefined) parseDurationArg(opts.timeout);
+		register("createToken", name);
+		tokenNames.add(name);
 		// Item 4(c): the recorded step output must be the SAME id the caller gets back (it wasn't --
 		// the step used to record `{ id: name }`, the step name, instead of the token's actual id).
 		const id = randomUUID();
@@ -283,18 +362,18 @@ export async function runTask<T extends AnyTask>(
 	}
 
 	async function waitForToken(tokenOrName: TokenHandle | string): Promise<WaitResult<unknown>> {
-		assertNotNested(
-			"waitForToken",
-			typeof tokenOrName === "string" ? tokenOrName : (tokenOrName?.name ?? String(tokenOrName))
-		);
 		let name: string;
 		if (typeof tokenOrName === "string") {
 			name = tokenOrName;
-			if (!usedNames.has(name)) await createToken(name);
+			// Like production: a name without an earlier `createToken` is `createToken(name)` first,
+			// so a name already used by another step kind (e.g. `step.run("x")`) is a duplicate.
+			// `createToken` has no `await` before registering, so this stays synchronous.
+			if (!tokenNames.has(name)) await createToken(name);
 		} else {
 			if (
 				tokenOrName === null ||
 				typeof tokenOrName !== "object" ||
+				typeof tokenOrName.id !== "string" ||
 				typeof tokenOrName.name !== "string"
 			) {
 				throw markFatal(
@@ -306,9 +385,9 @@ export async function runTask<T extends AnyTask>(
 			validateName(tokenOrName.name);
 			name = tokenOrName.name;
 		}
-		markUsed(`${name}#wait`);
+		register("waitForToken", `${name}#wait`);
 		if (options.tokens === undefined || !Object.hasOwn(options.tokens, name)) {
-			throw new MissingTestDoubleError(
+			throw missingDouble(
 				`runTask: step "${name}" calls ctx.step.waitForToken(...), but no resolver was given for ` +
 					`it; pass { tokens: { "${name}": <value> } } to runTask(task, payload, options)`
 			);
@@ -335,11 +414,11 @@ export async function runTask<T extends AnyTask>(
 		opts?: StepTriggerOptions
 	): Promise<RunHandle<unknown>> {
 		validateName(name);
-		assertNotNested("trigger", name);
-		markUsed(name);
-		const { id: taskId, stub } = childStub(taskArg, name, "trigger");
+		const taskId = childTaskId(taskArg, name, "trigger");
 		const value = childPayload(taskId, payload);
 		if (opts?.delay !== undefined) parseDurationArg(opts.delay);
+		register("trigger", name);
+		const stub = childStub(taskId, name, "trigger");
 		const output = normalizeOutput(await stub(value));
 		triggered.push({ name, taskId, mode: "trigger", payload: value, output: output as Json });
 		const id = randomUUID();
@@ -354,11 +433,11 @@ export async function runTask<T extends AnyTask>(
 		opts?: { timeout?: Duration }
 	): Promise<WaitResult<unknown>> {
 		validateName(name);
-		assertNotNested("triggerAndWait", name);
-		markUsed(name);
-		const { id: taskId, stub } = childStub(taskArg, name, "triggerAndWait");
+		const taskId = childTaskId(taskArg, name, "triggerAndWait");
 		const value = childPayload(taskId, payload);
 		if (opts?.timeout !== undefined) parseDurationArg(opts.timeout);
+		register("triggerAndWait", name);
+		const stub = childStub(taskId, name, "triggerAndWait");
 		steps.push({ name, kind: "trigger_wait", output: null });
 		return runChild(name, taskId, value, stub, "triggerAndWait");
 	}
@@ -370,8 +449,6 @@ export async function runTask<T extends AnyTask>(
 		opts?: { timeout?: Duration }
 	): Promise<WaitResult<unknown>[]> {
 		validateName(name);
-		assertNotNested("batchTriggerAndWait", name);
-		markUsed(name);
 		if (!Array.isArray(payloads)) {
 			throw markFatal(
 				new ConfigError(
@@ -379,16 +456,17 @@ export async function runTask<T extends AnyTask>(
 				)
 			);
 		}
+		const taskId = childTaskId(taskArg, name, "batchTriggerAndWait");
+		const values = payloads.map(p => childPayload(taskId, p));
 		if (opts?.timeout !== undefined) parseDurationArg(opts.timeout);
-		if (payloads.length === 0) {
-			steps.push({ name, kind: "batch_wait", output: null });
-			return [];
-		}
-		const { id: taskId, stub } = childStub(taskArg, name, "batchTriggerAndWait");
+		register("batchTriggerAndWait", name);
+		// Like production: an empty batch consumes the name (seq_index) but records nothing and
+		// needs no stub.
+		if (values.length === 0) return [];
+		const stub = childStub(taskId, name, "batchTriggerAndWait");
 		steps.push({ name, kind: "batch_wait", output: null });
 		const results: WaitResult<unknown>[] = [];
-		for (const payload of payloads) {
-			const value = childPayload(taskId, payload);
+		for (const value of values) {
 			results.push(await runChild(name, taskId, value, stub, "batchTriggerAndWait"));
 		}
 		return results;
@@ -413,13 +491,26 @@ export async function runTask<T extends AnyTask>(
 	}
 
 	const step: StepApi = {
-		run: run as StepApi["run"],
-		sleep,
-		createToken,
-		waitForToken: waitForToken as StepApi["waitForToken"],
-		trigger: trigger as StepApi["trigger"],
-		triggerAndWait: triggerAndWait as StepApi["triggerAndWait"],
-		batchTriggerAndWait: batchTriggerAndWait as StepApi["batchTriggerAndWait"],
+		run: ((name: string, fn: () => unknown) => track(run(name, fn))) as StepApi["run"],
+		sleep: (name, duration) => track(sleep(name, duration)),
+		createToken: (name, opts) => track(createToken(name, opts)),
+		waitForToken: ((tokenOrName: TokenHandle | string) =>
+			track(waitForToken(tokenOrName))) as StepApi["waitForToken"],
+		trigger: ((name: string, taskArg: AnyTask, payload: unknown, opts?: StepTriggerOptions) =>
+			track(trigger(name, taskArg, payload, opts))) as StepApi["trigger"],
+		triggerAndWait: ((
+			name: string,
+			taskArg: AnyTask,
+			payload: unknown,
+			opts?: { timeout?: Duration }
+		) => track(triggerAndWait(name, taskArg, payload, opts))) as StepApi["triggerAndWait"],
+		batchTriggerAndWait: ((
+			name: string,
+			taskArg: AnyTask,
+			payloads: readonly unknown[],
+			opts?: { timeout?: Duration }
+		) =>
+			track(batchTriggerAndWait(name, taskArg, payloads, opts))) as StepApi["batchTriggerAndWait"],
 	};
 
 	const logBuffer = createLogBuffer({
@@ -451,54 +542,70 @@ export async function runTask<T extends AnyTask>(
 		},
 		progress: {
 			async set<V>(value: V): Promise<void> {
-				const normalized = normalizeOutput(value) as Json;
-				assertSerializable(normalized, {
+				// Same as production (`execute-run.ts`): validate the value as given (`undefined`
+				// is rejected, not normalized to null), then snapshot it so a later mutation of the
+				// caller's object can't change what was recorded.
+				assertSerializable(value, {
 					label: `progress of task "${task.id}"`,
 					maxBytes: limits.maxProgressBytes,
 				});
-				progress.push(normalized);
+				progress.push(structuredClone(value) as Json);
 			},
 		},
 	};
 
 	const anyTask = task as AnyTask;
+	let outcome: { ok: true; value: unknown } | { ok: false; error: unknown };
 	try {
-		const rawOutput = await anyTask.options.run(payload, ctx);
-		// A fatal error (e.g. NestedStepError) that the task's own code caught and swallowed still
-		// fails the run without retry, exactly like production (`execute-run.ts`'s check of
-		// `state.fatalError` after the function returns, regardless of the outcome it produced).
-		if (fatal) throw fatalError;
-		const output = normalizeOutput(rawOutput);
-		try {
-			assertSerializable(output, {
-				label: `output of task "${task.id}"`,
-				maxBytes: limits.maxPayloadBytes,
-			});
-		} catch (error) {
-			throw markFatal(error as Error);
-		}
-		await logBuffer.close();
-		return {
-			output: output as TaskOutput<T>,
-			error: null,
-			steps,
-			logs: logEntries,
-			progress,
-			triggered,
-			streams,
-		};
+		outcome = { ok: true, value: await anyTask.options.run(payload, ctx) };
 	} catch (error) {
-		await logBuffer.close();
-		if (error instanceof MissingTestDoubleError) throw error;
-		const retryable = !fatal && !(error instanceof AbortTaskRunError);
-		return {
-			output: null,
-			error: formatError(error, retryable),
-			steps,
-			logs: logEntries,
-			progress,
-			triggered,
-			streams,
-		};
+		outcome = { ok: false, error };
 	}
+	// Production settles every step still in flight before the terminal write (success: steps not
+	// awaited are still recorded; error: `settleBeforeFail`), so `steps`/`triggered` are complete.
+	// Production parity: a fatal error (code bug) fails the run right away, without waiting for
+	// steps in flight; a thrown error waits at most `settleTimeoutMs` (production: `stallTimeoutMs`)
+	// and then reports the original error; success drains everything (unawaited steps recorded).
+	if (!fatal) {
+		const settled = await settleInFlight(outcome.ok ? undefined : settleTimeoutMs);
+		// Like production's `abort("finished")` after giving up: tell stuck steps the attempt ended.
+		if (!settled)
+			controller?.abort(new MinitriggerError("runTask finished while steps were in flight"));
+	}
+	await logBuffer.close();
+	// A missing test double is a test-authoring mistake: surface it even if the task caught it.
+	if (missingDoubleError !== undefined) throw missingDoubleError;
+
+	const failed = (error: unknown, retryable: boolean): RunTaskResult<TaskOutput<T>> => ({
+		output: null,
+		error: formatError(error, retryable),
+		steps,
+		logs: logEntries,
+		progress,
+		triggered,
+		streams,
+	});
+	// A fatal error (a code bug such as NestedStepError or an invalid step name) fails the run
+	// without retry and is the reported error, whatever the function did afterwards -- even if it
+	// caught it and resolved, or threw something else (production's `state.fatalError`).
+	if (fatal) return failed(fatalError, false);
+	if (!outcome.ok) return failed(outcome.error, !(outcome.error instanceof AbortTaskRunError));
+	const output = normalizeOutput(outcome.value);
+	try {
+		assertSerializable(output, {
+			label: `output of task "${task.id}"`,
+			maxBytes: limits.maxPayloadBytes,
+		});
+	} catch (error) {
+		return failed(error, false);
+	}
+	return {
+		output: output as TaskOutput<T>,
+		error: null,
+		steps,
+		logs: logEntries,
+		progress,
+		triggered,
+		streams,
+	};
 }

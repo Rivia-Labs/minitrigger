@@ -148,6 +148,13 @@ própria — você só perde a atomicidade com suas próprias escritas).
 - **Não combina com `debounce`** — travaria a run pendente compartilhada até sua transação
   terminar.
 - **Não suportado por `createTestEngine`** — lança `ConfigError`.
+- **Two-phase commit (2PC).** O Postgres recusa `PREPARE TRANSACTION` numa transação que já rodou
+  `NOTIFY`/`pg_notify` (`ERROR: cannot PREPARE a transaction that has executed NOTIFY`). Como
+  `trigger(..., { tx })` roda `pg_notify` no commit quando `outbox.notify` está no padrão (`true`),
+  uma transação que também faz `PREPARE TRANSACTION` (2PC entre vários recursos) falha se disparou
+  algo. Configure `outbox.notify: false` nessa engine se sua aplicação usa 2PC — o despacho passa a
+  depender só da varredura de `outbox.pollIntervalMs`, que nunca roda `NOTIFY` na conexão da sua
+  transação.
 - Upgrading de 0.2.x: a migration `006_outbox` adiciona uma coluna e um índice parcial; veja
   [11. Produção](11-producao.md#upgrade-020-para-030).
 
@@ -155,9 +162,9 @@ própria — você só perde a atomicidade com suas próprias escritas).
 
 | Opção | Padrão | Notas |
 |---|---|---|
-| `outbox.pollIntervalMs` | `2 000` | Frequência da varredura de rede de segurança. |
-| `outbox.batchSize` | `500` | Linhas por statement `claimOutbox`. |
-| `outbox.reconnectMaxMs` | `30 000` | Teto do backoff de reconexão do client `LISTEN`. |
+| `outbox.pollIntervalMs` | `2 000` | Frequência da varredura de rede de segurança. Faixa 100–2³¹-1. |
+| `outbox.batchSize` | `500` | Linhas por statement `claimOutbox`. Faixa 1–10 000. |
+| `outbox.reconnectMaxMs` | `30 000` | Teto do backoff de reconexão do client `LISTEN`. Faixa 500–2³¹-1 (o backoff começa em 500 ms; um teto menor colapsaria num laço de reconexão quase contínuo). |
 | `outbox.notify` | `true` | `false` pula o `pg_notify` no commit — vale a troca (latência de milissegundos por nunca tomar o lock de `NOTIFY` no commit) para transações pequenas em taxa muito alta, quando o custo de serialização de commit pesa mais que a latência de despacho. |
 
 Ver [03. Configuração](03-configuracao.md#outbox-trigger-transacional) para o quadro completo.

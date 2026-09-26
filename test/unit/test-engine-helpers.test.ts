@@ -179,3 +179,27 @@ describe("assertTriggered / refuteTriggered", () => {
 		expect(message).toContain("…");
 	});
 });
+
+describe("payload matching: own keys only (external review)", () => {
+	const loose = defineTask({
+		id: "loose-payload",
+		run: async (_payload: { [key: string]: string | null }) => null,
+	});
+
+	it("a missing key does not match an expected null", async () => {
+		const engine = testEngine(loose);
+		await engine.trigger(loose, { a: "x" });
+		expect(await allTriggered(engine, { payload: { b: null } })).toHaveLength(0);
+		await engine.trigger(loose, { a: "x", b: null });
+		expect(await allTriggered(engine, { payload: { b: null } })).toHaveLength(1);
+	});
+
+	it("inherited keys of the payload object are never read", async () => {
+		const engine = testEngine(loose);
+		await engine.trigger(loose, { a: "x" });
+		// An own `__proto__` key (JSON.parse creates one) must not match the payload's prototype
+		// (`Object.prototype`, which "contains" `{}`).
+		const expected = JSON.parse('{"__proto__": {}}') as { a: string };
+		expect(await allTriggered(engine, { payload: expected })).toHaveLength(0);
+	});
+});

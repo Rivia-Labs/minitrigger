@@ -87,9 +87,9 @@ pool da sua aplicação — veja [11. Produção](11-producao.md).
 
 | Opção | Padrão | Notas |
 |---|---|---|
-| `outbox.pollIntervalMs` | `2 000` | Com que frequência todo engine iniciado varre por runs de `trigger(..., { tx })` já commitadas, mesmo sem um `NOTIFY`. |
-| `outbox.batchSize` | `500` | Linhas reivindicadas por statement `claimOutbox`. |
-| `outbox.reconnectMaxMs` | `30 000` | Teto do backoff de reconexão do cliente `LISTEN` dedicado. |
+| `outbox.pollIntervalMs` | `2 000` | Com que frequência todo engine iniciado varre por runs de `trigger(..., { tx })` já commitadas, mesmo sem um `NOTIFY`. Faixa 100–2³¹-1. |
+| `outbox.batchSize` | `500` | Linhas reivindicadas por statement `claimOutbox`. Faixa 1–10 000. |
+| `outbox.reconnectMaxMs` | `30 000` | Teto do backoff de reconexão do cliente `LISTEN` dedicado. Faixa 500–2³¹-1 (o backoff do listener começa em 500 ms). |
 | `outbox.notify` | `true` | `false` pula o `pg_notify` no commit de `trigger(..., { tx })` (o despacho passa a depender só de `outbox.pollIntervalMs`). |
 
 Ver [06. Outbox transacional](06-outbox.md) para o uso completo.

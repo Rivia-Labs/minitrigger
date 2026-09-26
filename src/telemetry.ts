@@ -10,8 +10,23 @@
  * carry them (see `src/engine.ts`).
  */
 
-import type { EngineLogger } from "./config.js";
-import type { Engine, RunEvent, RunEventName } from "./engine.js";
+import { defaultLogger, type EngineLogger } from "./config.js";
+import type { EngineClient, RunEvent, RunEventName } from "./engine.js";
+import { ConfigError } from "./errors.js";
+
+/** What `attachDefaultLogger` needs from an engine: its `events` (any `Engine`/`TestEngine`). */
+export type EventSource = Pick<EngineClient, "events">;
+
+/**
+ * `defaultLogger` (used when `config.logger` is omitted) drops `debug`/`info`, which would make
+ * `run:started`/`run:completed` vanish silently -- the opposite of what attaching a logger asks
+ * for. So when the target is that built-in logger, its `info` goes to `console.info` (same
+ * `[minitrigger]` prefix as its warn/error); every other level is left as is.
+ */
+const defaultLoggerWithInfo: EngineLogger = {
+	...defaultLogger,
+	info: (fields, message) => console.info(`[minitrigger] ${message}`, fields),
+};
 
 /** Only the transitions this logs; `run:queued`/`run:waiting` are left to the caller (noisier, less actionable by default). */
 const LOGGED_EVENTS: readonly RunEventName[] = [
@@ -79,24 +94,55 @@ function logEvent(logger: EngineLogger, event: RunEvent): void {
  * | `run:retrying` | `warn` | + `durationMs`, `error: { name, message }` |
  * | `run:canceled` | `warn` | `runId`, `taskId`, `attempt` |
  *
+ * Levels: your logger's own level filter applies (a pino logger at `warn` drops the `info`
+ * lines). The one exception is the built-in default logger (no `config.logger` given), which
+ * normally drops `info`: here its `info` lines are written to `console.info` instead, since
+ * attaching a logger and seeing no `run:started`/`run:completed` would be surprising.
+ *
+ * `engine` can be any engine exposing `events` (`Engine`, `TestEngine`); `logger` is required
+ * when the engine doesn't carry its own (`TestEngine`).
+ *
  * Opt-in only -- `createEngine`/`createTestEngine` never call this on their own. Handlers run
- * off the run's critical path (like every `engine.events` handler) and never throw back into it;
- * a logging call that itself throws is caught and reported through `logger.error` once, so one bad
- * logger implementation can't crash the process from inside an event handler.
+ * off the run's critical path (like every `engine.events` handler) and never throw back into it:
+ * a logging call that itself throws is caught, and only the FIRST such failure is reported
+ * through `logger.error` (a broken logger would otherwise report itself on every event); later
+ * failures are dropped silently. A `logger.error` that throws while reporting is swallowed too.
  *
  * Returns an unsubscribe function (idempotent, like every `engine.events.on` unsubscribe).
  */
-export function attachDefaultLogger(engine: Engine, logger?: EngineLogger): () => void {
-	const target = logger ?? engine.logger;
+export function attachDefaultLogger(
+	engine: EventSource & { readonly logger: EngineLogger },
+	logger?: EngineLogger
+): () => void;
+export function attachDefaultLogger(engine: EventSource, logger: EngineLogger): () => void;
+export function attachDefaultLogger(
+	engine: EventSource & { readonly logger?: EngineLogger },
+	logger?: EngineLogger
+): () => void {
+	const configured = logger ?? engine.logger;
+	if (configured === undefined) {
+		throw new ConfigError(
+			"attachDefaultLogger(engine, logger): this engine has no logger of its own (e.g. a " +
+				"TestEngine); pass one as the second argument"
+		);
+	}
+	const target = configured === defaultLogger ? defaultLoggerWithInfo : configured;
+	let reportedFailure = false;
 	const unsubscribes = LOGGED_EVENTS.map(name =>
 		engine.events.on(name, event => {
 			try {
 				logEvent(target, event);
 			} catch (error) {
-				target.error(
-					{ err: error, event: event.name, runId: event.runId },
-					"attachDefaultLogger: logging a run event failed"
-				);
+				if (reportedFailure) return;
+				reportedFailure = true;
+				try {
+					target.error(
+						{ err: error, event: event.name, runId: event.runId },
+						"attachDefaultLogger: logging a run event failed (further failures are not reported)"
+					);
+				} catch {
+					// The logger is broken beyond reporting; never throw into engine.events.
+				}
 			}
 		})
 	);

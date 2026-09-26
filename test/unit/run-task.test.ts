@@ -502,3 +502,236 @@ describe("runTask: task with no payload", () => {
 		expect(result.output).toBe("ok");
 	});
 });
+
+describe("runTask: parity with production (external review)", () => {
+	it("(a) a step call that fails before starting never becomes an unhandledRejection", async () => {
+		const unhandled: unknown[] = [];
+		const onUnhandled = (reason: unknown) => unhandled.push(reason);
+		process.on("unhandledRejection", onUnhandled);
+		try {
+			const task = defineTask({
+				id: "void-bad-name",
+				run: async (_payload: undefined, ctx) => {
+					void ctx.step.run("bad:name", async () => 1);
+					return "ok";
+				},
+			});
+			const result = await runTask(task);
+			await new Promise(resolve => setTimeout(resolve, 20));
+			expect(unhandled).toEqual([]);
+			// Invalid step name is a fatal code bug in production: the run fails without retry.
+			expect(result.error).toMatchObject({ name: "ConfigError", retryable: false });
+		} finally {
+			process.off("unhandledRejection", onUnhandled);
+		}
+	});
+
+	it("(b) steps started but not awaited are settled before runTask returns", async () => {
+		const task = defineTask({
+			id: "not-awaited",
+			run: async (_payload: undefined, ctx) => {
+				void ctx.step.run("later", async () => {
+					await new Promise(resolve => setTimeout(resolve, 10));
+					return 1;
+				});
+				void ctx.step.trigger("kick", child, { n: 2 });
+				return "ok";
+			},
+		});
+		const result = await runTask(task, undefined, {
+			children: {
+				"child-task": async payload => {
+					await new Promise(resolve => setTimeout(resolve, 10));
+					return (payload as { n: number }).n;
+				},
+			},
+		});
+		expect(result.output).toBe("ok");
+		expect(result.steps.map(s => s.name).sort()).toEqual(["kick", "later"]);
+		expect(result.triggered).toHaveLength(1);
+	});
+
+	it("(b) in-flight steps are also settled when the task throws", async () => {
+		const task = defineTask({
+			id: "not-awaited-throw",
+			run: async (_payload: undefined, ctx) => {
+				void ctx.step.run("later", async () => {
+					await new Promise(resolve => setTimeout(resolve, 10));
+					return 1;
+				});
+				throw new Error("boom");
+			},
+		});
+		const result = await runTask(task);
+		expect(result.error).toMatchObject({ message: "boom" });
+		expect(result.steps.map(s => s.name)).toEqual(["later"]);
+	});
+
+	it("(c) progress.set snapshots each value (later mutation does not change it)", async () => {
+		const task = defineTask({
+			id: "progress-mutate",
+			run: async (_payload: undefined, ctx) => {
+				const state = { n: 1 };
+				await ctx.progress.set(state);
+				state.n = 2;
+				await ctx.progress.set(state);
+				state.n = 3;
+				await ctx.progress.set(state);
+				return "ok";
+			},
+		});
+		const result = await runTask(task);
+		expect(result.progress).toEqual([{ n: 1 }, { n: 2 }, { n: 3 }]);
+	});
+
+	it("(c) progress.set(undefined) rejects with SerializationError, like production", async () => {
+		let caught: unknown;
+		const task = defineTask({
+			id: "progress-undefined",
+			run: async (_payload: undefined, ctx) => {
+				try {
+					await ctx.progress.set(undefined);
+				} catch (error) {
+					caught = error;
+				}
+				return "ok";
+			},
+		});
+		const result = await runTask(task);
+		expect(result.output).toBe("ok");
+		expect(caught).toMatchObject({ name: "SerializationError" });
+		expect(result.progress).toEqual([]);
+	});
+
+	it("(d) a missing token resolver is rethrown even if the task catches it", async () => {
+		const task = defineTask({
+			id: "swallow-missing-token",
+			run: async (_payload: undefined, ctx) => {
+				try {
+					await ctx.step.waitForToken("approval");
+				} catch {}
+				return "ok";
+			},
+		});
+		await expect(runTask(task)).rejects.toThrow(/no resolver was given/);
+	});
+
+	it("(d) a missing child stub is rethrown even if the task catches it", async () => {
+		const task = defineTask({
+			id: "swallow-missing-stub",
+			run: async (_payload: undefined, ctx) => {
+				try {
+					await ctx.step.trigger("kick", child, { n: 1 });
+				} catch {}
+				return "ok";
+			},
+		});
+		await expect(runTask(task)).rejects.toThrow(/no stub was given/);
+	});
+
+	it("(e) after a fatal error, later steps rethrow it and it is the reported error", async () => {
+		let ran = false;
+		let later: unknown;
+		const task = defineTask({
+			id: "fatal-then-more",
+			run: async (_payload: undefined, ctx) => {
+				try {
+					await ctx.step.run("bad:name", async () => 1);
+				} catch {}
+				try {
+					await ctx.step.run("fine", async () => {
+						ran = true;
+						return 1;
+					});
+				} catch (error) {
+					later = error;
+				}
+				throw new Error("task's own error");
+			},
+		});
+		const result = await runTask(task);
+		expect(ran).toBe(false);
+		expect(later).toMatchObject({ name: "ConfigError" });
+		expect(result.error).toMatchObject({ name: "ConfigError", retryable: false });
+		expect(result.steps).toEqual([]);
+	});
+
+	it("(e) waitForToken(name) with a name already used by step.run is a DuplicateStepError", async () => {
+		const task = defineTask({
+			id: "wait-dup",
+			run: async (_payload: undefined, ctx) => {
+				await ctx.step.run("x", async () => 1);
+				await ctx.step.waitForToken("x");
+				return "ok";
+			},
+		});
+		const result = await runTask(task, undefined, { tokens: { x: 1 } });
+		expect(result.error).toMatchObject({ name: "DuplicateStepError", retryable: false });
+	});
+
+	it("(e) batchTriggerAndWait([]) records no step but still consumes the name", async () => {
+		const task = defineTask({
+			id: "empty-batch-parity",
+			run: async (_payload: undefined, ctx) => {
+				const results = await ctx.step.batchTriggerAndWait("batch", child, []);
+				await ctx.step.run("batch", async () => 1);
+				return results;
+			},
+		});
+		const result = await runTask(task);
+		expect(result.steps).toEqual([]);
+		expect(result.error).toMatchObject({ name: "DuplicateStepError" });
+	});
+});
+
+describe("runTask: bounded settle of in-flight steps (production parity)", () => {
+	const never = () => new Promise<never>(() => {});
+
+	it("a fatal error does not wait for in-flight steps", { timeout: 2_000 }, async () => {
+		const task = defineTask({
+			id: "fatal-no-wait",
+			run: async (_payload: undefined, ctx) => {
+				void ctx.step.run("stuck", never);
+				await ctx.step.run("bad:name", async () => 1);
+				return "unreachable";
+			},
+		});
+		const result = await runTask(task);
+		expect(result.error).toMatchObject({ name: "ConfigError", retryable: false });
+	});
+
+	it("a thrown error waits at most settleTimeoutMs, then reports the original error", {
+		timeout: 2_000,
+	}, async () => {
+		let signal: AbortSignal | undefined;
+		const task = defineTask({
+			id: "throw-bounded-wait",
+			run: async (_payload: undefined, ctx) => {
+				signal = ctx.signal;
+				void ctx.step.run("stuck", never);
+				throw new Error("original");
+			},
+		});
+		const started = Date.now();
+		const result = await runTask(task, undefined, { settleTimeoutMs: 50 });
+		expect(Date.now() - started).toBeLessThan(1_000);
+		expect(result.error).toMatchObject({ name: "Error", message: "original", retryable: true });
+		expect(signal?.aborted).toBe(true);
+	});
+
+	it("a thrown error still records steps that settle within the bound", async () => {
+		const task = defineTask({
+			id: "throw-settles-in-time",
+			run: async (_payload: undefined, ctx) => {
+				void ctx.step.run("quick", async () => {
+					await new Promise(resolve => setTimeout(resolve, 5));
+					return 1;
+				});
+				throw new Error("original");
+			},
+		});
+		const result = await runTask(task, undefined, { settleTimeoutMs: 1_000 });
+		expect(result.steps.map(s => s.name)).toEqual(["quick"]);
+		expect(result.error).toMatchObject({ message: "original" });
+	});
+});

@@ -46,7 +46,11 @@ import {
 	type PubSubPublisher,
 	type RunStatusMessage,
 } from "./pubsub.js";
-import { createRedisConnections } from "./queue/connections.js";
+import {
+	closeConnection,
+	createRedisConnections,
+	type RedisConnections,
+} from "./queue/connections.js";
 import { SCHEDULE_TICK_JOB_NAME, systemQueueName } from "./queue/ids.js";
 import { assertRedisReachable } from "./queue/redis-check.js";
 import { createTransport, type Transport } from "./queue/transport.js";
@@ -112,6 +116,16 @@ const HAND_BACK_ENQUEUE_TIMEOUT_MS = 3_000;
 const HAND_BACK_FLUSH_MARGIN_MS = 500;
 /** How long `stop()` waits for a running leader tick before releasing leadership. */
 const LEADER_TICK_STOP_TIMEOUT_MS = 5_000;
+/** Review 3 item 1: bound on the pub/sub subscriber's SUBSCRIBE in start() (same as the PING). */
+const SUBSCRIBE_READY_TIMEOUT_MS = 5_000;
+/** stop() during start(): wait this long before dropping the subscriber to unblock start(). */
+const START_SETTLE_GRACE_MS = 1_000;
+/** ...then at most this long more before stopping anyway. */
+const START_SETTLE_TIMEOUT_MS = 10_000;
+/** At most one "outbox enqueue failed" warn per this window (Redis down: every poll fails). */
+const OUTBOX_ENQUEUE_WARN_THROTTLE_MS = 10_000;
+/** How many run ids that warn lists. */
+const OUTBOX_ENQUEUE_WARN_MAX_IDS = 20;
 /** How long `stop()` waits for pending best-effort status/cancel publishes before closing Redis. */
 const NOTIFY_DRAIN_MS = 2_000;
 /**
@@ -636,6 +650,12 @@ export interface EngineCoreLifecycle {
 	isShuttingDown(): boolean;
 	/** Throws once the engine was stopped. */
 	assertNotStopped(): void;
+	/**
+	 * Throws only once the engine is fully stopped (its resources closed), not while `stop()` is
+	 * still draining: reads, `runs.cancel` and `tokens.complete` keep working during a graceful
+	 * shutdown (e.g. a webhook completing a token). Omitted: never throws.
+	 */
+	assertNotClosed?(): void;
 }
 
 /** The shared part of an engine (see {@link EngineBackend}). @internal */
@@ -662,6 +682,8 @@ export interface EngineCore {
 	getPubSub(): PubSub;
 	/** The subscriber side if it was already created. */
 	currentPubSub(): PubSub | undefined;
+	/** Forgets the subscriber side (a failed start() closes it); returns it, if any. */
+	discardPubSub(): PubSub | undefined;
 	/** Ends every open `runs.subscribe` iteration. */
 	endSubscriptions(): void;
 	/** Bounded wait for the best-effort publishes still in flight. */
@@ -681,6 +703,7 @@ export function createEngineCore(
 	const { logger } = resolved;
 	const { store, transport, publisher } = backend;
 	const { assertNotStopped } = lifecycle;
+	const assertNotClosed = lifecycle.assertNotClosed ?? (() => {});
 	const active = new ActiveExecutions();
 
 	// --- Pub/sub (Phase 6 cancel broadcast, Phase 7 status seam). Publishing uses the shared
@@ -806,6 +829,8 @@ export function createEngineCore(
 		registry,
 		logger,
 		maxPayloadBytes: resolved.limits.maxPayloadBytes,
+		assertNotStopped,
+		assertNotClosed,
 	});
 
 	const deps: ExecutorDeps = {
@@ -872,14 +897,16 @@ export function createEngineCore(
 			// Decision 26: nothing is enqueued or published here (the caller's transaction is not
 			// committed); the engine that claims the run after the commit does both.
 			const result = await createRunInCallerTransaction(options.tx, input);
-			// Only id/taskId/kind are read from `result.run` here, and that is intentional, not
-			// incidental: an ORM adapter (decision 26) can normalize a raw query's rows in ways that
-			// lose fidelity outside those two string fields -- e.g. `rowCount` (dropped by adapters
-			// whose ORM returns a plain row array, `toQueryResult` in src/adapters/shared.ts) and
-			// timestamp columns (some adapters' drivers return them as strings, not `Date`). Do not
-			// start reading other fields (e.g. `updatedAt`) off a tx-path `result.run` without
-			// checking every adapter handles that column consistently.
-			return { id: result.run.id, taskId: result.run.taskId, kind: result.kind };
+			// Only `id` (plus the result `kind`) is read from the tx-path result here, and that is
+			// intentional, not incidental: an ORM adapter (decision 26) can normalize a raw query's
+			// rows in ways that lose fidelity outside that one field -- e.g. knex's
+			// `postProcessResponse` camelCasing the rows (dropping `task_id`), `rowCount` (dropped by
+			// adapters whose ORM returns a plain row array, `toQueryResult` in
+			// src/adapters/shared.ts) and timestamp columns (some adapters' drivers return them as
+			// strings, not `Date`). `taskId` comes from the task itself. Do not start reading other
+			// fields (e.g. `updatedAt`) off a tx-path `result.run` without checking every adapter
+			// handles that column consistently.
+			return { id: result.run.id, taskId: task.id, kind: result.kind };
 		}
 		const result = await store.runs.create(input);
 		// Decision 9: only a newly created run is enqueued; an existing one is returned as-is.
@@ -1087,10 +1114,20 @@ export function createEngineCore(
 		for (const row of await store.queues.list()) {
 			if (row.queue === systemQueue) continue;
 			if ((await transport.isQueuePaused(row.queue)) === row.paused) continue;
-			await applyQueuePause(row.queue, row.paused);
+			// Review 3 item 4: `row` may be stale -- a queues.pause()/resume() may have committed
+			// (and set its Redis flag) since the list above. Re-read this queue's row right before
+			// applying, so a concurrent pause is never undone.
+			const current = await store.queues.get(row.queue);
+			if (current === null) continue;
+			if ((await transport.isQueuePaused(row.queue)) === current.paused) continue;
+			await applyQueuePause(row.queue, current.paused);
+			// Like setQueuePaused: a write that committed after our re-read may have applied its
+			// flag before ours; converge on what Postgres holds now.
+			const after = await store.queues.get(row.queue);
+			if (after && after.paused !== current.paused) await applyQueuePause(row.queue, after.paused);
 			fixed++;
 			logger.info(
-				{ queue: row.queue, paused: row.paused },
+				{ queue: row.queue, paused: after?.paused ?? current.paused },
 				"queue pause state re-applied to BullMQ from Postgres"
 			);
 		}
@@ -1101,6 +1138,7 @@ export function createEngineCore(
 		pause: name => setQueuePaused(name, true),
 		resume: name => setQueuePaused(name, false),
 		async list(): Promise<QueueInfo[]> {
+			assertNotClosed();
 			const states = new Map((await store.queues.list()).map(r => [r.queue, r]));
 			const activeByQueue = new Map<string, number>();
 			for (const execution of active.values()) {
@@ -1149,6 +1187,7 @@ export function createEngineCore(
 
 	const runs: EngineRuns = {
 		async get<O>(run: string | RunHandle<O>): Promise<Run<O> | null> {
+			assertNotClosed();
 			const runId = runIdOf(run);
 			// Not a UUID: no such run (the SQL cast would throw instead), like logs/steps/tokens.
 			if (!isUuid(runId)) return null;
@@ -1157,10 +1196,15 @@ export function createEngineCore(
 		},
 
 		async list(options: ListRunsOptions = {}): Promise<RunList> {
+			assertNotClosed();
 			const result = await store.runs.list({
 				limit: validLimit("runs.list", options.limit, DEFAULT_LIST_LIMIT),
-				...(options.taskId !== undefined ? { taskId: options.taskId } : {}),
-				...(options.status !== undefined ? { status: options.status } : {}),
+				...(options.taskId !== undefined
+					? { taskId: validFilterText("runs.list options.taskId", options.taskId) }
+					: {}),
+				...(options.status !== undefined
+					? { status: validStatusFilter("runs.list options.status", options.status) }
+					: {}),
 				...(options.createdFrom !== undefined ? { createdFrom: options.createdFrom } : {}),
 				...(options.createdTo !== undefined ? { createdTo: options.createdTo } : {}),
 				...(options.cursor !== undefined ? { cursor: options.cursor } : {}),
@@ -1169,6 +1213,7 @@ export function createEngineCore(
 		},
 
 		async cancel(run: string | RunHandle<unknown>): Promise<CancelRunOutcome> {
+			assertNotClosed();
 			const runId = runIdOf(run);
 			if (!isUuid(runId)) return "not_found";
 			const result = await store.runs.cancel(runId, "canceled via engine.runs.cancel()");
@@ -1244,6 +1289,7 @@ export function createEngineCore(
 		},
 
 		async logs(run, options = {}): Promise<RunLogPage> {
+			assertNotClosed();
 			const limit = clampLimit(
 				validLimit("runs.logs", options.limit, DEFAULT_LOGS_LIMIT),
 				MAX_LOGS_LIMIT
@@ -1274,6 +1320,7 @@ export function createEngineCore(
 		},
 
 		async steps(run): Promise<RunStep[]> {
+			assertNotClosed();
 			const runId = runIdOf(run);
 			if (!UUID_PATTERN.test(runId)) return [];
 			const records = await store.steps.list(runId);
@@ -1411,6 +1458,7 @@ export function createEngineCore(
 
 	const tokens: EngineTokens = {
 		async complete(tokenId: string, output?: unknown): Promise<CompleteTokenOutcome> {
+			assertNotClosed();
 			const value = output === undefined ? null : output;
 			assertSerializable(value, {
 				label: "output of tokens.complete()",
@@ -1452,6 +1500,11 @@ export function createEngineCore(
 		syncQueueStates,
 		getPubSub,
 		currentPubSub: () => pubsub,
+		discardPubSub() {
+			const current = pubsub;
+			pubsub = undefined;
+			return current;
+		},
 		endSubscriptions() {
 			for (const end of Array.from(openSubscriptions)) end();
 		},
@@ -1488,9 +1541,23 @@ export function createEngine(config: EngineConfig): Engine {
 		onError: (error, purpose) =>
 			logger.debug({ err: error, purpose }, "redis connection error (ioredis reconnects)"),
 	});
+	/**
+	 * Review 3 item 1: the workers' dedicated connections, so a start() that fails after creating
+	 * some workers closes them at once (`closeWorkers` only runs on stop()).
+	 */
+	const workerConnections = new Set<Redis>();
+	const transportConnections: RedisConnections = {
+		shared: () => connections.shared(),
+		dedicated: purpose => {
+			const connection = connections.dedicated(purpose);
+			if (purpose === "worker") workerConnections.add(connection);
+			return connection;
+		},
+		closeAll: () => connections.closeAll(),
+	};
 	const transport: Transport = createTransport({
 		prefix: resolved.prefix,
-		connections,
+		connections: transportConnections,
 		queues: Array.from(registry.queues.values()),
 		systemConcurrency: resolved.systemConcurrency,
 		schema: resolved.schema,
@@ -1507,6 +1574,11 @@ export function createEngine(config: EngineConfig): Engine {
 		if (lifecycle === "stopping") {
 			throw new MinitriggerError("this engine was stopped; create a new one");
 		}
+	}
+	/** Set once stop() finished closing everything (see `EngineCoreLifecycle.assertNotClosed`). */
+	let closed = false;
+	function assertNotClosed(): void {
+		if (closed) throw new MinitriggerError("this engine was stopped; create a new one");
 	}
 
 	const streams = createStreams({ redis: connections.shared(), prefix: resolved.prefix });
@@ -1585,7 +1657,7 @@ export function createEngine(config: EngineConfig): Engine {
 					outbox: { channel: outbox.channel, notify: resolved.outbox.notify },
 				}),
 		},
-		{ isShuttingDown: () => shuttingDown, assertNotStopped }
+		{ isShuttingDown: () => shuttingDown, assertNotStopped, assertNotClosed }
 	);
 	const { deps, active, notifier, notifyStatus, abortLocal } = core;
 
@@ -1790,10 +1862,32 @@ export function createEngine(config: EngineConfig): Engine {
 
 			// Subscribed before the workers, so a cancel published for a run acquired right away is
 			// not missed. `ready` never rejects.
+			const createdPubSub = core.currentPubSub() === undefined;
 			const ps = core.getPubSub();
 			offCancel?.();
 			offCancel = ps.onCancel(abortLocal);
-			await ps.ready;
+			try {
+				// Review 3 item 1: bounded like the PING above. The shared connection works, but a new
+				// one may never become ready (Redis maxclients, a drop right after the PING); the
+				// SUBSCRIBE would then wait forever (`maxRetriesPerRequest: null`), and start() with it.
+				if (!(await withTimeout(ps.ready, SUBSCRIBE_READY_TIMEOUT_MS))) {
+					throw new ConfigError(
+						`the Redis pub/sub subscriber did not become ready within ${SUBSCRIBE_READY_TIMEOUT_MS} ` +
+							"ms, although PING on the shared connection worked: Redis may refuse new " +
+							"connections (check maxclients / CLIENT LIST) or the network dropped; fix it, " +
+							"then call start() again"
+					);
+				}
+				if (shuttingDown) {
+					throw new MinitriggerError("engine.stop() was called while start() was in progress");
+				}
+			} catch (error) {
+				offCancel?.();
+				offCancel = undefined;
+				// Close what this attempt opened, so a later start() begins from a clean state.
+				if (createdPubSub) await discardPubSub();
+				throw error;
+			}
 
 			try {
 				// On failure `startWorkers` closes whatever workers it already created.
@@ -1813,9 +1907,21 @@ export function createEngine(config: EngineConfig): Engine {
 			} catch (error) {
 				offCancel?.();
 				offCancel = undefined;
+				// Review 3 item 1: `startWorkers` closed its partial workers, but their dedicated
+				// connections belong to us (a `Worker` never closes a connection it was given).
+				await closeWorkerConnections();
 				throw error;
 			}
 
+			// Review 3: stop() may have begun while the workers were starting (and may have stopped
+			// waiting for this start()). Its `closeWorkers` closes every worker created before it
+			// began, and the transport refuses to create one after; the outbox listener and the
+			// leader loop must not start either.
+			if (shuttingDown) {
+				offCancel?.();
+				offCancel = undefined;
+				throw new MinitriggerError("engine.stop() was called while start() was in progress");
+			}
 			startOutboxListener();
 			startLeaderLoop();
 		})();
@@ -1830,6 +1936,24 @@ export function createEngine(config: EngineConfig): Engine {
 			}
 		);
 		return startPromise;
+	}
+
+	/** Drops the subscriber created by a failed start() (Review 3 item 1). */
+	async function discardPubSub(): Promise<void> {
+		const ps = core.discardPubSub();
+		// `runs.subscribe` iterations begun during this attempt took this same pub/sub (every one
+		// begun before it would have created it first, and then it isn't discarded): end them
+		// rather than leave them on a closed subscriber, noticing changes only via the re-read.
+		core.endSubscriptions();
+		await ps?.close().catch(() => {});
+		subscriberConnection?.disconnect();
+		subscriberConnection = undefined;
+	}
+
+	async function closeWorkerConnections(): Promise<void> {
+		const opened = Array.from(workerConnections);
+		workerConnections.clear();
+		await Promise.all(opened.map(connection => closeConnection(connection)));
 	}
 
 	/**
@@ -1939,10 +2063,13 @@ export function createEngine(config: EngineConfig): Engine {
 	 * the caller's `trigger` could not publish before its commit) and enqueues them. An enqueue lost
 	 * here is recovered by the reconciler (decision 1): the flag is already cleared.
 	 */
-	async function dispatchOutboxBatch(): Promise<boolean> {
+	async function dispatchOutboxBatch(signal?: AbortSignal): Promise<boolean> {
+		// close() already began: claim nothing more (a claimed run would only be enqueued by us).
+		if (signal?.aborted) return false;
 		const claim = await store.runs.claimOutbox(resolved.outbox.batchSize);
+		const failures: Array<{ runId: string; error: unknown }> = [];
 		await Promise.all(
-			claim.enqueue.map(item => {
+			claim.enqueue.map(async item => {
 				notifyStatus({
 					runId: item.runId,
 					taskId: item.taskId,
@@ -1952,10 +2079,47 @@ export function createEngine(config: EngineConfig): Engine {
 					updatedAt: item.updatedAt,
 					transition: "queued",
 				});
-				return enqueue(deps, item);
+				// Directly (not `enqueue()`, which warns per run): with Redis down, one warn per batch.
+				try {
+					await transport.enqueueRun({
+						queue: item.queue,
+						runId: item.runId,
+						seq: item.seq,
+						delayMs: item.delayMs,
+					});
+				} catch (error) {
+					failures.push({ runId: item.runId, error });
+				}
 			})
 		);
+		if (failures.length > 0) warnOutboxEnqueueFailures(failures);
 		return claim.claimed >= resolved.outbox.batchSize;
+	}
+
+	/** Last time {@link warnOutboxEnqueueFailures} logged, and the failures suppressed since. */
+	let outboxEnqueueWarnAt = Number.NEGATIVE_INFINITY;
+	let outboxEnqueueSuppressed = 0;
+	/** One throttled warn per outbox batch whose enqueues failed (e.g. Redis down). */
+	function warnOutboxEnqueueFailures(
+		failures: ReadonlyArray<{ runId: string; error: unknown }>
+	): void {
+		const now = Date.now();
+		if (now - outboxEnqueueWarnAt < OUTBOX_ENQUEUE_WARN_THROTTLE_MS) {
+			outboxEnqueueSuppressed += failures.length;
+			return;
+		}
+		outboxEnqueueWarnAt = now;
+		const suppressed = outboxEnqueueSuppressed;
+		outboxEnqueueSuppressed = 0;
+		logger.warn(
+			{
+				failed: failures.length,
+				err: failures[0]?.error,
+				runIds: failures.slice(0, OUTBOX_ENQUEUE_WARN_MAX_IDS).map(f => f.runId),
+				...(suppressed > 0 ? { suppressedSinceLastWarn: suppressed } : {}),
+			},
+			"outbox: enqueueing claimed runs failed; the reconciler re-enqueues them from Postgres"
+		);
 	}
 
 	/**
@@ -1964,6 +2128,7 @@ export function createEngine(config: EngineConfig): Engine {
 	 * connection is best-effort (a failure warns and retries; the poll still dispatches).
 	 */
 	function startOutboxListener(): void {
+		if (shuttingDown) return;
 		outbox.listener = createOutboxListener({
 			clientConfig:
 				typeof resolved.postgres === "string"
@@ -1986,10 +2151,17 @@ export function createEngine(config: EngineConfig): Engine {
 	}
 
 	function startLeaderLoop(): void {
+		if (shuttingDown) return;
 		leader = createLeaderElector({
-			...(typeof resolved.postgres === "string"
-				? { connectionString: resolved.postgres }
-				: { clientConfig: pool.options }),
+			// Review 3 item 1: the same bounded connect as the pool, so a leader tick can't wait
+			// forever on a Postgres that accepts TCP but never answers.
+			clientConfig:
+				typeof resolved.postgres === "string"
+					? {
+							connectionString: resolved.postgres,
+							connectionTimeoutMillis: resolved.poolConnectionTimeoutMs,
+						}
+					: pool.options,
 			schema: resolved.schema,
 			logger,
 			onAcquire: () =>
@@ -2178,6 +2350,7 @@ export function createEngine(config: EngineConfig): Engine {
 	 */
 	function stop(): Promise<void> {
 		if (stopPromise) return stopPromise;
+		const wasStarting = lifecycle === "starting";
 		lifecycle = "stopping";
 		shuttingDown = true;
 		shutdownController.abort();
@@ -2187,7 +2360,23 @@ export function createEngine(config: EngineConfig): Engine {
 		stopPromise = (async () => {
 			try {
 				// A concurrent start() must finish (or fail) first, or its workers would leak.
-				await startPromise?.catch(() => {});
+				// Review 3 item 1: bounded. `shuttingDown` makes it fail before starting workers; a
+				// start() stuck on the subscriber is unblocked by dropping that connection.
+				if (wasStarting && startPromise) {
+					const settled = startPromise.then(
+						() => undefined,
+						() => undefined
+					);
+					if (!(await withTimeout(settled, START_SETTLE_GRACE_MS))) {
+						subscriberConnection?.disconnect();
+						if (!(await withTimeout(settled, START_SETTLE_TIMEOUT_MS))) {
+							logger.warn(
+								{ timeoutMs: START_SETTLE_GRACE_MS + START_SETTLE_TIMEOUT_MS },
+								"stop(): start() is still in progress; stopping anyway"
+							);
+						}
+					}
+				}
 				// Item 6: the workers stop fetching right away (`closeWorkers` first), BEFORE waiting
 				// for the leader tick: otherwise every job fetched meanwhile is acquired, handed back
 				// (`enqueue_seq + 1`) and re-enqueued at once, over and over. The tick is awaited in
@@ -2218,6 +2407,9 @@ export function createEngine(config: EngineConfig): Engine {
 					},
 				});
 			} finally {
+				// From here on the connections are gone: reads, runs.cancel and tokens.complete (which
+				// kept working while stopping, for a graceful drain) now fail with the clean error.
+				closed = true;
 				// Decision 14: only the pool the engine created. Bounded (review item b): a client
 				// still checked out would keep `pool.end()` pending forever.
 				if (ownsPool) {
@@ -2359,12 +2551,7 @@ function validBatchFilter(method: string, filter: unknown): Omit<BatchCandidates
 	for (const key of ["taskId", "queue"] as const) {
 		const value = f[key];
 		if (value === undefined) continue;
-		if (typeof value !== "string") {
-			throw new ConfigError(
-				`${method}: filter.${key} must be a string, got ${describeOffendingValue(value)}`
-			);
-		}
-		out[key] = value;
+		out[key] = validFilterText(`${method}: filter.${key}`, value);
 	}
 	for (const key of ["createdFrom", "createdTo"] as const) {
 		const value = f[key];
@@ -2392,6 +2579,34 @@ function validBatchFilter(method: string, filter: unknown): Omit<BatchCandidates
 		out.cursor = { createdAt: cursor.createdAt, id: cursor.id };
 	}
 	return out;
+}
+
+/**
+ * Review 3 item 5: a string filter that Postgres `text` can't hold (NUL, or a lone UTF-16
+ * surrogate -- the same rule as step names and keys, `src/utils/identifiers.ts`) is a
+ * `ConfigError` here instead of the raw pg error (SQLSTATE 22021) from the query.
+ */
+function validFilterText(label: string, value: unknown): string {
+	if (typeof value !== "string") {
+		throw new ConfigError(`${label} must be a string, got ${describeOffendingValue(value)}`);
+	}
+	if (value.includes("\u0000")) {
+		throw new ConfigError(`${label} contains a NUL character (U+0000), which Postgres rejects`);
+	}
+	if (!value.isWellFormed()) {
+		throw new ConfigError(
+			`${label} is not well-formed Unicode (contains an unpaired surrogate), which Postgres rejects`
+		);
+	}
+	return value;
+}
+
+/** `runs.list` `status`: one status or an array of them, each checked like {@link validFilterText}. */
+function validStatusFilter(label: string, value: unknown): RunStatus | readonly RunStatus[] {
+	if (Array.isArray(value)) {
+		return value.map((v, i) => validFilterText(`${label}[${i}]`, v) as RunStatus);
+	}
+	return validFilterText(label, value) as RunStatus;
 }
 
 function clampLimit(limit: number, max: number): number {
@@ -2632,9 +2847,24 @@ function ormHandleHint(tx: unknown): { what: string; wrap: string; subpath: stri
 	if (typeof tx === "function" && has("raw")) {
 		return { what: "a knex transaction/instance", wrap: "knexTx(trx)", subpath: "knex" };
 	}
-	if (has("query") && (has("startTransaction") || "queryRunner" in tx)) {
+	// Review 3 item 2: the real non-transactional `dataSource.manager` (and the DataSource itself)
+	// has neither `startTransaction` nor an own `queryRunner` key; TypeORM tags its classes with
+	// `"@instanceof"` (Symbol.for(<class name>)), and both share query + transaction +
+	// getRepository. Unrecognized, its `query()` would run the INSERT in autocommit.
+	const tag = (tx as Record<string, unknown>)["@instanceof"];
+	const typeormTagged =
+		tag === Symbol.for("EntityManager") ||
+		tag === Symbol.for("DataSource") ||
+		tag === Symbol.for("QueryRunner");
+	if (
+		typeormTagged ||
+		(has("query") &&
+			(has("startTransaction") ||
+				"queryRunner" in tx ||
+				(has("transaction") && has("getRepository"))))
+	) {
 		return {
-			what: "a TypeORM EntityManager/QueryRunner",
+			what: "a TypeORM EntityManager/QueryRunner/DataSource",
 			wrap: "typeormTx(manager)",
 			subpath: "typeorm",
 		};

@@ -158,6 +158,16 @@ describe("resolveConfig", () => {
 		);
 	});
 
+	// Review 3 item 2: below the listener's 500 ms reconnect floor, backoff collapses to
+	// `reconnectMaxMs` itself, i.e. a near-continuous reconnect loop while Postgres is down.
+	it("rejects an outbox.reconnectMaxMs below 500ms", () => {
+		expect(() => resolveConfig({ ...base, outbox: { reconnectMaxMs: 499 } })).toThrow(ConfigError);
+		expect(() => resolveConfig({ ...base, outbox: { reconnectMaxMs: 1 } })).toThrow(/500/);
+		expect(resolveConfig({ ...base, outbox: { reconnectMaxMs: 500 } }).outbox.reconnectMaxMs).toBe(
+			500
+		);
+	});
+
 	it("rejects an outbox.batchSize above 10_000", () => {
 		expect(() => resolveConfig({ ...base, outbox: { batchSize: 10_001 } })).toThrow(ConfigError);
 		expect(() => resolveConfig({ ...base, outbox: { batchSize: 10_001 } })).toThrow(/10.?000/);

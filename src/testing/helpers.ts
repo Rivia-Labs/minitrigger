@@ -174,7 +174,8 @@ function toTriggeredRun(run: Run): TriggeredRun {
  * object must deep-match the same key of `actual` (extra keys on `actual` are ignored, checked
  * recursively), while an `expected` array must match `actual` exactly (same length, every element
  * matching in order) -- a "partial array" isn't a meaningful concept here. Primitives compare with
- * `===` (so `NaN`/`-0` are never produced by valid `Json` anyway).
+ * `===` (so `NaN`/`-0` are never produced by valid `Json` anyway). Only own keys of `actual` are
+ * read: a missing key never matches an expected `null`.
  */
 function containsPartial(actual: Json, expected: Json): boolean {
 	if (expected === null || typeof expected !== "object") return actual === expected;
@@ -187,8 +188,12 @@ function containsPartial(actual: Json, expected: Json): boolean {
 	}
 	if (actual === null || typeof actual !== "object" || Array.isArray(actual)) return false;
 	const actualObj = actual as { [key: string]: Json | undefined };
+	// Own keys only: a key missing from `actual` never matches (not even an expected `null`), and
+	// inherited properties (e.g. `__proto__` -> `Object.prototype`) are never read.
 	return Object.entries(expected).every(
-		([key, value]) => value === undefined || containsPartial(actualObj[key] ?? null, value)
+		([key, value]) =>
+			value === undefined ||
+			(Object.hasOwn(actualObj, key) && containsPartial(actualObj[key] as Json, value))
 	);
 }
 

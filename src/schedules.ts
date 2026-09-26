@@ -165,12 +165,19 @@ export interface SchedulesApiDeps {
 	registry: Registry;
 	logger: EngineLogger;
 	maxPayloadBytes: number;
+	/** Throws once the owning engine was stopped (upsert/delete call it first). */
+	assertNotStopped?: () => void;
+	/** Throws only once the engine is fully stopped (list calls it; it works while stopping). */
+	assertNotClosed?: () => void;
 }
 
 export function createSchedulesApi(deps: SchedulesApiDeps): EngineSchedules {
 	const { store, transport, registry, logger, maxPayloadBytes } = deps;
+	const assertNotStopped = deps.assertNotStopped ?? (() => {});
+	const assertNotClosed = deps.assertNotClosed ?? (() => {});
 
 	async function upsert<T extends AnyTask>(input: ScheduleUpsertInput<T>): Promise<Schedule> {
+		assertNotStopped();
 		if (input === null || typeof input !== "object") {
 			throw new ConfigError("schedules.upsert: input must be an object");
 		}
@@ -211,6 +218,7 @@ export function createSchedulesApi(deps: SchedulesApiDeps): EngineSchedules {
 	}
 
 	async function del(id: string): Promise<boolean> {
+		assertNotStopped();
 		if (typeof id !== "string") return false;
 		const deleted = await store.schedules.delete(id);
 		if (deleted) {
@@ -229,6 +237,7 @@ export function createSchedulesApi(deps: SchedulesApiDeps): EngineSchedules {
 	}
 
 	async function list(): Promise<Schedule[]> {
+		assertNotClosed();
 		const rows = await store.schedules.list();
 		return rows.map(toPublicSchedule);
 	}

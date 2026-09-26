@@ -10,6 +10,7 @@ import { prismaTx } from "../../src/adapters/prisma.js";
 import { typeormTx } from "../../src/adapters/typeorm.js";
 import { validateTransactionClient } from "../../src/engine.js";
 import { ConfigError } from "../../src/errors.js";
+import { createSqlTxRunStore } from "../../src/store/sql/index.js";
 
 describe("typeormTx", () => {
 	const runner = (active = true, released = false) => {
@@ -42,6 +43,25 @@ describe("typeormTx", () => {
 		).toThrow(/"mysql"/);
 		expect(() => typeormTx(42 as never)).toThrow(ConfigError);
 		expect(() => typeormTx({} as never)).toThrow(ConfigError);
+	});
+
+	const runnerReturning = (result: unknown) => ({
+		isTransactionActive: true,
+		isReleased: false,
+		startTransaction: async () => {},
+		query: async () => result,
+	});
+
+	it("accepts a raw row array (a runner that ignores useStructuredResult)", async () => {
+		const tx = typeormTx(runnerReturning([{ id: "r" }]) as never);
+		expect(await tx.query("SELECT 1", [])).toEqual({ rows: [{ id: "r" }] });
+	});
+
+	it("throws ConfigError on an unknown result shape instead of treating it as zero rows", async () => {
+		for (const result of [{ affected: 1 }, undefined, null, { records: "nope" }]) {
+			const tx = typeormTx(runnerReturning(result) as never);
+			await expect(tx.query("SELECT 1", [])).rejects.toThrow(ConfigError);
+		}
 	});
 });
 
@@ -76,6 +96,26 @@ describe("knexTx", () => {
 		expect(() => knexTx(trx({ isCompleted: () => true }))).toThrow(/already committed/);
 		expect(() => knexTx(trx({ client: { dialect: "mysql" } }))).toThrow(/"mysql"/);
 		expect(() => knexTx({} as never)).toThrow(ConfigError);
+	});
+
+	it("a key-renaming postProcessResponse (camelCase) keeps the run id the tx path relies on", async () => {
+		// knex applies the user's postProcessResponse to trx.raw() too, so `task_id` comes back as
+		// `taskId` and the store's row mapping loses it; `id` survives any case transform. The
+		// engine's tx path must therefore only read `id` (and use the task it already has).
+		const camelRow = { id: "11111111-1111-1111-1111-111111111111", taskId: "t", notified: "" };
+		const t = trx({ raw: async () => ({ rows: [camelRow], rowCount: 1 }) });
+		const store = createSqlTxRunStore(knexTx(t), "mt_camel");
+		const result = await store.create({
+			id: camelRow.id,
+			taskId: "t",
+			queue: "default",
+			payload: null,
+			maxAttempts: 1,
+			delayMs: 0,
+			outbox: { channel: "c" },
+		});
+		expect(result.kind).toBe("created");
+		expect(result.run.id).toBe(camelRow.id);
 	});
 });
 

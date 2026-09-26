@@ -286,13 +286,14 @@ type AbortRace<T> = { aborted: true } | { aborted: false; value: T };
  * Races `promise` against `signal` firing. On abort, resolves immediately with `{ aborted: true }`
  * without waiting for `promise` to settle -- `promise` (the in-flight `XREAD BLOCK`) is left to
  * resolve on its own later, on a connection the caller owns and is expected to discard/close
- * after an abort, so nothing awaits or depends on its eventual result.
+ * after an abort, so nothing awaits or depends on its eventual result. A rejection is propagated
+ * unless the signal had already fired by then.
  */
 function raceAbort<T>(promise: Promise<T>, signal: AbortSignal | undefined): Promise<AbortRace<T>> {
 	if (!signal) return promise.then(value => ({ aborted: false, value }));
 	if (signal.aborted) return Promise.resolve({ aborted: true });
 
-	return new Promise(resolve => {
+	return new Promise((resolve, reject) => {
 		const onAbort = (): void => resolve({ aborted: true });
 		signal.addEventListener("abort", onAbort, { once: true });
 		promise.then(
@@ -300,12 +301,14 @@ function raceAbort<T>(promise: Promise<T>, signal: AbortSignal | undefined): Pro
 				signal.removeEventListener("abort", onAbort);
 				resolve({ aborted: false, value });
 			},
-			() => {
-				// A rejected XREAD (e.g. the caller's dedicated connection was closed to force an
-				// abort) is treated the same as an abort: stop reading rather than throwing out of
-				// the generator.
+			(error: unknown) => {
 				signal.removeEventListener("abort", onAbort);
-				resolve({ aborted: true });
+				// A rejection AFTER the abort (the caller closed its dedicated connection to stop
+				// the read) is part of that abort: end quietly. Any other rejection (LOADING after
+				// a Redis restart, NOAUTH, ...) is a real error the reader must see; ending the
+				// stream normally would silently drop the chunks it never read.
+				if (signal.aborted) resolve({ aborted: true });
+				else reject(error);
 			}
 		);
 	});

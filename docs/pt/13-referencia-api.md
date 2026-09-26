@@ -12,7 +12,7 @@ Ver [03. Configuração](03-configuracao.md) e a [tabela de config](#config-opti
 ```ts
 interface Engine {
 	migrate(): Promise<MigrateResult>;         // aplica migrations pendentes; seguro chamar concorrentemente
-	start(options?: { queues?: string[] }): Promise<void>; // inicia workers; omitido = nenhum
+	start(options?: { queues?: string[] }): Promise<void>; // inicia workers; sem `queues` = toda fila de task declarada (o worker `-system` sempre inicia)
 	stop(): Promise<void>;                      // shutdown gracioso; idempotente
 	trigger<T extends AnyTask>(task: T, payload?, options?: TriggerOptions): Promise<RunHandle<TaskOutput<T>>>;
 	runs: {

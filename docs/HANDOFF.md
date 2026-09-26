@@ -4,9 +4,11 @@ Atualizado em 2026-09-25. Leia junto com `CLAUDE.md` (decisões e notas de imple
 
 ## Estado atual
 
-- **Verificação completa verde:** `pnpm typecheck && pnpm lint && pnpm test` → 877 testes (unit + integration) + 1 (flushall); `pnpm build` ok (ESM, CJS, DTS).
-- **Fases 1 a 10 concluídas.** `pnpm check:pack` ok; `examples/basic` roda de ponta a ponta.
-- Árvore git limpa; commits convencionais por fase/frente.
+- **Fases 1 a 10 concluídas.** `pnpm check:pack` ok (última vez rodado); `examples/basic` roda de ponta a ponta.
+- **Terceira revisão externa (2026-09-25):** aplicada e commitada (ver `CLAUDE.md`, "Terceira
+  revisão externa"); testes novos em `test/{unit,integration}/review3-{engine,io}.test.ts`.
+- **Verificação completa:** `pnpm typecheck && pnpm lint && pnpm test` verde — 1398 testes
+  (unit + integration) + 3 no projeto flushall; `pnpm check:pack` e `pnpm skills:validate` ok.
 
 ### O que existe (resumo)
 
@@ -20,8 +22,13 @@ Atualizado em 2026-09-25. Leia junto com `CLAUDE.md` (decisões e notas de imple
 | Engine                           | `src/engine.ts`, `src/config.ts`                                                                                                 |
 | Resiliência                      | `src/leader.ts`, `src/reconciler.ts`, `src/retention.ts`, `src/pubsub.ts`                                                        |
 | Logs e streams                   | `src/logs/buffer.ts`, `src/streams.ts`                                                                                           |
-| Testes                           | `test/unit`, `test/integration`, `test/integration-flushall`, `test/helpers` (namespace por arquivo, suíte de contrato de store) |
-| Docs                             | `README.md` (rascunho quase completo), `examples/basic` (mínimo)                                                                 |
+| Outbox transacional (decisão 26) | `src/outbox.ts`, `createSqlTxRunStore` em `src/store/sql/runs.ts`, `dispatchOutboxBatch` em `src/engine.ts` |
+| Adaptadores de ORM               | `src/adapters/{typeorm,knex,drizzle,prisma,placeholders,shared}.ts`, subpaths `@rivia-labs/minitrigger/{typeorm,knex,drizzle,prisma}` |
+| Modo de teste / helpers          | `src/testing/{test-engine,memory-transport,memory-pubsub,helpers,run-task}.ts`, subpath `@rivia-labs/minitrigger/testing` |
+| Telemetria                       | `src/telemetry.ts` (`attachDefaultLogger`), `durationMs`/`startedAt` em `src/executor/notify.ts`/`src/engine.ts` |
+| Controle de filas / lote         | `engine.queues.*`, `runs.cancelMany`/`retryFailed` em `src/engine.ts`; `queue_state` (migration 007) |
+| Testes                           | `test/unit`, `test/integration`, `test/integration-flushall`, `test/helpers` (namespace por arquivo, suíte de contrato de store), `test/{unit,integration}/review3-{engine,io}.test.ts` (terceira revisão externa) |
+| Docs                             | `README.md`, `docs/pt/*`, `examples/basic`                                                                                       |
 
 ### Decisões tomadas com o dono do projeto
 

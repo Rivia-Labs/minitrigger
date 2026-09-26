@@ -61,7 +61,9 @@ iniciada — ela volta para a fila **sem gastar uma tentativa**, e tenta de novo
   não declara um é `ConfigError`. `limit` é compartilhado por todas as tasks da fila, como as
   outras configurações de fila.
 - **Só `engine.trigger` aceita `concurrencyKey` por enquanto** (não `step.trigger*`);
-  `runs.replay()` mantém a chave da run original. Filhas disparadas via
+  `runs.replay()` mantém a chave da run original **só enquanto a fila ainda declarar
+  `concurrencyKey`** — se ela foi removida da configuração da fila desde então, a run replayada
+  fica sem chave e roda sem limite. Filhas disparadas via
   `step.trigger`/`step.triggerAndWait`/`step.batchTriggerAndWait` numa fila com `concurrencyKey`
   rodam **sem limite** — o limite só se aplica a uma run cujo próprio `concurrencyKey` foi definido
   por `engine.trigger`.
@@ -144,6 +146,14 @@ await engine.queues.scale("llm", 5); // só o worker DESTE processo, até ele re
   cada tick do reconciliador. Depois de um `FLUSHALL` do Redis (que apaga a flag do BullMQ), uma
   fila pausada volta a ser pausada dentro de `reconciler.intervalMs` (15 s por padrão); runs dela
   podem iniciar nessa janela.
+- O reconciliador do líder exclui filas pausadas das suas varreduras de enqueue perdido/waiting
+  parada, então o backlog de uma fila pausada nunca atrasa achar jobs de verdade perdidos de
+  **outras** filas — mas excluir essas linhas ainda custa algo em cada tick: é um filtro aplicado
+  durante a varredura ordenada por `run_after`, não um índice que pula essas linhas de cara. Conte
+  algo como 0,1 ms de trabalho extra por tick a cada 1 000 linhas `queued`/`waiting` numa fila
+  pausada; uma fila pausada com um backlog muito grande (milhões de runs `queued` deixadas de
+  propósito) deixa todo tick do líder proporcionalmente mais lento enquanto ela ficar pausada e
+  esse backlog continuar lá.
 - Só filas usadas pelas tasks deste engine (ou com estado salvo) podem ser pausadas; a fila interna
   `${prefix}-system` não pode.
 - `list()` devolve as filas deste engine mais toda fila com estado salvo. `paused` vem de Postgres;

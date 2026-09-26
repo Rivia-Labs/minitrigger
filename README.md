@@ -64,17 +64,25 @@ with access to the repo) and add it from disk:
 
 ```bash
 gh release download v0.2.0 -R igorabreu29/minitrigger -p "*.tgz"
-pnpm add ./rivia-labs-minitrigger-0.2.0.tgz bullmq ioredis pg
+pnpm add ./minitrigger-0.2.0.tgz bullmq ioredis pg
 pnpm add -D @types/pg   # optional, only needed if you use TypeScript
 ```
 
+(`v0.2.0`'s tarball is named `minitrigger-0.2.0.tgz` — unscoped, see the note below. From
+`v0.3.0` on it's `rivia-labs-minitrigger-<version>.tgz`, and the install command uses
+`@rivia-labs/minitrigger` as shown in the "Recommended: npm" section above.)
+
 Commit the `.tgz` (e.g. under `vendor/`) or fetch it in CI with a token that can read the repo.
 
-A release tarball already contains the built `dist/` (`pnpm pack`'s `files: ["dist", "LICENSE"]`),
-so nothing builds on install: no pnpm `allowBuilds` opt-in, and no fresh, possibly-differently-resolved
-`ioredis`/`msgpackr-extract` pulled in transitively just to run a build script. It's also pinned and
-reproducible — a fixed artifact per version, not "whatever `HEAD` currently contains." `pnpm
-check:pack` (see [Benchmark](#benchmark)) exercises exactly this pack → install → import path in CI.
+A release tarball already contains the built `dist/` (`pnpm pack`'s `files` field: `dist`,
+`LICENSE`, plus the Claude Code plugin content — `.claude-plugin`, `skills`, `docs/pt` — that this
+package also ships for people using it inside a Claude Code project; none of that plugin content
+is imported or loaded by the library itself, and it is not counted in the load-time/bundle-size
+notes below), so nothing builds on install: no pnpm `allowBuilds` opt-in, and no fresh,
+possibly-differently-resolved `ioredis`/`msgpackr-extract` pulled in transitively just to run a
+build script. It's also pinned and reproducible — a fixed artifact per version, not "whatever
+`HEAD` currently contains." `pnpm check:pack` (see [Benchmark](#benchmark)) exercises exactly this
+pack → install → import path in CI.
 
 Releases up to and including `v0.2.0` were published under the unscoped name `minitrigger` (the
 tarball and its `package.json` inside that tag say `minitrigger`, not `@rivia-labs/minitrigger`) —
@@ -308,7 +316,10 @@ queue **without spending an attempt**, and tries again.
   queue doesn't declare one is a `ConfigError`. `limit` is shared by every task of the queue, like
   the other queue settings.
 - Only `engine.trigger` takes a `concurrencyKey` for now (not `step.trigger*`); `runs.replay()`
-  keeps the original run's key. Children triggered via `step.trigger`/`step.triggerAndWait`/
+  keeps the original run's key **only while the queue still declares `concurrencyKey`** — if it
+  was removed from the queue's config since, the replayed run gets no key and runs unlimited (a
+  `ConfigError` at trigger time, not at replay time, since the original run may be long gone).
+  Children triggered via `step.trigger`/`step.triggerAndWait`/
   `step.batchTriggerAndWait` on a queue with `concurrencyKey` run **unlimited** — the limit only
   applies to a run whose own `concurrencyKey` was set by `engine.trigger`.
 - A process that doesn't know the queue's `concurrencyKey` setting (e.g. an old deploy) acquires
@@ -390,14 +401,23 @@ try {
   `debounce` (it would lock the shared pending run until your transaction ends) and not supported
   by `createTestEngine` (`ConfigError`). The engine only runs parameterized, schema-qualified
   statements on your client — never `SET`, `LISTEN` or other session state.
-- **Tuning.** `outbox.pollIntervalMs` (default 2 000), `outbox.batchSize` (default 500, rows per
-  `claimOutbox` statement) and `outbox.reconnectMaxMs` (default 30 000, the LISTEN client's
-  reconnect backoff cap) are `createEngine` config, not per-call options — see the
-  [config table](#config-options). Set `outbox.notify: false` to skip the commit-time `pg_notify`
-  call entirely (the run is still flagged `outbox_pending`): trades the millisecond dispatch latency
-  for never taking the cluster-wide NOTIFY lock at commit, relying solely on the `pollIntervalMs`
-  sweep — worth it for very high-rate, small transactions where the serialized-commit cost (above)
-  matters more than dispatch latency.
+- **Tuning.** `outbox.pollIntervalMs` (default 2 000, minimum 100), `outbox.batchSize` (default
+  500, rows per `claimOutbox` statement, maximum 10 000) and `outbox.reconnectMaxMs` (default
+  30 000, the LISTEN client's reconnect backoff cap, **minimum 500** — the backoff itself starts at
+  500 ms, so a lower cap would collapse it into a near-continuous reconnect loop while Postgres is
+  down) are `createEngine` config, not per-call options — out-of-range values throw `ConfigError`
+  at `createEngine()` time; see the [config table](#config-options). Set `outbox.notify: false` to
+  skip the commit-time `pg_notify` call entirely (the run is still flagged `outbox_pending`):
+  trades the millisecond dispatch latency for never taking the cluster-wide NOTIFY lock at commit,
+  relying solely on the `pollIntervalMs` sweep — worth it for very high-rate, small transactions
+  where the serialized-commit cost (above) matters more than dispatch latency.
+- **Two-phase commit.** Postgres refuses `PREPARE TRANSACTION` for a transaction that has run
+  `NOTIFY`/`pg_notify` — it fails with `ERROR: cannot PREPARE a transaction that has executed
+  NOTIFY`. Since `trigger(..., { tx })` calls `pg_notify` on commit whenever `outbox.notify` is at
+  its default (`true`), a transaction that also does `PREPARE TRANSACTION` (2PC across multiple
+  resources) will fail if it triggered anything. Set `outbox.notify: false` for that engine when
+  your application uses 2PC — dispatch then relies only on the `pollIntervalMs` poll (see above),
+  which never runs `NOTIFY` on your transaction's connection.
 - Upgrading from 0.2.x: migration `006_outbox` adds a column and a partial index; see
   [Upgrading to 0.3.0](#upgrading-to-030).
 
@@ -491,6 +511,14 @@ await engine.queues.scale("llm", 5); // THIS process's worker only, until it res
   it on every reconciler tick. After a Redis `FLUSHALL` (which erases BullMQ's flag), a paused
   queue is paused again within `reconciler.intervalMs` (15 s by default); runs of it could start in
   that window.
+- The leader's reconciler excludes paused queues from its lost-enqueue/stale-waiting scans, so a
+  paused queue's backlog never delays finding genuinely lost jobs of *other* queues — but excluding
+  those rows still costs the leader tick something: it's a filter applied while scanning
+  candidates in `run_after` order, not an index that skips a paused queue's rows outright.
+  Budget roughly 0.1 ms of extra per-tick work per 1 000 `queued`/`waiting` rows sitting in a
+  paused queue; a queue paused with a very large backlog (say, millions of queued runs left
+  piled up on purpose) makes every leader tick proportionally slower for as long as it stays
+  paused and that backlog stays there.
 - Only queues used by this engine's tasks (or with a saved state) can be paused; the internal
   `-system` queue cannot.
 - `list()` returns this engine's queues plus every queue with a saved state. `paused` comes from
@@ -564,17 +592,33 @@ const { retried, skipped, hasMore, nextCursor } = await engine.runs.retryFailed(
   `canceled` lists every run moved to `canceled`, descendants included. `failed` lists one entry
   (`{ runId, error: { name, message } }`) per matched run whose own cancel raised something other
   than the transparently-retried deadlock (a store/Redis hiccup): the call still cancels every
-  other matched run rather than losing `canceled` entirely to the first error — call `cancelMany`
-  again (same filter, or `cursor: nextCursor`) to retry those.
+  other matched run rather than losing `canceled` entirely to the first error. To retry only those
+  failures, call `cancelMany` again with the **same** `cursor` you used for *this* call (not
+  `nextCursor` — that page's own candidates are still `queued`/`running`/`waiting`, since they
+  failed to cancel, so they're matched again from the same starting point); passing no cursor at
+  all (start over) also retries them, along with everything before that page.
 - `retryFailed` retries the matching `failed` top-level runs like `runs.replay()`: a **new** run of
   the same task with the same payload (`attempt` starts over; the failed run is left as it was;
-  its concurrency key is kept). Each failed run is retried at most once, even by concurrent calls,
-  so calling it again (with or without the cursor) never duplicates. Runs with a parent are left out
+  its concurrency key is kept only while the queue still declares `concurrencyKey`, same as
+  `runs.replay()` above). A run this call retried is **excluded from candidacy** on every future
+  call (matched by its `__retry:<id>` idempotency key, decision 9): pagination with `nextCursor`
+  is safe to continue even while other calls are retrying runs concurrently, and re-running the
+  same filter from the start (e.g. a daily sweep) only ever retries each failed run once — you
+  don't need to track which ones you already handled. `already_retried` in `skipped` (below) is
+  therefore rare in practice: it only happens when two calls race for the *same* run in the small
+  window between listing it as a candidate and creating its retry. Runs with a parent are left out
   (their failure was already delivered to the parent: retry the parent). `skipped` lists runs whose
   task this process does not register (`task_not_registered`), that a concurrent call retried first
   (`already_retried`), or whose stored payload no longer validates, e.g. `config.limits.maxPayloadBytes`
   was lowered since it was created (`invalid_payload` — retrying it would fail the same way on every
   future call too, so it's skipped rather than failing the whole batch).
+- **On a large `runs` table, pass `createdFrom`** (e.g. "no older than 24h") to both calls: without
+  it, the first page's query still has to scan forward from the oldest matching row, which for
+  `cancelMany`/`retryFailed` means scanning through however much old, already-finished history
+  exists before it reaches anything recent — measured ~143 ms for the first page's query alone
+  against a `runs` table with 1M finished rows on unremarkable hardware. `cursor`-based pagination
+  itself is fine (it seeks by index, doesn't re-scan); it's specifically a `createdFrom`-less first
+  call on an old table that pays this cost every time.
 
 Cancellation works across processes: the canceled run ids are published on Redis pub/sub
 (`${prefix}:cancel`), and every started engine sharing the same `prefix` aborts its local
@@ -624,7 +668,7 @@ See the [config options table](#config-options) below for every field.
 ```ts
 interface Engine {
 	migrate(): Promise<MigrateResult>;         // applies pending migrations; safe to call concurrently
-	start(options?: { queues?: string[] }): Promise<void>; // starts workers; omit to start none
+	start(options?: { queues?: string[] }): Promise<void>; // starts workers; omit `queues` to start every declared task queue (the `-system` worker always starts)
 	stop(): Promise<void>;                      // graceful shutdown; idempotent
 	trigger<T extends AnyTask>(task: T, payload?, options?: TriggerOptions): Promise<RunHandle<TaskOutput<T>>>;
 	runs: {
@@ -730,7 +774,11 @@ for await (const token of engine.runs.readStream<string>(runId, "answer")) proce
   given to `ctx.stream` threw, or the attempt was aborted mid-stream), the iteration **throws** a
   `MinitriggerError` (with the original `Name: message`) after yielding the chunks written before
   it. Each reader uses its own Redis connection, closed when the iteration ends (or on `stop()`,
-  which ends the iteration cleanly, without an error, like `runs.subscribe`).
+  which ends the iteration cleanly, without an error, like `runs.subscribe`). A Redis error on
+  that connection while reading (e.g. `LOADING` right after a Redis restart, `NOAUTH`) also
+  **throws** out of the iteration, distinct from `stop()`'s clean end — it no longer silently ends
+  the stream as if it had reached the writer's end marker, which would otherwise drop whatever
+  chunks the reader hadn't gotten to yet without any indication something went wrong.
 - Readers stop at the **first** end marker. If a run retries after a stream error, the next
   attempt's `ctx.stream` with the same name appends to the same stream key, after that marker:
   a reader starting from the beginning never sees the retry's chunks. Use a per-attempt name
@@ -744,11 +792,17 @@ import { attachDefaultLogger } from "@rivia-labs/minitrigger";
 const detach = attachDefaultLogger(engine); // uses engine's own config.logger
 // attachDefaultLogger(engine, pino());     // or an explicit pino/console-compatible logger
 
+// A TestEngine has no `.logger` of its own -- the second argument is required for it:
+// attachDefaultLogger(testEngine, pino());
+
 // later, to stop:
 detach();
 ```
 
-Opt-in only — neither `createEngine` nor `start()` calls it for you. It subscribes to
+Opt-in only — neither `createEngine` nor `start()` calls it for you. `engine` can be any engine
+exposing `events` — a real `Engine` or a `TestEngine` (the `EventSource` type) — but the `logger`
+argument is only optional for an `Engine`, which carries its own `config.logger`; a `TestEngine`
+has none, so it's required there (omitting it throws `ConfigError`). It subscribes to
 `engine.events` and writes one structured line per run transition:
 
 | Event | Level | Extra fields |
@@ -763,8 +817,17 @@ Every line also carries `runId`, `taskId`, `attempt`. **Security by default:** a
 never includes the full `SerializedError` (no `stack`, no chained `cause`) and never the run's
 payload or output — only `error.name`/`error.message`. `run:queued`/`run:waiting` aren't logged
 (noisier, less actionable by default); subscribe to them yourself via `engine.events.on` if needed.
-A logging call that itself throws (a broken custom `logger`) is caught and reported once through
-`logger.error`, never thrown back into `engine.events`.
+Your own logger's level filter still applies (e.g. a pino logger configured at `warn` drops the
+`info` lines) — with one exception: the **built-in default logger** (`config.logger` left unset)
+normally drops `debug`/`info` entirely, which would make `run:started`/`run:completed` disappear
+silently, defeating the point of attaching a logger; `attachDefaultLogger` special-cases it so its
+`info` lines go to `console.info` (same `[minitrigger]` prefix as its `warn`/`error`) instead of
+being dropped — every other logger is left exactly as configured.
+A logging call that itself throws (a broken custom `logger`) is caught; only the *first* such
+failure is reported through `logger.error` (a broken logger would otherwise report itself on every
+single event) — later failures in the same `attachDefaultLogger()` call are dropped silently, and a
+`logger.error` call that itself throws while reporting is swallowed too. Nothing is ever thrown
+back into `engine.events`.
 
 #### Progress
 
@@ -979,9 +1042,9 @@ interface StepApi {
 | `reconciler.intervalMs` | `15 000` | Leader-election + reconciler tick. Also the worst-case latency to recover a lost enqueue (plus `graceMs`). |
 | `reconciler.graceMs` | `30 000` | How long a `queued`/`waiting` run may sit past its `run_after` before the reconciler re-enqueues it. |
 | `reconciler.batchSize` | `100` | Rows handled per reconciler case per tick. |
-| `outbox.pollIntervalMs` | `2 000` | How often every started engine sweeps for committed `trigger(..., { tx })` runs even without a `NOTIFY`. |
-| `outbox.batchSize` | `500` | Rows claimed per `claimOutbox` statement. |
-| `outbox.reconnectMaxMs` | `30 000` | Upper bound of the dedicated LISTEN client's reconnect backoff. |
+| `outbox.pollIntervalMs` | `2 000` | How often every started engine sweeps for committed `trigger(..., { tx })` runs even without a `NOTIFY`. Range 100–2³¹-1. |
+| `outbox.batchSize` | `500` | Rows claimed per `claimOutbox` statement. Range 1–10 000. |
+| `outbox.reconnectMaxMs` | `30 000` | Upper bound of the dedicated LISTEN client's reconnect backoff. Range 500–2³¹-1 (the backoff starts at 500 ms). |
 | `outbox.notify` | `true` | `false` skips the commit-time `pg_notify` in `trigger(..., { tx })` (dispatch then relies only on `outbox.pollIntervalMs`). See [Transactional trigger](#transactional-trigger-outbox). |
 | `limits.maxPayloadBytes` | `1 MB` | Trigger payloads, token outputs, task outputs. |
 | `limits.maxStepOutputBytes` | `256 KB` | `step.run` outputs. |
@@ -1143,13 +1206,21 @@ it("approves when the token resolves truthy", async () => {
 - Payload/output validation reuses the real `Serializable`/size checks
   (`config.limits`, overridable via `options.limits`) and step-name validation
   (`ctx.step.*`'s reserved `#`/`:` characters included), so a task that passes here behaves the
-  same in production. An invalid `payload` argument throws (like `trigger()` would); an invalid
-  **output** (task's own or a step's) comes back as `result.error`, not thrown — same as a failed
-  run in production, `retryable: false`.
-- `runTask` never rejects for an error the task's own code threw (or an invalid output): it comes
-  back as `result.error`, exactly like `TestEngine#runInline`'s `error` — `retryable` is `false`
-  for the same deterministic bugs production treats as fatal (bad step name, duplicate step,
-  non-serializable output, ...), and otherwise `true` unless the task threw `AbortTaskRunError`.
+  same in production. An invalid `payload` argument throws (like `trigger()` would). An invalid
+  **task** output (the value `run` itself returns) comes back as `result.error`, not thrown —
+  same as a failed run in production, `retryable: false` (deterministic: retrying wouldn't help).
+  An invalid **step** output (`ctx.step.run`'s return value) is different: like production, it's
+  an ordinary `SerializationError` handed back to the task's own code, not fatal — uncaught, it
+  becomes a normal `result.error` with `retryable: true` (the task could catch it, or a future
+  attempt with smaller output could succeed).
+- `runTask` never rejects for an error the task's own code threw (or an invalid task output): it
+  comes back as `result.error`, exactly like `TestEngine#runInline`'s `error` — `retryable` is
+  `false` for the same deterministic bugs production treats as fatal (bad step name, duplicate or
+  nested step, invalid task output, ...), and otherwise `true` (this includes an invalid **step**
+  output, per above) unless the task threw `AbortTaskRunError`. On a thrown error, `runTask` waits
+  up to `options.settleTimeoutMs` (default: `stallTimeoutMs`'s default, 60 s) for steps still in
+  flight before reporting it, mirroring production's wait bounded by `stallTimeoutMs`; a fatal
+  error never waits, and a successful return always waits for every step.
 - **What this does *not* test:** replay, memoization across attempts, suspension, non-determinism
   detection, real waitpoint timeouts, or anything else that depends on durability. Use
   `createTestEngine` for that; use `runTask` for the logic a task computes given its inputs.
@@ -1194,6 +1265,30 @@ it("approves when the token resolves truthy", async () => {
   `queue_state` table: no lock on `runs`, nothing to prepare.
 - **New APIs:** `engine.queues` (pause/resume/list/scale) and `engine.runs.cancelMany`/
   `retryFailed`; `EngineClient` now includes `queues`.
+- **Transactional trigger (outbox), decision 26.** `trigger(task, payload, { tx })` inserts the run
+  in your own transaction instead of enqueueing right away — see
+  [Transactional trigger](#transactional-trigger-outbox). New `outbox.*` config
+  (`pollIntervalMs`, `batchSize`, `reconnectMaxMs`, `notify`) — see the [config table](#config-options).
+- **ORM adapters for the outbox:** `@rivia-labs/minitrigger/typeorm|knex|drizzle|prisma` subpaths
+  (`typeormTx`, `knexTx`, `drizzleTx`, `prismaTx`) turn an ORM's own transaction handle into the
+  `tx` client above — see [With an ORM](#with-an-orm-typeorm-knex-drizzle-prisma).
+- **`attachDefaultLogger(engine, logger?)`**, opt-in structured logging over `engine.events` — see
+  [Structured logging](#structured-logging-attachdefaultlogger).
+- **Test helpers**, from the `/testing` subpath: `assertTriggered`/`refuteTriggered`/`allTriggered`
+  (assert what an `Engine`/`TestEngine` triggered) and `runTask` (unit-test one task's `run`
+  function directly, no engine/store/queue) — see
+  [`assertTriggered` / `refuteTriggered` / `allTriggered`](#asserttriggered--refutetriggered--alltriggered)
+  and [`runTask`: unit-testing one task's logic](#runtask-unit-testing-one-tasks-logic).
+- **Reads keep working while `stop()` drains, writes don't.** During a graceful `stop()` (workers
+  closing, active runs draining, connections being released), read-only calls — `runs.get`/`list`/
+  `logs`/`steps`, `runs.cancel`, `tokens.complete`, `queues.list`, `schedules.list` — keep working
+  right up until `stop()` finishes closing everything (its very last step, just before closing a
+  pool this engine created); only after that do they throw `"this engine was stopped; create a new
+  one"`. Calls that start new work — `trigger`, `runs.replay`/`subscribe`/`readStream`/`cancelMany`/
+  `retryFailed`, `queues.pause`/`resume`/`scale`, `schedules.upsert`/`delete` — throw that same
+  error as soon as `stop()` **begins**, not when it finishes, since starting new work while the
+  engine is on its way out would fight the shutdown. A `TestEngine` never throws this on its own
+  (it has no `stop()`); it stays usable for the lifetime of the object.
 
 ## Upgrading to 0.2.0
 
@@ -1309,6 +1404,15 @@ concern is specific to 005's two new indexes.
   `noeviction`, migrations genuinely pending) throws `ConfigError` naming every problem found. The
   same function (`checkEnvironment`, exported from the package root along with its types) can be
   called standalone too, e.g. in a health check or before `migrate()` in a deploy script.
+- **`start()` bounds its Redis waits.** It first `PING`s the shared connection (5 s timeout) before
+  doing anything else, so a fully unreachable Redis fails fast instead of hanging. It then opens
+  (or reuses) the dedicated pub/sub subscriber connection and waits for its `SUBSCRIBE` to become
+  ready — also bounded to 5 s. The shared connection working is not enough: a *new* connection
+  (the subscriber) can still fail to become ready (Redis refusing new connections over
+  `maxclients`, or dropped right after that first `PING`), which without this bound would hang
+  `start()` forever (the subscriber's `maxRetriesPerRequest: null` retries indefinitely). Past 5 s,
+  `start()` rejects with a `ConfigError` naming the likely cause (check `maxclients`/`CLIENT LIST`
+  or the network) instead of hanging; fix it and call `start()` again.
 - **Postgres is the source of truth.** `trigger()` does two non-atomic writes: insert the run in
   Postgres, then enqueue it in Redis. If the process dies between the two, the run exists but was
   never enqueued. This is recovered by the **reconciler**, which periodically re-enqueues
@@ -1333,16 +1437,46 @@ concern is specific to 005's two new indexes.
   would wait for a reconnection that never comes). Closing the pool the engine created is bounded
   too (5 s): if a client is still checked out, `stop()` logs a `warn` and resolves, and the pool
   finishes closing once that client is released. An injected pool is never closed.
-- **Pool sizing.** The pool needs `max >= total worker concurrency + 5` (the engine's own
-  bookkeeping queries need headroom beyond what your workers consume). On top of the pool, every
-  **started** engine holds **two** dedicated connections outside it (leader election and the
-  outbox `LISTEN`), so budget `max_connections` for `processes × (pool.max + 2)`. A pool the engine creates
-  gets that size by default (at least 10) and a 10 s `connectionTimeoutMillis`
-  (`pool.connectionTimeoutMs`). If you inject your own `pg.Pool`, size it the same way and set a
-  `connectionTimeoutMillis`: `start()` warns when it is smaller than the started queues need or
-  has no acquisition timeout (a heartbeat would then wait for a connection without limit instead of
-  failing with a warning). A separate, dedicated pool for the library is recommended over sharing
-  your application's pool.
+#### Pool sizing
+
+The pool needs `max >= total worker concurrency + 5` (the engine's own
+bookkeeping queries need headroom beyond what your workers consume). On top of the pool, every
+**started** engine holds **two** dedicated Postgres connections outside it (leader election and the
+outbox `LISTEN`), so budget `max_connections` for `processes × (pool.max + 2)`. A pool the engine creates
+gets that size by default (at least 10) and a 10 s `connectionTimeoutMillis`
+(`pool.connectionTimeoutMs`). If you inject your own `pg.Pool`, size it the same way and set a
+`connectionTimeoutMillis`: `start()` warns when it is smaller than the started queues need or
+has no acquisition timeout (a heartbeat would then wait for a connection without limit instead of
+failing with a warning). A separate, dedicated pool for the library is recommended over sharing
+your application's pool.
+
+#### Redis connections per engine
+
+Every non-blocking use (BullMQ `Queue` producers for every task queue plus `-system`, the outbox
+publish, the streams writer, environment checks) shares the **one** connection you gave the engine
+(a connection string, or your own injected `ioredis` instance) — no extra socket for those. Two
+kinds of use need their own connection instead, because BullMQ/ioredis don't allow blocking
+commands or pub/sub subscriber mode on a connection also used for regular commands:
+
+- **One `duplicate()` per started worker** (one task queue worker per started queue, plus the
+  always-on `-system` worker): this library creates that duplicate (tracked, closed by `stop()`).
+  BullMQ then creates **one more** connection of its own on top of that, internally, for the
+  blocking fetch (`BZPOPMIN`) each `Worker` needs — invisible to this library's own connection
+  count, but a real socket to Redis, opened and closed by that `Worker` itself. So each started
+  queue (including `-system`) costs **2** actual connections, not 1.
+- **One pub/sub subscriber connection**, created lazily the first time it's needed (`start()`
+  subscribing to cross-process cancellation, or the first `runs.subscribe()` on an engine that
+  never called `start()`) and reused afterwards for every channel this engine subscribes to — never
+  more than one, and only ever created once per engine.
+
+So a started engine with `N` task queues (the default: every declared queue, unless `start({
+queues })` narrows it) holds, once running: `1` (shared) + `2 × (N + 1)` (worker + BullMQ's own
+blocking duplicate, per queue including `-system`) + `1` (subscriber) = `2N + 4` fixed Redis
+connections. A trigger-only engine (never `start()`ed) holds just the shared connection, plus the
+subscriber if it ever calls `runs.subscribe()`. On top of the fixed count, `runs.readStream()`
+opens one more `duplicate()` **per currently-open reader**, closed when that iteration ends (or on
+`stop()`) — not a fixed cost, but worth budgeting for if you expect many concurrent readers.
+
 - **Advisory locks.** Migrations use `pg_advisory_xact_lock` inside a transaction; the leader
   (reconciler/retention owner) uses `pg_try_advisory_lock` on a dedicated client kept outside the
   pool for as long as it holds the lock — never on a connection borrowed from a pool, since a
