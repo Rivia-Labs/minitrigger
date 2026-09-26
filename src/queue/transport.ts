@@ -2,6 +2,7 @@ import { DelayedError, Job, Queue, Worker } from "bullmq";
 import type { EngineLogger } from "../config.js";
 import { ConfigError, MinitriggerError } from "../errors.js";
 import { SystemJobDelayed } from "../executor/system.js";
+import type { RunRecord } from "../store/types.js";
 import { validateQueueName, validateSqlIdentifier } from "../utils/identifiers.js";
 import type { RedisConnections } from "./connections.js";
 import { runJobId, SCHEDULE_TICK_JOB_NAME, systemQueueName } from "./ids.js";
@@ -24,6 +25,15 @@ export interface ResolvedQueueConfig {
 export interface RunJobData {
 	runId: string;
 	seq: number;
+	/**
+	 * Set only by the Postgres transport (`src/pg/transport.ts`, decision 28(a)): the run already
+	 * claimed in the same statement that picked up this job, so the executor (Task 9) skips its own
+	 * `acquire()` and runs it directly. Type-only addition for this task: the BullMQ path below
+	 * (`enqueueRun`) never sets it on a job it adds -- it would be dead weight to serialize into
+	 * Redis (a BullMQ job is a real persisted payload, unlike a Postgres claim's in-memory result)
+	 * and unsafe as stale data if that same job were ever redelivered.
+	 */
+	claimed?: RunRecord;
 }
 
 export interface CreateTransportOptions {
