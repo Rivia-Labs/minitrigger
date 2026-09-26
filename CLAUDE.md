@@ -44,6 +44,7 @@ Env de teste: `TEST_DATABASE_URL`, `TEST_REDIS_URL` (padrões apontam para o doc
 25. Concurrency key por fila: `queue: { concurrencyKey: { limit } }` + `trigger(..., { concurrencyKey })` limita `running` simultâneas da mesma chave; atraso cresce por tentativa `limited` (backoff 1s–30s).
 26. Trigger transacional (outbox): `trigger(task, payload, { tx })` insere a run na transação do chamador; nada é enfileirado antes do commit; `LISTEN`/poll + adaptadores de ORM (`/typeorm`, `/knex`, `/drizzle`, `/prisma`) despacham depois.
 27. Pausa de fila persistida no Postgres (`queue_state`), espelhada no BullMQ (`Queue.pause()`), ressincronizada pelo líder; `engine.queues.*`/`runs.cancelMany`/`retryFailed` para operações em lote.
+28. Transporte Postgres (`transport: "postgres"`): fila = linha de `runs` com `SKIP LOCKED` (claim = `acquire`), `-system` = tabela `system_jobs` com fencing por `locked_by`, wake por `LISTEN/NOTIFY` (payload não confiável, agrupado) + poll adaptativo, pub/sub por `NOTIFY` só com id e sempre relido (cancel só aborta run `canceled`), `globalConcurrency` exato por advisory lock da fila, `cron-parser` para ticks (linha do tick nunca apagada); `prefix`/`redis`/`outbox`/`rateLimit`/streams são `ConfigError`; modo misto no mesmo schema recusado por `schema_meta`.
 
 ## Decisões de implementação
 
