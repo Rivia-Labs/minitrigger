@@ -153,6 +153,21 @@ interleave under its mutex).
 `engine.runs.replay(id)` = `get` + `create` (new id, same task/payload, current queue and
 maxAttempts from the task definition, **no** idempotency key). No dedicated store op.
 
+**`listBatchCandidates`** (`engine.runs.cancelMany`/`retryFailed`): read-only, one statement.
+`SELECT RUN_COLUMNS FROM runs r WHERE <purpose> [AND task_id] [AND queue] [AND created_at >= from]
+[AND created_at < to] [AND (created_at, id) > ($c, $id)] ORDER BY created_at, id LIMIT limit+1`
+(ASCENDING, unlike `list`: parents come before their children, so a batch cancel reaches a parent
+first and its children as descendants; the extra row only says whether `nextCursor` is set; `limit`
+clamped to 1..`MAX_BATCH_LIMIT` = 1000). `purpose: "cancel"` → `status IN ('queued','running',
+'waiting')`; `purpose: "retry"` → `status = 'failed' AND parent_run_id IS NULL AND NOT EXISTS
+(idempotency_keys WHERE task_id = r.task_id AND key = '__retry:' || r.id)` (PK lookup). The engine
+then acts on each row in its own short transaction: `cancel(id)` (a row that finished meanwhile is
+`already_finished` and skipped), or `create` with idempotency key `retryIdempotencyKey(id)`
+(`__retry:<failed run id>`, `ttlMs: null`, the reserved `__` namespace of decision 9): a failed run
+is retried at most once, even by concurrent callers (`existing` = already retried). No transaction
+spans the batch; no `FOR UPDATE SKIP LOCKED` is needed (per-run row locks inside `cancel`, and the
+idempotency claim, make concurrent batches safe).
+
 ## StepStore
 
 | Method             | Decision | SQL shape                                                                                                                                                                                                                                                 |
@@ -207,6 +222,18 @@ Postgres is authoritative for `cron`/`timezone`/`payload` (decision 8): the `-sy
 (engine-owned, not this store) always reads them fresh instead of trusting the BullMQ job
 scheduler's own copy, and ticks create runs through `RunStore.create` with idempotency key
 `__schedule:${id}:${ts}` and `ttlMs: null` -- that flow is the engine's, not `ScheduleStore`'s.
+
+## QueueStateStore (decision 27)
+
+| Method      | SQL shape                                                                                                                                                                                                                                                                                              |
+| ----------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `setPaused` | One statement: `WITH prev AS (SELECT paused ... WHERE queue=$1) INSERT ... ON CONFLICT (queue) DO UPDATE SET paused, updated_at=now() RETURNING *, (SELECT paused FROM prev)`. Always writes; `changed` = `paused` differs from the previous value (missing row = not paused; approximate under concurrent writers, informational only). |
+| `get`       | Plain lookup by `queue`.                                                                                                                                                                                                                                                                              |
+| `list`      | `ORDER BY queue` (few rows: one per queue ever paused).                                                                                                                                                                                                                                                |
+
+The engine writes the row first, then mirrors it into BullMQ's queue-level pause flag (Redis);
+`start()` and the leader's reconciler re-apply every row to Redis (see SPEC decision 27). The store
+never talks to Redis.
 
 ## Schema assumptions for 001_init.sql
 
@@ -263,3 +290,10 @@ triggers opens no subtransaction — and works on an autocommit client too. `out
 count and the enqueue data (`delayMs` from `run_after - now()`, plus `attempt`/`error` for the
 status notification) of those still `queued`. The memory store rejects `outbox` and its
 `claimOutbox` always returns nothing.
+
+## Schema assumptions for 007_queue_state.sql
+
+Adds `queue_state(queue text PRIMARY KEY, paused boolean NOT NULL, updated_at timestamptz NOT NULL
+DEFAULT now())` (decision 27). No FK (queues are declared in application code, like
+`schedules.task_id`), no extra index. A queue without a row is not paused. The SQL contract
+harness truncates it and shifts `updated_at` with the other timestamps.

@@ -134,6 +134,87 @@ describe("trigger(..., { tx })", () => {
 		expect(rowCount).toBe(1);
 	});
 
+	it("outbox.notify: false sends no NOTIFY on the channel; dispatch still happens (poll/catch-up)", async () => {
+		const { task, executions } = recorder();
+		// pollIntervalMs is short so a test relying only on the poll (not exercised below, since the
+		// listener's own connect-time catch-up sweep usually wins the race) would still be fast.
+		const engine = makeEngine([task], { outbox: { notify: false, pollIntervalMs: 150 } });
+		await engine.start();
+
+		// A second, independent LISTEN session on the same channel: the most direct way to prove no
+		// `pg_notify` was sent by the `{ tx }` insert -- timing (poll vs. catch-up-on-connect vs.
+		// reconciler) is an implementation detail that can legitimately race either way.
+		const channel = outboxChannel(ns.schema);
+		const rawListener = new Client({ connectionString: ns.databaseUrl });
+		await rawListener.connect();
+		let notifyCount = 0;
+		rawListener.on("notification", m => {
+			if (m.channel === channel) notifyCount++;
+		});
+		await rawListener.query(`LISTEN ${escapeIdentifier(channel)}`);
+
+		try {
+			const handle = await withTx(client => engine.trigger(task, { n: 99 }, { tx: client }));
+
+			await waitFor(async () => (await runStatus(handle.id))?.status === "completed", {
+				timeoutMs: 5_000,
+				intervalMs: 10,
+			});
+			expect(executions).toEqual([99]);
+			expect((await runStatus(handle.id))?.outbox_pending).toBe(false);
+			// Give any (unexpected) async NOTIFY delivery time to arrive before asserting on it.
+			await new Promise(resolve => setTimeout(resolve, 200));
+			expect(notifyCount).toBe(0);
+		} finally {
+			await rawListener.end();
+		}
+	});
+
+	// Item 6: `notify: false` means every trigger waits for the poll (or a late catch-up sweep) to
+	// be dispatched -- a `pollIntervalMs` above 10s combined with it is very likely a
+	// misconfiguration (near-instant dispatch was traded for a multi-second-plus one by accident),
+	// so start() warns about it once, the same way it warns about pool sizing.
+	it("warns once at start() when outbox.notify is false and pollIntervalMs is above 10s", async () => {
+		const warnings: string[] = [];
+		const quiet: EngineLogger = {
+			debug: () => {},
+			info: () => {},
+			warn: (_fields, message) => warnings.push(message),
+			error: (_fields, message) => warnings.push(message),
+		};
+		const engine = makeEngine(
+			[],
+			{ outbox: { notify: false, pollIntervalMs: 15_000 }, logger: quiet },
+			other
+		);
+		await engine.start();
+		expect(warnings.some(m => /notify.*false/i.test(m) && /pollIntervalMs/.test(m))).toBe(true);
+	});
+
+	it("does not warn when outbox.notify is false with a short pollIntervalMs, or when notify is true", async () => {
+		const warnings: string[] = [];
+		const quiet: EngineLogger = {
+			debug: () => {},
+			info: () => {},
+			warn: (_fields, message) => warnings.push(message),
+			error: (_fields, message) => warnings.push(message),
+		};
+		const short = makeEngine(
+			[],
+			{ outbox: { notify: false, pollIntervalMs: 2_000 }, logger: quiet },
+			other
+		);
+		await short.start();
+		await short.stop();
+		const notified = makeEngine(
+			[],
+			{ outbox: { notify: true, pollIntervalMs: 15_000 }, logger: quiet },
+			other
+		);
+		await notified.start();
+		expect(warnings.some(m => /notify.*false/i.test(m))).toBe(false);
+	});
+
 	it("rollback: no run row and nothing executes", async () => {
 		const { task, executions } = recorder();
 		const engine = makeEngine([task]);

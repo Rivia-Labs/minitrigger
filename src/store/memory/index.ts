@@ -15,6 +15,7 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import type { RunStatus, Store, StoreTx } from "../types.js";
 import { createIdempotencyStore } from "./idempotency.js";
 import { createLogStore } from "./logs.js";
+import { createQueueStateStore } from "./queues.js";
 import type { Exec } from "./resolve.js";
 import { createRunStore } from "./runs.js";
 import { createScheduleStore } from "./schedules.js";
@@ -71,6 +72,7 @@ function buildRepos(exec: Exec) {
 		idempotency: createIdempotencyStore(exec),
 		logs: createLogStore(exec),
 		schedules: createScheduleStore(exec),
+		queues: createQueueStateStore(exec),
 	};
 }
 

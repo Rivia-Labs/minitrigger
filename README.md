@@ -20,6 +20,8 @@ own codebase.
 is only used as transport (delivery, delay, concurrency, rate limiting). If Redis is wiped, no run
 is lost — see [Operation](#operation).
 
+Documentação em português: [docs/pt/](docs/pt/README.md)
+
 ### When to use it
 
 - You have a personal or small-team project with tasks that must survive a crash or a redeploy
@@ -388,6 +390,14 @@ try {
   `debounce` (it would lock the shared pending run until your transaction ends) and not supported
   by `createTestEngine` (`ConfigError`). The engine only runs parameterized, schema-qualified
   statements on your client — never `SET`, `LISTEN` or other session state.
+- **Tuning.** `outbox.pollIntervalMs` (default 2 000), `outbox.batchSize` (default 500, rows per
+  `claimOutbox` statement) and `outbox.reconnectMaxMs` (default 30 000, the LISTEN client's
+  reconnect backoff cap) are `createEngine` config, not per-call options — see the
+  [config table](#config-options). Set `outbox.notify: false` to skip the commit-time `pg_notify`
+  call entirely (the run is still flagged `outbox_pending`): trades the millisecond dispatch latency
+  for never taking the cluster-wide NOTIFY lock at commit, relying solely on the `pollIntervalMs`
+  sweep — worth it for very high-rate, small transactions where the serialized-commit cost (above)
+  matters more than dispatch latency.
 - Upgrading from 0.2.x: migration `006_outbox` adds a column and a partial index; see
   [Upgrading to 0.3.0](#upgrading-to-030).
 
@@ -405,6 +415,38 @@ Queue settings are shared per queue **name**: several tasks can reference the sa
 one of them may declare `concurrency`/`globalConcurrency`/`rateLimit` for it — a second, differing
 declaration for the same name fails engine creation with a clear error. A task with no `queue`
 belongs to the `"default"` queue (concurrency 10 unless something else declares it).
+
+#### Pausing, resuming and scaling queues
+
+```ts
+await engine.queues.pause("llm");   // every process stops starting new runs of "llm"
+await engine.queues.resume("llm");
+await engine.queues.list();         // [{ name, paused, updatedAt, declared, declaredConcurrency, concurrency, activeLocal }]
+await engine.queues.scale("llm", 5); // THIS process's worker only, until it restarts
+```
+
+- `pause`/`resume` work across processes and survive restarts. The state is saved in Postgres
+  first (table `queue_state`, the source of truth) and then applied as BullMQ's queue-level pause
+  in Redis, which every worker of every process honors within one fetch. Any engine can call them,
+  started or not (e.g. an admin script). Idempotent.
+- **Pausing never aborts running executions**: they finish (or suspend) normally. Only new jobs
+  of the queue stop being picked up; triggers still create runs (they wait as `queued`), and the
+  queue's retries, sleeps and resumes wait too until `resume`.
+- Every `start()` re-applies the saved state before its workers fetch, and the leader re-applies
+  it on every reconciler tick. After a Redis `FLUSHALL` (which erases BullMQ's flag), a paused
+  queue is paused again within `reconciler.intervalMs` (15 s by default); runs of it could start in
+  that window.
+- Only queues used by this engine's tasks (or with a saved state) can be paused; the internal
+  `-system` queue cannot.
+- `list()` returns this engine's queues plus every queue with a saved state. `paused` comes from
+  Postgres; `concurrency` is this process's current worker concurrency (null when this process
+  runs no worker for the queue); `activeLocal` counts the executions of the queue's runs in
+  progress **in this process** (other processes' are not counted).
+- `scale(name, n)` changes the concurrency of this process's worker at runtime (a decrease stops
+  new fetches beyond `n` at once, running jobs finish; an increase applies at the next fetch). It
+  is not saved and does not affect other processes: to change it everywhere, change `concurrency`
+  in the task and deploy. Keep `pool.max` above the total concurrency + 5 (a warning is logged when
+  it is not).
 
 ### Retries & backoff
 
@@ -440,6 +482,44 @@ suspended (waiting on a sleep, token, or subtask) — only while an attempt is a
 started via `step.trigger`/`triggerAndWait`/`batchTriggerAndWait` that haven't finished). A
 canceled run's `ctx.signal` fires; code that ignores the signal and keeps running can no longer
 write anything (see [Operation](#operation) — ownership is checked on every step write).
+
+#### Bulk cancel and retry
+
+```ts
+let cursor;
+do {
+	const res = await engine.runs.cancelMany({ taskId: "import-csv", limit: 500, cursor });
+	console.log(`canceled ${res.canceled.length}`);
+	cursor = res.nextCursor ?? undefined;
+} while (cursor);
+
+const { retried, skipped, hasMore, nextCursor } = await engine.runs.retryFailed({
+	queue: "emails",
+	createdFrom: new Date(Date.now() - 24 * 3_600_000),
+	limit: 100,
+});
+```
+
+- Filter: `taskId?`, `queue?`, `createdFrom?` (inclusive), `createdTo?` (exclusive), `cursor?`, and a
+  **required** `limit` (1 to 1 000 per call). Runs are walked oldest first; when more match,
+  `hasMore` is true — pass `nextCursor` back as `cursor`.
+- `cancelMany` cancels the matching `queued`/`running`/`waiting` runs, each exactly like
+  `runs.cancel()` (pending descendants too, running executions aborted, events and `runs.subscribe`
+  notified), each in its own short transaction: no long transaction, safe to run next to anything.
+  `canceled` lists every run moved to `canceled`, descendants included. `failed` lists one entry
+  (`{ runId, error: { name, message } }`) per matched run whose own cancel raised something other
+  than the transparently-retried deadlock (a store/Redis hiccup): the call still cancels every
+  other matched run rather than losing `canceled` entirely to the first error — call `cancelMany`
+  again (same filter, or `cursor: nextCursor`) to retry those.
+- `retryFailed` retries the matching `failed` top-level runs like `runs.replay()`: a **new** run of
+  the same task with the same payload (`attempt` starts over; the failed run is left as it was;
+  its concurrency key is kept). Each failed run is retried at most once, even by concurrent calls,
+  so calling it again (with or without the cursor) never duplicates. Runs with a parent are left out
+  (their failure was already delivered to the parent: retry the parent). `skipped` lists runs whose
+  task this process does not register (`task_not_registered`), that a concurrent call retried first
+  (`already_retried`), or whose stored payload no longer validates, e.g. `config.limits.maxPayloadBytes`
+  was lowered since it was created (`invalid_payload` — retrying it would fail the same way on every
+  future call too, so it's skipped rather than failing the whole batch).
 
 Cancellation works across processes: the canceled run ids are published on Redis pub/sub
 (`${prefix}:cancel`), and every started engine sharing the same `prefix` aborts its local
@@ -497,6 +577,8 @@ interface Engine {
 		list(options?: ListRunsOptions): Promise<RunList>;
 		cancel(run: string | RunHandle<unknown>): Promise<"canceled" | "already_finished" | "not_found">;
 		replay<O>(run: string | RunHandle<O>): Promise<RunHandle<O>>; // new run, same payload, no idempotency key
+		cancelMany(filter: BatchRunsFilter): Promise<CancelManyResult>;   // see "Bulk cancel and retry"
+		retryFailed(filter: BatchRunsFilter): Promise<RetryFailedResult>;
 		logs(run, options?: { afterId?: string | null; limit?: number }): Promise<RunLogPage>;
 		steps(run): Promise<RunStep[]>;
 		subscribe(run, options?: { signal?: AbortSignal }): AsyncIterable<RunStatusUpdate>;
@@ -513,8 +595,19 @@ interface Engine {
 	events: {
 		on(event: RunEventName, handler: (event: RunEvent) => void | Promise<void>): () => void;
 	};
+	queues: {                                   // see "Pausing, resuming and scaling queues"
+		pause(name: string): Promise<QueueState>;
+		resume(name: string): Promise<QueueState>;
+		list(): Promise<QueueInfo[]>;
+		scale(name: string, concurrency: number): Promise<void>;
+	};
+	logger: EngineLogger; // config.logger (default: warn/error to console); used by attachDefaultLogger()
 }
 ```
+
+`attachDefaultLogger(engine, logger?)` — see [Structured logging](#structured-logging-attachdefaultlogger)
+above — subscribes an `EngineLogger` (given, or `engine.logger`) to `engine.events` and returns an
+unsubscribe function. Opt-in; exported from the main entry, not a method of `Engine`.
 
 `payload` is required unless the task's `run` takes none (then it's optional and must be omitted
 or `undefined`) — the exact type is `PayloadArgs<TaskPayload<T>, [options?: TriggerOptions]>`, not
@@ -551,7 +644,7 @@ for await (const update of engine.runs.subscribe(runId, { signal })) {
 }
 
 // Local events of THIS process; returns an unsubscribe function.
-const off = engine.events.on("run:completed", event => { /* { name, runId, taskId, status, attempt, error, updatedAt } */ });
+const off = engine.events.on("run:completed", event => { /* { name, runId, taskId, status, attempt, error, updatedAt, startedAt?, durationMs? } */ });
 
 // Chunks written by ctx.stream("answer", ...) in the run, live.
 for await (const token of engine.runs.readStream<string>(runId, "answer")) process.stdout.write(token);
@@ -568,6 +661,15 @@ for await (const token of engine.runs.readStream<string>(runId, "answer")) proce
   process are emitted (the process that triggered, acquired, suspended, finished, retried or
   canceled the run; stall recoveries on the leader). Handlers run after the commit, off the run's
   critical path; a throwing or rejecting handler is logged with `logger.error`.
+- `run:completed`/`run:failed`/`run:retrying`/`run:waiting` also carry `startedAt` (DB clock) and
+  `durationMs` (monotonic clock, `performance.now()` — never persisted to Postgres, telemetry
+  only). Both measure the **current execution**, not the whole attempt: since its most recent
+  acquisition or resume, not summed across earlier suspensions (a run that slept, then resumed and
+  suspended again waiting on a token, then finally completed reports only the last leg's duration).
+  Absent on `run:queued`, `run:started` and `run:canceled`, which aren't timing one execution's end
+  — this includes a suspension that requeues right away because everything it waited for was
+  already resolved by the time the suspension transaction ran (a `run:queued` transition, not a
+  `run:waiting` execution with something actually left pending).
 - `runs.readStream` reads from the start of the stream (so a late reader gets every chunk still
   kept) and ends at the writer's end marker. When the stream ended with an error (the `source`
   given to `ctx.stream` threw, or the attempt was aborted mid-stream), the iteration **throws** a
@@ -578,6 +680,36 @@ for await (const token of engine.runs.readStream<string>(runId, "answer")) proce
   attempt's `ctx.stream` with the same name appends to the same stream key, after that marker:
   a reader starting from the beginning never sees the retry's chunks. Use a per-attempt name
   (e.g. `` `answer-${ctx.run.attempt}` ``) when a stream must survive retries.
+
+#### Structured logging (`attachDefaultLogger`)
+
+```ts
+import { attachDefaultLogger } from "@rivia-labs/minitrigger";
+
+const detach = attachDefaultLogger(engine); // uses engine's own config.logger
+// attachDefaultLogger(engine, pino());     // or an explicit pino/console-compatible logger
+
+// later, to stop:
+detach();
+```
+
+Opt-in only — neither `createEngine` nor `start()` calls it for you. It subscribes to
+`engine.events` and writes one structured line per run transition:
+
+| Event | Level | Extra fields |
+|---|---|---|
+| `run:started` | `info` | — |
+| `run:completed` | `info` | `durationMs` |
+| `run:failed` | `error` | `durationMs`, `error: { name, message }` |
+| `run:retrying` | `warn` | `durationMs`, `error: { name, message }` |
+| `run:canceled` | `warn` | — |
+
+Every line also carries `runId`, `taskId`, `attempt`. **Security by default:** a failure/retry line
+never includes the full `SerializedError` (no `stack`, no chained `cause`) and never the run's
+payload or output — only `error.name`/`error.message`. `run:queued`/`run:waiting` aren't logged
+(noisier, less actionable by default); subscribe to them yourself via `engine.events.on` if needed.
+A logging call that itself throws (a broken custom `logger`) is caught and reported once through
+`logger.error`, never thrown back into `engine.events`.
 
 #### Progress
 
@@ -792,6 +924,10 @@ interface StepApi {
 | `reconciler.intervalMs` | `15 000` | Leader-election + reconciler tick. Also the worst-case latency to recover a lost enqueue (plus `graceMs`). |
 | `reconciler.graceMs` | `30 000` | How long a `queued`/`waiting` run may sit past its `run_after` before the reconciler re-enqueues it. |
 | `reconciler.batchSize` | `100` | Rows handled per reconciler case per tick. |
+| `outbox.pollIntervalMs` | `2 000` | How often every started engine sweeps for committed `trigger(..., { tx })` runs even without a `NOTIFY`. |
+| `outbox.batchSize` | `500` | Rows claimed per `claimOutbox` statement. |
+| `outbox.reconnectMaxMs` | `30 000` | Upper bound of the dedicated LISTEN client's reconnect backoff. |
+| `outbox.notify` | `true` | `false` skips the commit-time `pg_notify` in `trigger(..., { tx })` (dispatch then relies only on `outbox.pollIntervalMs`). See [Transactional trigger](#transactional-trigger-outbox). |
 | `limits.maxPayloadBytes` | `1 MB` | Trigger payloads, token outputs, task outputs. |
 | `limits.maxStepOutputBytes` | `256 KB` | `step.run` outputs. |
 | `limits.maxLogEntryBytes` | `16 KB` | One `ctx.logger` entry's `data`. |
@@ -861,8 +997,13 @@ it("approves a document", async () => {
   `drain`/`drive`/`runInline`/`clock.advance` and `trigger` also trigger that sync, so
   `schedules.list()` on a fresh engine already sees them), rejects with a `ConfigError` for an
   unknown schedule id, and rejects with whatever error the tick job itself failed with.
-- `EngineClient` (`Pick<Engine, "trigger" | "runs" | "tokens" | "schedules" | "events">`) is the
-  surface `Engine` and `TestEngine` share: use it to type a helper that works against either.
+- `EngineClient` (`Pick<Engine, "trigger" | "runs" | "tokens" | "schedules" | "events" |
+  "queues">`) is the surface `Engine` and `TestEngine` share: use it to type a helper that works
+  against either.
+- `queues.pause`/`resume`/`list` work in memory: a paused queue's jobs are held (a drain never
+  takes them and they never move the clock) until `resume`, which does not drain by itself (drive
+  the engine again). `queues.scale` throws (no workers: one job at a time). `runs.cancelMany`/
+  `retryFailed` work as in production.
 - `debounce` works as in production for triggers issued before the next drain. `concurrencyKey`
   is checked too, but the test engine runs one job at a time, so two runs of a key never overlap on
   their own; a run limited by some other `running` run is re-delayed with the same growing backoff
@@ -872,6 +1013,91 @@ it("approves a document", async () => {
   than `maxJobsPerDrain` jobs (default 10 000) throws, to catch runs that never settle. Of
   `retention`, only `days` is accepted (for the idempotency-key TTL check, exactly as in
   `createEngine`): the test engine never runs retention sweeps.
+
+### `assertTriggered` / `refuteTriggered` / `allTriggered`
+
+Also from `@rivia-labs/minitrigger/testing`, inspired by `@rivia-labs/oban-ts`'s
+`assertEnqueued`/`refuteEnqueued`/`allEnqueued`: assertions over which runs a `TestEngine` has
+triggered, built entirely on `engine.runs.list()` — so they work for a child triggered by
+`ctx.step.trigger*` exactly like a top-level `engine.trigger()`, and for a real `Engine` too (they
+only need `runs`, via the shared `EngineClient` surface).
+
+```ts
+import { assertTriggered, createTestEngine, refuteTriggered } from "@rivia-labs/minitrigger/testing";
+import { expect, it } from "vitest";
+import { placeOrder, sendReceipt } from "./tasks.js";
+
+it("places an order and triggers a receipt", async () => {
+	const engine = createTestEngine({ tasks: [placeOrder, sendReceipt] });
+	const { id } = await engine.trigger(placeOrder, { orderId: 1 });
+	await engine.drive(id); // runs placeOrder, which does ctx.step.trigger("receipt", sendReceipt, ...)
+
+	await assertTriggered(engine, { task: sendReceipt, payload: { orderId: 1 } });
+	await refuteTriggered(engine, { task: sendReceipt, payload: { orderId: 2 } });
+	await engine.stop();
+});
+```
+
+Match criteria (all optional, combined with AND):
+
+| Field | Matches when |
+| --- | --- |
+| `task` | the task (object or id) equals it |
+| `payload` | the run's payload **contains** these keys with equal values (deep; a nested array must match exactly, not as a subset) |
+| `status` | one status, or any of several |
+| `concurrencyKey` | equals it |
+
+`assertTriggered` resolves with the first match (oldest first), so you can chain further
+assertions off it (`(await assertTriggered(engine, ...)).runId`); with no match, it throws an
+`AssertionError` listing what WAS triggered (bounded, payloads truncated, never a full dump).
+`allTriggered(engine, match?)` returns every match, oldest first.
+
+### `runTask`: unit-testing one task's logic
+
+`runTask(task, payload, options?)`, also from the testing subpath, runs a task's `run` function
+directly — **no engine, no store, no queue** — for a fast unit test of its logic in isolation, the
+way you'd unit test any other function:
+
+```ts
+import { runTask } from "@rivia-labs/minitrigger/testing";
+import { expect, it } from "vitest";
+import { approval } from "./tasks.js";
+
+it("approves when the token resolves truthy", async () => {
+	const result = await runTask(approval, { doc: "contract.pdf" }, {
+		tokens: { approval: { approved: true } },
+	});
+	expect(result).toMatchObject({ output: { status: "approved" }, error: null });
+});
+```
+
+- `ctx.step.run(name, fn)` calls `fn` immediately (no memoization/replay to check against) and
+  records the call; `ctx.step.sleep` resolves instantly. Both are recorded in `result.steps`.
+- `ctx.step.createToken`/`waitForToken` and `ctx.step.trigger`/`triggerAndWait`/
+  `batchTriggerAndWait` have no engine to resolve them for real, so they need a test double —
+  `options.tokens: { [name]: value }` (or a `() => value` function, called lazily) and
+  `options.children: { [taskId]: (payload) => output }` respectively — or they **throw** an
+  actionable error (not returned as `result.error`: it's a missing test double, not a task bug).
+  A `createToken` that's never awaited needs no entry. A `children` stub that throws only fails
+  its own `triggerAndWait`/`batchTriggerAndWait` result (`{ ok: false, error }`); `trigger`
+  (fire-and-forget) propagates it like any step. Every call is also recorded in `result.triggered`.
+- `ctx.logger` entries land in `result.logs`; `ctx.progress.set` values, in call order, in
+  `result.progress`; `ctx.stream(name, ...)` items, per stream name, in `result.streams`.
+  `ctx.signal` never fires unless you pass `options.signal`; `ctx.run.attempt` defaults to 1
+  (override it to exercise attempt-dependent logic).
+- Payload/output validation reuses the real `Serializable`/size checks
+  (`config.limits`, overridable via `options.limits`) and step-name validation
+  (`ctx.step.*`'s reserved `#`/`:` characters included), so a task that passes here behaves the
+  same in production. An invalid `payload` argument throws (like `trigger()` would); an invalid
+  **output** (task's own or a step's) comes back as `result.error`, not thrown — same as a failed
+  run in production, `retryable: false`.
+- `runTask` never rejects for an error the task's own code threw (or an invalid output): it comes
+  back as `result.error`, exactly like `TestEngine#runInline`'s `error` — `retryable` is `false`
+  for the same deterministic bugs production treats as fatal (bad step name, duplicate step,
+  non-serializable output, ...), and otherwise `true` unless the task threw `AbortTaskRunError`.
+- **What this does *not* test:** replay, memoization across attempts, suspension, non-determinism
+  detection, real waitpoint timeouts, or anything else that depends on durability. Use
+  `createTestEngine` for that; use `runTask` for the logic a task computes given its inputs.
 
 ## Upgrading to 0.3.0
 
@@ -909,6 +1135,10 @@ it("approves a document", async () => {
 
   Check the definitions against `src/migrations/006_outbox.sql` of the version you install. Coming
   from 0.1.x, apply the 0.2.0 steps below first.
+- **Migration `007_queue_state`** (queue pause/resume, decision 27) only creates the small
+  `queue_state` table: no lock on `runs`, nothing to prepare.
+- **New APIs:** `engine.queues` (pause/resume/list/scale) and `engine.runs.cancelMany`/
+  `retryFailed`; `EngineClient` now includes `queues`.
 
 ## Upgrading to 0.2.0
 

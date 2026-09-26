@@ -259,13 +259,22 @@ export interface NewRun {
 	/** Decision 25: stored in `runs.concurrency_key`; enforced by {@link RunStore.acquireWithConcurrencyLimit}. */
 	concurrencyKey?: string;
 	/**
-	 * Decision 26 (transactional trigger): the run is inserted with `outbox_pending = true` and the
-	 * same statement runs `pg_notify(channel, '')`, so the caller must NOT enqueue `created.enqueue`
-	 * (the transaction is not committed yet); a started engine claims it with
-	 * {@link RunStore.claimOutbox} after the commit. Not combinable with `debounce` (the store
-	 * throws). Only the SQL store supports it (the memory store throws).
+	 * Decision 26 (transactional trigger): the run is inserted with `outbox_pending = true`, so the
+	 * caller must NOT enqueue `created.enqueue` (the transaction is not committed yet); a started
+	 * engine claims it with {@link RunStore.claimOutbox} after the commit (poll sweep, and -- unless
+	 * `notify: false` -- the NOTIFY below). Not combinable with `debounce` (the store throws). Only
+	 * the SQL store supports it (the memory store throws).
 	 */
-	outbox?: { channel: string };
+	outbox?: {
+		channel: string;
+		/**
+		 * `false` skips the same statement's `pg_notify(channel, '')` (config `outbox.notify`,
+		 * default `true`): the commit no longer takes the cluster-wide NOTIFY lock, at the cost of
+		 * dispatch relying entirely on the listener's poll sweep (`outbox.pollIntervalMs`) instead of
+		 * near-instant delivery. `outbox_pending` is set either way, so the poll always finds it.
+		 */
+		notify?: boolean;
+	};
 }
 
 /**
@@ -491,6 +500,45 @@ export interface ListRunsResult {
 	nextCursor: RunCursor | null;
 }
 
+/** Upper bound of {@link BatchCandidatesFilter.limit} (`runs.cancelMany`/`runs.retryFailed`). */
+export const MAX_BATCH_LIMIT = 1_000;
+
+/**
+ * `idempotency_keys.key` of the run created by `runs.retryFailed` for a failed run (decision 9's
+ * reserved `__` namespace, `expires_at NULL`): a failed run is retried at most once, even by
+ * concurrent calls.
+ */
+export function retryIdempotencyKey(failedRunId: string): string {
+	return `__retry:${failedRunId}`;
+}
+
+/**
+ * Candidates of a batch operation, oldest first: `(created_at, id)` ASCENDING (parents before
+ * their children, which matters for `cancel`). `purpose`:
+ * - `cancel`: `status IN ('queued','running','waiting')`;
+ * - `retry`: `status = 'failed'`, `parent_run_id IS NULL` (a child's failure was already delivered
+ *   to its parent) and no {@link retryIdempotencyKey} row for `(task_id, key)` yet.
+ */
+export interface BatchCandidatesFilter {
+	purpose: "cancel" | "retry";
+	taskId?: string;
+	queue?: string;
+	/** Inclusive lower bound on `created_at`. */
+	createdFrom?: Date;
+	/** Exclusive upper bound on `created_at`. */
+	createdTo?: Date;
+	/** Exclusive: rows strictly AFTER this cursor in `(created_at asc, id asc)` order. */
+	cursor?: RunCursor;
+	/** 1..{@link MAX_BATCH_LIMIT}; larger values are clamped. */
+	limit: number;
+}
+
+export interface BatchCandidatesResult {
+	items: RunRecord[];
+	/** Cursor of the last item when more rows match (probed with `limit + 1`), else null. */
+	nextCursor: RunCursor | null;
+}
+
 export interface RunStore {
 	/**
 	 * Trigger (decision 9; also used by `runs.replay()` without `idempotency`,
@@ -652,6 +700,13 @@ export interface RunStore {
 	list(filter: ListRunsFilter): Promise<ListRunsResult>;
 
 	/**
+	 * Read-only selection of the runs a batch operation acts on (`runs.cancelMany` /
+	 * `runs.retryFailed`); the caller then acts on each one in its own short transaction
+	 * ({@link cancel}, {@link create}), so no transaction spans the batch.
+	 */
+	listBatchCandidates(filter: BatchCandidatesFilter): Promise<BatchCandidatesResult>;
+
+	/**
 	 * Replay of `triggerAndWait`/`batchTriggerAndWait`: one query
 	 * `WHERE parent_waitpoint_id = $1 ORDER BY batch_index` (decision 10).
 	 */
@@ -664,14 +719,27 @@ export interface RunStore {
 	 * (read-only). Keyset pagination `ORDER BY run_after, id` after `after` (exclusive): runs whose
 	 * jobs legitimately exist stay stale, so the reconciler walks past them instead of re-reading
 	 * the first page every tick (head-of-line blocking). `nextCursor` is null on a short page.
+	 * `excludeQueues` (item 1): rows whose `queue` is in the list are skipped entirely (never
+	 * counted against `limit` or returned), so a paused queue's backlog can't delay finding
+	 * genuinely lost jobs of other queues.
 	 */
-	listStaleQueued(graceMs: number, limit: number, after?: StaleCursor | null): Promise<StalePage>;
+	listStaleQueued(
+		graceMs: number,
+		limit: number,
+		after?: StaleCursor | null,
+		excludeQueues?: readonly string[]
+	): Promise<StalePage>;
 
 	/**
 	 * Case 2: `waiting`, no pending waitpoint, `run_after < now() - grace` => SAME seq (read-only).
-	 * Paginated like {@link listStaleQueued}.
+	 * Paginated like {@link listStaleQueued}; `excludeQueues` has the same meaning.
 	 */
-	listStaleWaiting(graceMs: number, limit: number, after?: StaleCursor | null): Promise<StalePage>;
+	listStaleWaiting(
+		graceMs: number,
+		limit: number,
+		after?: StaleCursor | null,
+		excludeQueues?: readonly string[]
+	): Promise<StalePage>;
 
 	/**
 	 * Case 3: `waiting`, `run_after IS NULL`, no pending waitpoint. Locks candidates
@@ -1058,6 +1126,34 @@ export interface ScheduleStore {
 }
 
 // ---------------------------------------------------------------------------
+// QueueStateStore (decision 27)
+// ---------------------------------------------------------------------------
+
+/** One row of `queue_state` (migration 007): the persisted pause state of a task queue. */
+export interface QueueStateRecord {
+	queue: string;
+	paused: boolean;
+	/** `now()` of the last `setPaused` that changed or re-set the row. */
+	updatedAt: Date;
+}
+
+export interface QueueStateStore {
+	/**
+	 * `INSERT ... ON CONFLICT (queue) DO UPDATE SET paused, updated_at = now() RETURNING` (one
+	 * statement). Always writes (a repeated pause refreshes `updated_at`); `changed` says whether
+	 * `paused` actually flipped (a new row counts as changed only when `paused` is true: a missing
+	 * row already means "not paused").
+	 */
+	setPaused(
+		queue: string,
+		paused: boolean
+	): Promise<{ record: QueueStateRecord; changed: boolean }>;
+	get(queue: string): Promise<QueueStateRecord | null>;
+	/** Every row, `ORDER BY queue`. Rows are few (one per queue ever paused). */
+	list(): Promise<QueueStateRecord[]>;
+}
+
+// ---------------------------------------------------------------------------
 // Store and transactions
 // ---------------------------------------------------------------------------
 
@@ -1069,6 +1165,7 @@ export interface StoreTx {
 	idempotency: IdempotencyStore;
 	logs: LogStore;
 	schedules: ScheduleStore;
+	queues: QueueStateStore;
 }
 
 /** Repositories bound to the pool, plus the transaction entry point. */
@@ -1079,6 +1176,7 @@ export interface Store {
 	idempotency: IdempotencyStore;
 	logs: LogStore;
 	schedules: ScheduleStore;
+	queues: QueueStateStore;
 	/**
 	 * Runs `fn` in one transaction: COMMIT if it resolves, ROLLBACK and rethrow if it
 	 * rejects; the client is always released. `tx` must not be used after `fn`

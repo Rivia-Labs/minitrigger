@@ -154,6 +154,28 @@ export interface Transport {
 	closeWorkers(opts: CloseWorkersOptions): Promise<CloseWorkersResult>;
 	/** Decision 22: warns (does not throw) when the check itself is unavailable; throws only on a wrong answer. */
 	checkRedis(): Promise<string | undefined>;
+	/**
+	 * Decision 27: BullMQ's queue-level (global, Redis) pause of a task queue: every worker of every
+	 * process stops fetching new jobs of it; active jobs are not touched. Jobs can still be added
+	 * (they wait). Idempotent. Any valid task-queue name (a producer-only `Queue` on demand, like
+	 * {@link enqueueRun}); the `-system` queue is refused (`ConfigError`).
+	 */
+	pauseQueue(queue: string): Promise<void>;
+	/** Undoes {@link pauseQueue}; idempotent. */
+	resumeQueue(queue: string): Promise<void>;
+	/** Whether the queue-level pause flag is set in Redis. */
+	isQueuePaused(queue: string): Promise<boolean>;
+	/**
+	 * This process's worker concurrency for `queue`, or `undefined` when this process runs no worker
+	 * for it (not started, filtered out by `start({ queues })`, or a test transport).
+	 */
+	workerConcurrency(queue: string): number | undefined;
+	/**
+	 * Changes this process's worker concurrency for `queue` at runtime (BullMQ reads it on every
+	 * fetch-loop iteration: a decrease stops new fetches right away, running jobs finish; an
+	 * increase applies at the worker's next fetch). Returns false when there is no such worker.
+	 */
+	setWorkerConcurrency(queue: string, concurrency: number): boolean;
 }
 
 const RUN_JOB_NAME = "run";
@@ -624,6 +646,18 @@ export function createTransport(options: CreateTransportOptions): Transport {
 		return checkRedisEvictionPolicy(connections.shared());
 	}
 
+	/** Decision 27: a task queue's `Queue` handle for pause/resume; never the `-system` queue. */
+	function pausableQueue(queue: string): Queue<RunJobData> {
+		if (queue === sysQueueName) {
+			throw new ConfigError(`the internal system queue "${queue}" cannot be paused`);
+		}
+		return getTaskQueue(queue);
+	}
+
+	function taskWorker(queue: string): Worker | undefined {
+		return queue === sysQueueName ? undefined : workers.find(w => w.name === queue);
+	}
+
 	return {
 		enqueueRun,
 		removeRunJob,
@@ -636,5 +670,23 @@ export function createTransport(options: CreateTransportOptions): Transport {
 		startWorkers,
 		closeWorkers,
 		checkRedis,
+		async pauseQueue(queue) {
+			await pausableQueue(queue).pause();
+		},
+		async resumeQueue(queue) {
+			await pausableQueue(queue).resume();
+		},
+		async isQueuePaused(queue) {
+			return pausableQueue(queue).isPaused();
+		},
+		workerConcurrency(queue) {
+			return taskWorker(queue)?.concurrency;
+		},
+		setWorkerConcurrency(queue, concurrency) {
+			const worker = taskWorker(queue);
+			if (!worker) return false;
+			worker.concurrency = concurrency;
+			return true;
+		},
 	};
 }

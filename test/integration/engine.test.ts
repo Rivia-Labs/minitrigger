@@ -674,6 +674,25 @@ describe("engine: lifecycle", () => {
 		await expect(engine.start()).rejects.toThrow(/stopped/);
 	});
 
+	// Item 7: `queues.pause`/`resume`/`scale` and `runs.cancelMany` used to skip `assertNotStopped()`
+	// (unlike `runs.replay`/`runs.retryFailed`/`trigger`), so they'd keep "working" (queuing store
+	// writes and BullMQ calls) against an engine the caller already tore down.
+	it("queues.pause/resume/scale and runs.cancelMany reject the same way as other ops after stop()", async () => {
+		const queue = uniqueQueue();
+		const task = defineTask({
+			id: uniqueTaskId("stopped-ops"),
+			queue: { name: queue },
+			run: async (_p: { v: number }) => {},
+		});
+		const engine = makeEngine([task]);
+		await engine.stop();
+
+		await expect(engine.queues.pause(queue)).rejects.toThrow(/stopped/);
+		await expect(engine.queues.resume(queue)).rejects.toThrow(/stopped/);
+		await expect(engine.queues.scale(queue, 1)).rejects.toThrow(/stopped/);
+		await expect(engine.runs.cancelMany({ limit: 10 })).rejects.toThrow(/stopped/);
+	});
+
 	it("a failed start() cleans up and can be retried", async () => {
 		const task = defineTask({
 			id: uniqueTaskId("restart"),

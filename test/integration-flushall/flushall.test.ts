@@ -7,6 +7,7 @@
  * with `NODE_ENV=test` (vitest sets it unless it is already set).
  */
 import { randomUUID } from "node:crypto";
+import { Queue } from "bullmq";
 import { Redis } from "ioredis";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import type { EngineLogger } from "../../src/config.js";
@@ -192,6 +193,61 @@ describe("FLUSHALL", () => {
 				expect(runs.items).toHaveLength(1);
 			} finally {
 				await debounced.stop();
+			}
+		},
+		30_000
+	);
+
+	(enabled ? it : it.skip)(
+		"a paused queue is paused again after Redis is wiped, and its runs wait for resume (decision 27)",
+		async () => {
+			const queue = `q${shortId()}`;
+			const task = defineTask({
+				id: `paused-${shortId()}`,
+				queue: { name: queue },
+				run: async () => "ran",
+			});
+			const paused = createEngine({
+				postgres: ns.databaseUrl,
+				redis: ns.redisUrl,
+				schema: ns.schema,
+				prefix: ns.prefix,
+				tasks: [task],
+				shutdownTimeoutMs: 1_000,
+				reconciler: { intervalMs: 200, graceMs: 200, batchSize: 50 },
+				logger: silent,
+			});
+			const connection = new Redis(TEST_REDIS_URL, { maxRetriesPerRequest: null });
+			const bull = new Queue(queue, { connection, prefix: ns.prefix });
+			try {
+				await paused.start();
+				await paused.queues.pause(queue);
+				// Its job is wiped below: the reconciler re-adds it, after re-pausing the queue.
+				const before = await paused.trigger(task);
+
+				const admin = new Redis(TEST_REDIS_URL);
+				try {
+					await admin.flushall();
+				} finally {
+					admin.disconnect();
+				}
+				expect(await bull.isPaused()).toBe(false);
+				await waitFor(() => bull.isPaused(), { timeoutMs: 5_000 });
+
+				const after = await paused.trigger(task);
+				await new Promise(resolve => setTimeout(resolve, 1_000));
+				const status = async (id: string) => (await paused.runs.get(id))?.status;
+				expect(await status(before.id)).toBe("queued");
+				expect(await status(after.id)).toBe("queued");
+
+				await paused.queues.resume(queue);
+				for (const id of [before.id, after.id]) {
+					await waitFor(async () => (await status(id)) === "completed", { timeoutMs: 10_000 });
+				}
+			} finally {
+				await paused.stop();
+				await bull.close();
+				connection.disconnect();
 			}
 		},
 		30_000

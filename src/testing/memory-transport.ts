@@ -58,7 +58,10 @@ export interface MemoryTransport extends Transport {
 	takeDue(): MemoryJob | undefined;
 	/** Removes a job taken with {@link takeDue}, or moves it back to delayed at `redelayAt`. */
 	finish(job: MemoryJob, redelayAt?: number): void;
-	/** Earliest `dueAt` among the waiting/delayed (not active) jobs of `kind` (any kind if omitted). */
+	/**
+	 * Earliest `dueAt` among the waiting/delayed (not active) jobs of `kind` (any kind if omitted).
+	 * Jobs of a paused queue are skipped, like in {@link takeDue}.
+	 */
 	nextDueAt(kind?: MemoryJob["kind"]): number | undefined;
 	/** Every job currently held (waiting, delayed or active), earliest first. */
 	jobs(): readonly MemoryJob[];
@@ -80,6 +83,8 @@ export function createMemoryTransport(options: MemoryTransportOptions): MemoryTr
 	/** Keyed by `${queue}\0${jobId}`, so a run queue and the system queue never collide. */
 	const table = new Map<string, MemoryJob>();
 	const schedulers = new Map<string, JobSchedulerInfo>();
+	/** Decision 27: queue-level pause (the BullMQ transport's Redis flag). */
+	const paused = new Set<string>();
 	let order = 0;
 	let autoId = 0;
 
@@ -122,6 +127,18 @@ export function createMemoryTransport(options: MemoryTransportOptions): MemoryTr
 
 	function sorted(): MemoryJob[] {
 		return Array.from(table.values()).sort((a, b) => a.dueAt - b.dueAt || a.order - b.order);
+	}
+
+	/** A job of a paused queue is held (never taken, never moves the clock), like BullMQ's pause. */
+	function held(job: MemoryJob): boolean {
+		return job.kind === "run" && paused.has(job.queue);
+	}
+
+	function pausable(queue: string): string {
+		if (queue === sysQueue) {
+			throw new ConfigError(`the internal system queue "${queue}" cannot be paused`);
+		}
+		return validateQueueName(queue);
 	}
 
 	return {
@@ -189,10 +206,31 @@ export function createMemoryTransport(options: MemoryTransportOptions): MemoryTr
 			return undefined;
 		},
 
+		async pauseQueue(queue) {
+			paused.add(pausable(queue));
+		},
+
+		async resumeQueue(queue) {
+			paused.delete(pausable(queue));
+		},
+
+		async isQueuePaused(queue) {
+			return paused.has(pausable(queue));
+		},
+
+		workerConcurrency() {
+			// No workers: the test engine processes jobs itself, one at a time.
+			return undefined;
+		},
+
+		setWorkerConcurrency() {
+			return false;
+		},
+
 		takeDue() {
 			const t = now();
 			for (const job of sorted()) {
-				if (job.active) continue;
+				if (job.active || held(job)) continue;
 				if (job.dueAt > t) return undefined;
 				job.active = true;
 				return job;
@@ -212,7 +250,7 @@ export function createMemoryTransport(options: MemoryTransportOptions): MemoryTr
 
 		nextDueAt(kind) {
 			for (const job of sorted()) {
-				if (job.active || (kind !== undefined && job.kind !== kind)) continue;
+				if (job.active || held(job) || (kind !== undefined && job.kind !== kind)) continue;
 				return job.dueAt;
 			}
 			return undefined;

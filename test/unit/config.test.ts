@@ -24,6 +24,12 @@ describe("resolveConfig", () => {
 		expect(r.retentionIntervalMs).toBe(3_600_000);
 		expect(r.retentionBatchSize).toBe(1_000);
 		expect(r.reconciler).toEqual({ intervalMs: 15_000, graceMs: 30_000, batchSize: 100 });
+		expect(r.outbox).toEqual({
+			pollIntervalMs: 2_000,
+			batchSize: 500,
+			reconnectMaxMs: 30_000,
+			notify: true,
+		});
 		expect(r.systemConcurrency).toBe(5);
 		expect(r.limits).toEqual({
 			maxPayloadBytes: 1024 * 1024,
@@ -115,6 +121,47 @@ describe("resolveConfig", () => {
 
 	it("rejects a heartbeat interval that is not smaller than the stall timeout", () => {
 		expect(() => resolveConfig({ ...base, heartbeatIntervalMs: 60_000 })).toThrow(ConfigError);
+	});
+
+	it("keeps explicit outbox options (decision 26)", () => {
+		const r = resolveConfig({
+			...base,
+			outbox: { pollIntervalMs: 500, batchSize: 50, reconnectMaxMs: 5_000, notify: false },
+		});
+		expect(r.outbox).toEqual({
+			pollIntervalMs: 500,
+			batchSize: 50,
+			reconnectMaxMs: 5_000,
+			notify: false,
+		});
+	});
+
+	it("rejects invalid outbox options", () => {
+		expect(() => resolveConfig({ ...base, outbox: { pollIntervalMs: 0 } })).toThrow(ConfigError);
+		expect(() => resolveConfig({ ...base, outbox: { pollIntervalMs: -1 } })).toThrow(ConfigError);
+		expect(() => resolveConfig({ ...base, outbox: { batchSize: 0 } })).toThrow(ConfigError);
+		expect(() => resolveConfig({ ...base, outbox: { batchSize: 1.5 } })).toThrow(ConfigError);
+		expect(() => resolveConfig({ ...base, outbox: { reconnectMaxMs: 0 } })).toThrow(ConfigError);
+		expect(() =>
+			resolveConfig({ ...base, outbox: { notify: "no" as unknown as boolean } })
+		).toThrow(ConfigError);
+	});
+
+	// Item 6: bounds a misconfigured outbox can't accidentally cross -- a poll faster than every
+	// bit of real work it does (a busy-loop against Postgres) or a claim batch large enough to hold
+	// a statement/transaction open for a long time.
+	it("rejects an outbox.pollIntervalMs below 100ms", () => {
+		expect(() => resolveConfig({ ...base, outbox: { pollIntervalMs: 99 } })).toThrow(ConfigError);
+		expect(() => resolveConfig({ ...base, outbox: { pollIntervalMs: 99 } })).toThrow(/100/);
+		expect(resolveConfig({ ...base, outbox: { pollIntervalMs: 100 } }).outbox.pollIntervalMs).toBe(
+			100
+		);
+	});
+
+	it("rejects an outbox.batchSize above 10_000", () => {
+		expect(() => resolveConfig({ ...base, outbox: { batchSize: 10_001 } })).toThrow(ConfigError);
+		expect(() => resolveConfig({ ...base, outbox: { batchSize: 10_001 } })).toThrow(/10.?000/);
+		expect(resolveConfig({ ...base, outbox: { batchSize: 10_000 } }).outbox.batchSize).toBe(10_000);
 	});
 
 	it.each([

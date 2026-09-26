@@ -4,6 +4,7 @@ import { createSqlContext, type SqlContext } from "../../src/store/sql/db.js";
 import { createSqlStore } from "../../src/store/sql/index.js";
 import type { Store } from "../../src/store/types.js";
 import { useTestNamespace } from "../helpers/namespace.js";
+import { defineBatchQueueContractSuite } from "../helpers/store-contract-batch-suite.js";
 import { defineDebounceConcurrencyContractSuite } from "../helpers/store-contract-debounce-suite.js";
 import { defineStoreContractSuite, type StoreHarness } from "../helpers/store-contract-suite.js";
 
@@ -23,7 +24,8 @@ beforeAll(async () => {
 beforeEach(async () => {
 	await ns.pool.query(
 		`TRUNCATE ${ctx.t("runs")}, ${ctx.t("idempotency_keys")}, ${ctx.t("steps")},
-		   ${ctx.t("waitpoints")}, ${ctx.t("run_logs")}, ${ctx.t("schedules")} CASCADE`
+		   ${ctx.t("waitpoints")}, ${ctx.t("run_logs")}, ${ctx.t("schedules")},
+		   ${ctx.t("queue_state")} CASCADE`
 	);
 });
 
@@ -46,6 +48,7 @@ const SHIFTS: [Parameters<SqlContext["t"]>[0], string[]][] = [
 	["idempotency_keys", ["expires_at"]],
 	["run_logs", ["ts"]],
 	["schedules", ["created_at", "updated_at"]],
+	["queue_state", ["updated_at"]],
 ];
 
 const harness: StoreHarness = {
@@ -80,3 +83,4 @@ const harness: StoreHarness = {
 
 defineStoreContractSuite(() => harness);
 defineDebounceConcurrencyContractSuite(() => harness);
+defineBatchQueueContractSuite(() => harness);

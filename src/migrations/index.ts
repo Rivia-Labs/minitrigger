@@ -4,6 +4,7 @@ import runsCreatedIdxSql from "./003_runs_created_idx.sql";
 import runProgressSql from "./004_run_progress.sql";
 import debounceConcurrencySql from "./005_debounce_concurrency.sql";
 import outboxSql from "./006_outbox.sql";
+import queueStateSql from "./007_queue_state.sql";
 
 /** One embedded, versioned migration (decision 18: no reading `.sql` files from disk at runtime). */
 export interface Migration {
@@ -20,4 +21,5 @@ export const MIGRATIONS: readonly Migration[] = [
 	{ version: 4, name: "run_progress", sql: runProgressSql },
 	{ version: 5, name: "debounce_concurrency", sql: debounceConcurrencySql },
 	{ version: 6, name: "outbox", sql: outboxSql },
+	{ version: 7, name: "queue_state", sql: queueStateSql },
 ];

@@ -29,7 +29,8 @@ export type TableName =
 	| "idempotency_keys"
 	| "run_logs"
 	| "schema_migrations"
-	| "schedules";
+	| "schedules"
+	| "queue_state";
 
 export function createSqlContext(schema: string): SqlContext {
 	const escaped = escapeIdentifier(schema);

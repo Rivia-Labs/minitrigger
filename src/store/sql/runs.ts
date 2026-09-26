@@ -21,7 +21,12 @@ import type {
 	TriggerChildrenResult,
 	WaitpointResolution,
 } from "../types.js";
-import { concurrencyLimitedDelayMs, MAX_LIST_LIMIT } from "../types.js";
+import {
+	concurrencyLimitedDelayMs,
+	MAX_BATCH_LIMIT,
+	MAX_LIST_LIMIT,
+	retryIdempotencyKey,
+} from "../types.js";
 import { atomic, type Db, direct, type SqlContext, type SqlExecutor } from "./db.js";
 import {
 	applyResumeRule,
@@ -98,10 +103,13 @@ export function createRunStore(exec: SqlExecutor, ctx: SqlContext): RunStore {
 	 */
 	async function createOnce(db: Db, input: NewRun): Promise<CreateOnce> {
 		const idem = input.idempotency;
-		// Decision 26: with `outbox`, the row is flagged for the post-commit claim and the same
-		// statement queues a NOTIFY (delivered only on commit). The payload is constant, so
-		// Postgres collapses every trigger of one transaction into a single notification.
+		// Decision 26: with `outbox`, the row is flagged for the post-commit claim (poll sweep) and,
+		// unless `outbox.notify === false` (config `outbox.notify`), the same statement also queues a
+		// NOTIFY (delivered only on commit; the payload is constant, so Postgres collapses every
+		// trigger of one transaction into a single notification). `notify: false` skips the NOTIFY
+		// (and the commit-time lock it takes) -- dispatch then relies entirely on the poll sweep.
 		const outbox = input.outbox;
+		const sendNotify = outbox !== undefined && outbox.notify !== false;
 		const params: unknown[] = [
 			input.id,
 			input.taskId,
@@ -112,7 +120,7 @@ export function createRunStore(exec: SqlExecutor, ctx: SqlContext): RunStore {
 			input.concurrencyKey ?? null,
 			outbox !== undefined,
 		];
-		const notify = outbox
+		const notify = sendNotify
 			? `, pg_notify($${params.push(outbox.channel)}::text, '') AS notified`
 			: "";
 		const insertRun = (source: string) =>
@@ -342,13 +350,19 @@ export function createRunStore(exec: SqlExecutor, ctx: SqlContext): RunStore {
 		predicate: string,
 		graceMs: number,
 		limit: number,
-		after: StaleCursor | null
+		after: StaleCursor | null,
+		excludeQueues: readonly string[] = []
 	): Promise<StalePage> {
 		const params: unknown[] = [graceMs, limit];
 		let keyset = "";
 		if (after) {
 			params.push(after.runAfter, after.id);
 			keyset = `AND (r.run_after, r.id) > ($3::timestamptz, $4::uuid)`;
+		}
+		let excludeClause = "";
+		if (excludeQueues.length > 0) {
+			params.push(excludeQueues);
+			excludeClause = `AND NOT (r.queue = ANY($${params.length}::text[]))`;
 		}
 		const { rows } = await direct(exec).query<EnqueueRow & { cursor_run_after: string }>(
 			`SELECT r.id, r.task_id, r.queue, r.enqueue_seq, r.status, r.updated_at,
@@ -359,6 +373,7 @@ export function createRunStore(exec: SqlExecutor, ctx: SqlContext): RunStore {
 			 WHERE ${predicate}
 			   AND r.run_after < now() - $1::float8 * interval '1 millisecond'
 			   ${keyset}
+			   ${excludeClause}
 			 ORDER BY r.run_after, r.id LIMIT $2`,
 			params
 		);
@@ -806,6 +821,51 @@ export function createRunStore(exec: SqlExecutor, ctx: SqlContext): RunStore {
 			};
 		},
 
+		async listBatchCandidates(filter) {
+			const limit = Math.min(MAX_BATCH_LIMIT, Math.max(1, Math.floor(filter.limit)));
+			const where: string[] = [];
+			const params: unknown[] = [];
+			const add = (sql: (p: string) => string, value: unknown) => {
+				params.push(value);
+				where.push(sql(`$${params.length}`));
+			};
+			if (filter.purpose === "cancel") {
+				where.push("r.status IN ('queued', 'running', 'waiting')");
+			} else {
+				// Decision 9's reserved namespace: a failed run already retried owns the key
+				// `__retry:<id>` (see `retryIdempotencyKey`); PK lookup on `(task_id, key)`.
+				where.push("r.status = 'failed'", "r.parent_run_id IS NULL");
+				add(
+					p => `NOT EXISTS (SELECT 1 FROM ${ctx.t("idempotency_keys")} k
+					   WHERE k.task_id = r.task_id AND k.key = ${p}::text || r.id::text)`,
+					retryIdempotencyKey("")
+				);
+			}
+			if (filter.taskId !== undefined) add(p => `r.task_id = ${p}`, filter.taskId);
+			if (filter.queue !== undefined) add(p => `r.queue = ${p}`, filter.queue);
+			if (filter.createdFrom !== undefined) add(p => `r.created_at >= ${p}`, filter.createdFrom);
+			if (filter.createdTo !== undefined) add(p => `r.created_at < ${p}`, filter.createdTo);
+			if (filter.cursor !== undefined) {
+				params.push(filter.cursor.createdAt, filter.cursor.id);
+				where.push(`(r.created_at, r.id) > ($${params.length - 1}, $${params.length}::uuid)`);
+			}
+			// One extra row tells whether more match, without a count.
+			params.push(limit + 1);
+			const { rows } = await direct(exec).query<RunRow>(
+				`SELECT ${RUN_COLUMNS} FROM ${runs} r
+				 WHERE ${where.join(" AND ")}
+				 ORDER BY r.created_at, r.id
+				 LIMIT $${params.length}`,
+				params
+			);
+			const items = rows.slice(0, limit).map(mapRun);
+			const last = items[items.length - 1];
+			return {
+				items,
+				nextCursor: rows.length > limit && last ? { createdAt: last.createdAt, id: last.id } : null,
+			};
+		},
+
 		async listChildResults(waitpointId) {
 			const { rows } = await direct(exec).query<{
 				id: string;
@@ -829,16 +889,17 @@ export function createRunStore(exec: SqlExecutor, ctx: SqlContext): RunStore {
 			);
 		},
 
-		listStaleQueued(graceMs, limit, after) {
-			return listStale("r.status = 'queued'", graceMs, limit, after ?? null);
+		listStaleQueued(graceMs, limit, after, excludeQueues) {
+			return listStale("r.status = 'queued'", graceMs, limit, after ?? null, excludeQueues ?? []);
 		},
 
-		listStaleWaiting(graceMs, limit, after) {
+		listStaleWaiting(graceMs, limit, after, excludeQueues) {
 			return listStale(
 				`r.status = 'waiting' AND NOT ${blockingWaitpointExistsSql(ctx, "r.id")}`,
 				graceMs,
 				limit,
-				after ?? null
+				after ?? null,
+				excludeQueues ?? []
 			);
 		},
 

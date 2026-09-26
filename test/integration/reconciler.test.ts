@@ -454,6 +454,47 @@ describe("createReconciler: case isolation", () => {
 	});
 });
 
+describe("createReconciler: cases 1/2 skip paused queues (item 1 perf)", () => {
+	it("excludes a paused queue's stale backlog, still recovers another queue's lost job in one tick, and picks the paused one back up after resume", async () => {
+		const s = store();
+		await s.queues.setPaused("paused", true);
+
+		const pausedRun = await f.runs.create(f.newRun({ queue: "paused" }));
+		if (pausedRun.kind !== "created") throw new Error("expected created");
+		const lostRun = await f.runs.create(f.newRun({ queue: QUEUE }));
+		if (lostRun.kind !== "created") throw new Error("expected created");
+		await f.sql(
+			`UPDATE ${f.t("runs")} SET run_after = now() - interval '1 minute' WHERE id = ANY($1)`,
+			[[pausedRun.run.id, lostRun.run.id]]
+		);
+
+		const transport = makeTransport();
+		const { logger } = makeLogger();
+		const report = await makeReconciler(transport, logger).runOnce();
+
+		// Only the "default" queue's stale run is counted/re-enqueued; the paused one is skipped
+		// entirely (not even attempted), so it never shows up as a job.
+		expect(report.staleQueued).toBe(1);
+		expect(report.errors).toBe(0);
+		const lostJob = await rawQueue(QUEUE).getJob(runJobId(lostRun.run.id, lostRun.enqueue.seq));
+		expect(lostJob).toBeDefined();
+		const pausedJob = await rawQueue("paused").getJob(
+			runJobId(pausedRun.run.id, pausedRun.enqueue.seq)
+		);
+		expect(pausedJob).toBeUndefined();
+
+		// After resume, the next tick recovers it like any other stale queued run (still queued, so
+		// the "default" queue's already-recovered run is re-attempted too -- job add is a no-op).
+		await s.queues.setPaused("paused", false);
+		const report2 = await makeReconciler(transport, logger).runOnce();
+		expect(report2.staleQueued).toBe(2);
+		const pausedJob2 = await rawQueue("paused").getJob(
+			runJobId(pausedRun.run.id, pausedRun.enqueue.seq)
+		);
+		expect(pausedJob2).toBeDefined();
+	});
+});
+
 describe("createReconciler: reconcileSchedules hook", () => {
 	it("calls the optional hook once at the end, isolated like every other case", async () => {
 		const transport = makeTransport();

@@ -45,6 +45,7 @@ describe("migrate()", () => {
 		expect(rows.map(row => row.tablename)).toEqual(
 			[
 				"idempotency_keys",
+				"queue_state",
 				"run_logs",
 				"runs",
 				"schedules",

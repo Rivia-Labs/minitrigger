@@ -37,7 +37,10 @@
   },
   "files": [
     "dist",
-    "LICENSE"
+    "LICENSE",
+    "skills",
+    "docs/pt",
+    ".claude-plugin"
   ],
   "main": "./dist/index.cjs",
   "module": "./dist/index.js",
@@ -87,7 +90,8 @@
     "infra:up": "docker compose up -d --wait",
     "infra:down": "docker compose down",
     "bench": "pnpm run build && node bench/run.ts",
-    "check:pack": "node scripts/check-pack.mjs"
+    "check:pack": "node scripts/check-pack.mjs",
+    "skills:validate": "claude plugin validate ."
   },
   "peerDependencies": {
     "bullmq": "^6.3.0",

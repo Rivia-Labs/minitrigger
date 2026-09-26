@@ -20,7 +20,12 @@ import type {
 	TriggerChildrenResult,
 	WaitpointResolution,
 } from "../types.js";
-import { concurrencyLimitedDelayMs, MAX_LIST_LIMIT } from "../types.js";
+import {
+	concurrencyLimitedDelayMs,
+	MAX_BATCH_LIMIT,
+	MAX_LIST_LIMIT,
+	retryIdempotencyKey,
+} from "../types.js";
 import { claimKey } from "./idempotency.js";
 import {
 	applyResumeRule,
@@ -646,6 +651,44 @@ export function createRunStore(exec: Exec): RunStore {
 			});
 		},
 
+		listBatchCandidates(filter) {
+			return exec.run(tx => {
+				const limit = Math.min(MAX_BATCH_LIMIT, Math.max(1, Math.floor(filter.limit)));
+				const from = filter.createdFrom?.getTime();
+				const to = filter.createdTo?.getTime();
+				const cursor = filter.cursor
+					? { at: filter.cursor.createdAt.getTime(), id: uuid(filter.cursor.id) }
+					: null;
+				const matchesPurpose = (r: RunRow): boolean =>
+					filter.purpose === "cancel"
+						? !isTerminal(r.status)
+						: r.status === "failed" &&
+							r.parentRunId === null &&
+							!tx.db.keys.has(keyOf(r.taskId, retryIdempotencyKey(r.id)));
+				const rows = [...tx.db.runs.values()].filter(
+					r =>
+						matchesPurpose(r) &&
+						(filter.taskId === undefined || r.taskId === filter.taskId) &&
+						(filter.queue === undefined || r.queue === filter.queue) &&
+						(from === undefined || r.createdAt >= from) &&
+						(to === undefined || r.createdAt < to) &&
+						(cursor === null ||
+							r.createdAt > cursor.at ||
+							(r.createdAt === cursor.at && r.id > cursor.id))
+				);
+				rows.sort((a, b) =>
+					a.createdAt !== b.createdAt ? a.createdAt - b.createdAt : a.id < b.id ? -1 : 1
+				);
+				const items = rows.slice(0, limit).map(mapRun);
+				const last = items[items.length - 1];
+				return {
+					items,
+					nextCursor:
+						rows.length > limit && last ? { createdAt: last.createdAt, id: last.id } : null,
+				};
+			});
+		},
+
 		listChildResults(waitpointId) {
 			return exec.run(tx => {
 				const wp = uuid(waitpointId);
@@ -664,15 +707,19 @@ export function createRunStore(exec: Exec): RunStore {
 			});
 		},
 
-		listStaleQueued(graceMs, limit, after) {
-			return exec.run(tx => listStale(tx, r => r.status === "queued", graceMs, limit, after));
+		listStaleQueued(graceMs, limit, after, excludeQueues) {
+			const exclude = new Set(excludeQueues);
+			return exec.run(tx =>
+				listStale(tx, r => r.status === "queued" && !exclude.has(r.queue), graceMs, limit, after)
+			);
 		},
 
-		listStaleWaiting(graceMs, limit, after) {
+		listStaleWaiting(graceMs, limit, after, excludeQueues) {
+			const exclude = new Set(excludeQueues);
 			return exec.run(tx =>
 				listStale(
 					tx,
-					r => r.status === "waiting" && !hasBlockingWaitpoint(tx, r.id),
+					r => r.status === "waiting" && !exclude.has(r.queue) && !hasBlockingWaitpoint(tx, r.id),
 					graceMs,
 					limit,
 					after

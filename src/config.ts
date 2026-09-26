@@ -113,6 +113,28 @@ export interface EngineConfig {
 		/** Rows handled per reconciler case per tick. Default 100. */
 		batchSize?: number;
 	};
+	/**
+	 * Decision 26 (transactional trigger / outbox): tuning for the dedicated LISTEN/NOTIFY
+	 * dispatcher of `trigger(..., { tx })` runs.
+	 */
+	outbox?: {
+		/**
+		 * How often every started engine sweeps for committed `{ tx }` runs even without a
+		 * notification (bounds the dispatch latency when a notification is lost). Default 2 000 ms.
+		 */
+		pollIntervalMs?: number;
+		/** Rows claimed per `claimOutbox` statement; a full batch triggers another one right away. Default 500. */
+		batchSize?: number;
+		/** Upper bound of the dedicated LISTEN client's reconnect backoff. Default 30 000 ms. */
+		reconnectMaxMs?: number;
+		/**
+		 * `false` skips the `pg_notify` call in the `trigger(..., { tx })` insert statement (the run
+		 * is still flagged `outbox_pending` for the poll sweep): trades near-instant dispatch for
+		 * avoiding the commit-time NOTIFY lock (Postgres serializes commits that notify). Default
+		 * `true`.
+		 */
+		notify?: boolean;
+	};
 	limits?: EngineLimits;
 	/** `ctx.logger` (Phase 7): persisted to `run_logs` in batches and mirrored to `logger`. */
 	logging?: {
@@ -146,6 +168,7 @@ export interface ResolvedConfig {
 	retentionBatchSize: number;
 	schedules: { pruneDeclarative: boolean };
 	reconciler: { intervalMs: number; graceMs: number; batchSize: number };
+	outbox: { pollIntervalMs: number; batchSize: number; reconnectMaxMs: number; notify: boolean };
 	limits: Required<EngineLimits>;
 	logging: { minLevel: LogLevel; mirror: boolean };
 	systemConcurrency: number;
@@ -160,6 +183,15 @@ export const DAY_MS = 86_400_000;
  * once instead of "never": every option that feeds a timer is capped to this at `createEngine`.
  */
 export const MAX_TIMER_MS = 2_147_483_647;
+
+/** Item 6: below this, the outbox listener's poll fallback becomes a busy-loop against Postgres. */
+export const MIN_OUTBOX_POLL_INTERVAL_MS = 100;
+
+/** Item 6: above this, one `claimOutbox` batch could hold a statement/transaction open too long. */
+export const MAX_OUTBOX_BATCH_SIZE = 10_000;
+
+/** Item 6: `queues.scale(name, n)` (`src/engine.ts`) rejects a concurrency above this. */
+export const MAX_QUEUE_SCALE_CONCURRENCY = 1_000;
 
 export const DEFAULTS = {
 	schema: "minitrigger",
@@ -179,6 +211,7 @@ export const DEFAULTS = {
 	retentionBatchSize: 1_000,
 	schedules: { pruneDeclarative: false },
 	reconciler: { intervalMs: 15_000, graceMs: 30_000, batchSize: 100 },
+	outbox: { pollIntervalMs: 2_000, batchSize: 500, reconnectMaxMs: 30_000, notify: true },
 	systemConcurrency: 5,
 	logging: { minLevel: "info", mirror: true },
 	limits: {
@@ -287,6 +320,35 @@ export function resolveConfig(config: EngineConfig): ResolvedConfig {
 			config.reconciler?.batchSize ?? DEFAULTS.reconciler.batchSize
 		),
 	};
+
+	const outboxNotify = config.outbox?.notify ?? DEFAULTS.outbox.notify;
+	if (typeof outboxNotify !== "boolean") {
+		throw new ConfigError(
+			`outbox.notify must be a boolean, got ${describeOffendingValue(outboxNotify)}`
+		);
+	}
+	const outbox = {
+		// Item 6: bounded so a misconfiguration can't turn the outbox listener into a busy-loop
+		// against Postgres (too-low pollIntervalMs) or hold a claim statement/transaction open for a
+		// long time (too-high batchSize).
+		pollIntervalMs: intInRange(
+			"outbox.pollIntervalMs",
+			config.outbox?.pollIntervalMs ?? DEFAULTS.outbox.pollIntervalMs,
+			MIN_OUTBOX_POLL_INTERVAL_MS,
+			MAX_TIMER_MS
+		),
+		batchSize: intInRange(
+			"outbox.batchSize",
+			config.outbox?.batchSize ?? DEFAULTS.outbox.batchSize,
+			1,
+			MAX_OUTBOX_BATCH_SIZE
+		),
+		reconnectMaxMs: timerMs(
+			"outbox.reconnectMaxMs",
+			config.outbox?.reconnectMaxMs ?? DEFAULTS.outbox.reconnectMaxMs
+		),
+		notify: outboxNotify,
+	};
 	const idempotencyKeyTtlMs =
 		config.idempotencyKeyTtl === undefined
 			? DEFAULTS.idempotencyKeyTtlMs
@@ -373,6 +435,7 @@ export function resolveConfig(config: EngineConfig): ResolvedConfig {
 		retentionBatchSize,
 		schedules,
 		reconciler,
+		outbox,
 		limits,
 		logging,
 		systemConcurrency,
@@ -469,6 +532,15 @@ export function assertTimerMs(name: string, value: number): number {
 		throw new ConfigError(
 			`${name} must be at most ${MAX_TIMER_MS} ms (the setTimeout limit, ~24.8 days), got ${value} ms`
 		);
+	}
+	return value;
+}
+
+/** A positive integer, additionally bounded to `[min, max]` (both inclusive). */
+function intInRange(name: string, value: number, min: number, max: number): number {
+	positiveInt(name, value);
+	if (value < min || value > max) {
+		throw new ConfigError(`${name} must be between ${min} and ${max}, got ${value}`);
 	}
 	return value;
 }

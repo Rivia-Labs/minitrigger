@@ -39,6 +39,7 @@ import {
 	type Engine,
 	type EngineCore,
 	type EngineEvents,
+	type EngineQueues,
 	type EngineRuns,
 	type EngineTokens,
 	type TriggerOptions,
@@ -132,6 +133,13 @@ export interface TestEngine {
 	tokens: TestEngineTokens;
 	schedules: EngineSchedules;
 	events: EngineEvents;
+	/**
+	 * Decision 27, in memory: a paused queue's jobs are held (never taken by `drain`, never move
+	 * the clock) until `resume`; `resume` does not drain by itself (drive the engine again).
+	 * `list().activeLocal` counts executions in progress; `concurrency` is always null and `scale`
+	 * throws (`ConfigError`): the test engine has no workers, it runs one job at a time.
+	 */
+	queues: EngineQueues;
 	clock: TestClock;
 	/**
 	 * Triggers `task` and drives the engine until nothing else can run (children of
@@ -475,6 +483,7 @@ export function createTestEngine(config: TestEngineConfig): TestEngine {
 		tokens,
 		schedules,
 		events: core.events,
+		queues: core.queues,
 		clock,
 		runInline,
 		drive,

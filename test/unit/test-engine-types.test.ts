@@ -23,9 +23,9 @@ describe("EngineClient: shared surface of Engine and TestEngine", () => {
 		expectTypeOf<TestEngine>().toMatchTypeOf<EngineClient>();
 	});
 
-	it("only exposes trigger/runs/tokens/schedules/events", () => {
+	it("only exposes trigger/runs/tokens/schedules/events/queues", () => {
 		expectTypeOf<EngineClient>().toEqualTypeOf<
-			Pick<Engine, "trigger" | "runs" | "tokens" | "schedules" | "events">
+			Pick<Engine, "trigger" | "runs" | "tokens" | "schedules" | "events" | "queues">
 		>();
 	});
 });

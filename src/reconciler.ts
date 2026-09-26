@@ -11,7 +11,7 @@
  * running (`runOnce()` always resolves, it never rejects for an expected/isolated failure).
  *
  * `reconcileSchedules` is a hook only -- Phase 8 fills it in; this module doesn't know anything
- * about schedules.
+ * about schedules. Same for `reconcileQueues` (decision 27, queue pause state).
  */
 
 import type { EngineLogger } from "./config.js";
@@ -65,6 +65,13 @@ export interface ReconcilerOptions {
 	/** Phase 8 hook: bidirectional reconciliation of schedules. Called last, isolated like the rest. */
 	reconcileSchedules?: () => Promise<void>;
 	/**
+	 * Decision 27 hook: re-applies the persisted queue pause state (Postgres) to the transport
+	 * (BullMQ's Redis flag, lost on FLUSHALL or diverged by a racing pause/resume). Called FIRST,
+	 * before case 1 re-adds jobs, so a paused queue is paused again before its jobs come back.
+	 * Returns how many queues it had to fix (counted in {@link ReconcileReport.queueStates}).
+	 */
+	reconcileQueues?: () => Promise<number>;
+	/**
 	 * Called with the runs canceled by an expiry (case 5), after their pending run jobs were
 	 * removed. The engine aborts local executions and publishes the cancel (Phase 6). A throw is
 	 * logged and counted in `errors`; the parent's resume still happens.
@@ -94,6 +101,8 @@ export interface ReconcileReport {
 	orphanWaiting: number;
 	stalled: StalledReport;
 	expiredWaitpoints: number;
+	/** Decision 27: queues whose Redis pause flag had to be re-synced from Postgres. */
+	queueStates: number;
 	/** Number of case-level or per-item failures encountered (logged, never thrown). */
 	errors: number;
 }
@@ -111,6 +120,7 @@ export function createReconciler(options: ReconcilerOptions): Reconciler {
 		stallTimeoutMs,
 		batchSize,
 		reconcileSchedules,
+		reconcileQueues,
 		onCanceled,
 		onStatusChange,
 	} = options;
@@ -187,11 +197,33 @@ export function createReconciler(options: ReconcilerOptions): Reconciler {
 		}
 	}
 
+	/**
+	 * Item 1 (perf): names of the currently paused queues, so cases 1/2 can skip their backlog
+	 * entirely instead of re-adding (and immediately losing to `acquire`'s pause check, or simply
+	 * sitting there) jobs of a queue that isn't going to run them anyway -- a big paused backlog
+	 * would otherwise push back finding genuinely lost jobs of OTHER queues down the same page walk.
+	 * Best-effort: a failed read just excludes nothing this tick (never blocks cases 1/2).
+	 */
+	async function listPausedQueues(): Promise<readonly string[]> {
+		try {
+			return (await store.queues.list()).filter(row => row.paused).map(row => row.queue);
+		} catch (err) {
+			logger.warn(
+				{ err },
+				"reconciler: failed to read paused queue state; not excluding any queue this tick"
+			);
+			return [];
+		}
+	}
+
 	// --- Case 1: queued, run_after < now() - grace -> re-enqueue with the CURRENT seq. ---
-	async function reconcileStaleQueued(report: ReconcileReport): Promise<void> {
+	async function reconcileStaleQueued(
+		report: ReconcileReport,
+		excludeQueues: readonly string[]
+	): Promise<void> {
 		await forEachStalePage(
 			"staleQueued",
-			after => store.runs.listStaleQueued(graceMs, batchSize, after),
+			after => store.runs.listStaleQueued(graceMs, batchSize, after, excludeQueues),
 			items =>
 				forEachItem(items, "staleQueued", report, async item => {
 					await transport.enqueueRun(toEnqueueInput(item));
@@ -201,10 +233,13 @@ export function createReconciler(options: ReconcilerOptions): Reconciler {
 	}
 
 	// --- Case 2: waiting, no pending waitpoint, run_after < now() - grace -> re-enqueue, SAME seq. ---
-	async function reconcileStaleWaiting(report: ReconcileReport): Promise<void> {
+	async function reconcileStaleWaiting(
+		report: ReconcileReport,
+		excludeQueues: readonly string[]
+	): Promise<void> {
 		await forEachStalePage(
 			"staleWaiting",
-			after => store.runs.listStaleWaiting(graceMs, batchSize, after),
+			after => store.runs.listStaleWaiting(graceMs, batchSize, after, excludeQueues),
 			items =>
 				forEachItem(items, "staleWaiting", report, async item => {
 					await transport.enqueueRun(toEnqueueInput(item));
@@ -315,11 +350,20 @@ export function createReconciler(options: ReconcilerOptions): Reconciler {
 			orphanWaiting: 0,
 			stalled: { requeued: 0, failed: 0 },
 			expiredWaitpoints: 0,
+			queueStates: 0,
 			errors: 0,
 		};
 
-		await runCase("staleQueued", report, () => reconcileStaleQueued(report));
-		await runCase("staleWaiting", report, () => reconcileStaleWaiting(report));
+		if (reconcileQueues) {
+			await runCase("queueStates", report, async () => {
+				report.queueStates += await reconcileQueues();
+			});
+		}
+		// Read AFTER reconcileQueues re-applied the Redis flags: a queue just paused this tick is
+		// already excluded from cases 1/2 below (rather than one tick behind).
+		const pausedQueues = await listPausedQueues();
+		await runCase("staleQueued", report, () => reconcileStaleQueued(report, pausedQueues));
+		await runCase("staleWaiting", report, () => reconcileStaleWaiting(report, pausedQueues));
 		await runCase("orphanWaiting", report, () => reconcileOrphanWaiting(report));
 		await runCase("stalled", report, () => reconcileStalled(report));
 		await runCase("expiredWaitpoints", report, () => reconcileExpiredWaitpoints(report));

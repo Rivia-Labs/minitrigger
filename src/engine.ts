@@ -14,11 +14,13 @@ import {
 	assertTtlWithinRetention,
 	DEFAULTS,
 	type EngineConfig,
+	type EngineLogger,
+	MAX_QUEUE_SCALE_CONCURRENCY,
 	type ResolvedConfig,
 	resolveConfig,
 } from "./config.js";
 import { checkEnvironment } from "./env-check.js";
-import { ConfigError, MinitriggerError } from "./errors.js";
+import { ConfigError, MinitriggerError, SerializationError } from "./errors.js";
 import {
 	ActiveExecutions,
 	afterResolution,
@@ -36,12 +38,7 @@ import {
 } from "./executor/index.js";
 import { createLeaderElector, type LeaderElector } from "./leader.js";
 import { type MigrateResult, migrate } from "./migrations/migrate.js";
-import {
-	createOutboxListener,
-	OUTBOX_BATCH_SIZE,
-	type OutboxListener,
-	outboxChannel,
-} from "./outbox.js";
+import { createOutboxListener, type OutboxListener, outboxChannel } from "./outbox.js";
 import {
 	createPubSub,
 	createPubSubPublisher,
@@ -69,14 +66,17 @@ import {
 import type { SqlQueryable } from "./store/sql/db.js";
 import { createSqlStore, createSqlTxRunStore } from "./store/sql/index.js";
 import {
+	type BatchCandidatesFilter,
 	type CreateRunResult,
 	type Json,
 	type LogLevel,
+	MAX_BATCH_LIMIT,
 	type NewRun,
 	type NewRunDebounce,
 	type RunCursor,
 	type RunRecord,
 	type RunStatus,
+	retryIdempotencyKey,
 	type SerializedError,
 	type StepKind,
 	type StepStatus,
@@ -89,10 +89,16 @@ import type { AnyTask, PayloadArgs, RunHandle, TaskOutput, TaskPayload } from ".
 import { computeBackoffMs } from "./utils/backoff.js";
 import { type Duration, parseDuration } from "./utils/duration.js";
 import { describeOffendingValue } from "./utils/error-format.js";
-import { validateIdempotencyKey, validateTriggerKey } from "./utils/identifiers.js";
+import {
+	validateIdempotencyKey,
+	validateQueueName,
+	validateTriggerKey,
+} from "./utils/identifiers.js";
 import { assertSerializable } from "./utils/serialization.js";
 
 const DEFAULT_LIST_LIMIT = 20;
+/** Item 6: `outbox.notify: false` above this `pollIntervalMs` gets a one-time startup warning. */
+const OUTBOX_NOTIFY_FALSE_WARN_THRESHOLD_MS = 10_000;
 /**
  * How long `stop()` waits, after handing back the still-active runs, for the in-flight
  * `executeRun` calls (a late acquire being handed back, a retry or parent-resume enqueue) so their
@@ -237,6 +243,127 @@ export interface RunList {
 
 export type CancelRunOutcome = "canceled" | "already_finished" | "not_found";
 
+/**
+ * Which runs a batch operation (`runs.cancelMany`/`runs.retryFailed`) acts on, walked oldest
+ * first (`createdAt`, then id). Pass the previous result's `nextCursor` as `cursor` to continue.
+ */
+export interface BatchRunsFilter {
+	taskId?: string;
+	queue?: string;
+	/** Inclusive. */
+	createdFrom?: Date;
+	/** Exclusive. */
+	createdTo?: Date;
+	/** `nextCursor` of a previous call with the same filter. */
+	cursor?: RunCursor;
+	/** Required: how many matching runs this call handles, 1 to 1 000. */
+	limit: number;
+}
+
+/** Item 2: one matched run's unexpected failure in `runs.cancelMany`/`runs.retryFailed`. */
+export interface BatchRunError {
+	name: string;
+	message: string;
+}
+
+export interface CancelManyResult {
+	/**
+	 * Every run this call moved to `canceled`: the matched runs and, recursively, their pending
+	 * descendants (so it can hold more than `limit` ids). A matched run that finished (or was
+	 * canceled by someone else) meanwhile is simply not listed.
+	 */
+	canceled: string[];
+	/**
+	 * One entry per matched run whose cancel raised something other than the retried deadlock (a
+	 * store/Redis hiccup): the batch keeps going, canceling every other matched run, rather than
+	 * losing `canceled` entirely to the first error. Call again (same filter/cursor) to retry these.
+	 */
+	failed: Array<{ runId: string; error: BatchRunError }>;
+	/** More runs matched than `limit`: call again with `cursor: nextCursor`. */
+	hasMore: boolean;
+	nextCursor: RunCursor | null;
+}
+
+/**
+ * Why `runs.retryFailed` left a matched failed run alone. `invalid_payload` (item 2): the run's
+ * stored payload no longer validates (e.g. `config.limits.maxPayloadBytes` was lowered since it
+ * was created) -- `createRunDetailed`'s `assertSerializable` throws a `SerializationError`/
+ * `ConfigError` for it every time, so retrying it would fail the same way forever; skip it and let
+ * the rest of the page's candidates retry normally.
+ */
+export type RetrySkipReason = "task_not_registered" | "already_retried" | "invalid_payload";
+
+export interface RetryFailedResult {
+	/** One entry per failed run retried by this call: the failed run and its new run. */
+	retried: Array<{ runId: string; newRunId: string }>;
+	/**
+	 * `task_not_registered`: this process does not register the run's task (e.g. mid rolling
+	 * deploy; retry from a process that does). `already_retried`: a concurrent call retried it first.
+	 */
+	skipped: Array<{ runId: string; reason: RetrySkipReason }>;
+	/** More runs matched than `limit`: call again with `cursor: nextCursor`. */
+	hasMore: boolean;
+	nextCursor: RunCursor | null;
+}
+
+/** Decision 27: the persisted pause state of a queue. */
+export interface QueueState {
+	name: string;
+	paused: boolean;
+	/** Last `pause`/`resume` of this queue (DB clock); null if it never had one. */
+	updatedAt: Date | null;
+}
+
+/** One queue of `engine.queues.list()`. */
+export interface QueueInfo extends QueueState {
+	/** Some task registered in THIS engine uses the queue. */
+	declared: boolean;
+	/** `concurrency` resolved from this engine's tasks (null when not declared here). */
+	declaredConcurrency: number | null;
+	/**
+	 * This process's worker concurrency (the `scale()`d value, else the declared one); null when
+	 * this process runs no worker for the queue (not started, or filtered out by
+	 * `start({ queues })`).
+	 */
+	concurrency: number | null;
+	/**
+	 * Executions of this queue's runs in progress in THIS process right now: from acquisition until
+	 * the execution settles (a run being handed back on `stop()` included). Other processes'
+	 * executions are not counted.
+	 */
+	activeLocal: number;
+}
+
+/**
+ * Queue control (decision 27). Works without `start()` (an admin process can pause/resume).
+ * Pausing never aborts running executions: they finish (or suspend) normally; only new jobs of
+ * the queue stop being fetched, by every process. Retries, resumes and sleeps of the queue's runs
+ * wait while it is paused.
+ */
+export interface EngineQueues {
+	/**
+	 * Persists `paused = true` in Postgres, then sets BullMQ's queue-level pause (Redis), so every
+	 * worker of every process stops fetching the queue's jobs within one fetch. Idempotent. The
+	 * queue must be used by a task of this engine or already have a persisted state.
+	 */
+	pause(name: string): Promise<QueueState>;
+	/** Persists `paused = false`, then lifts BullMQ's pause. Idempotent. */
+	resume(name: string): Promise<QueueState>;
+	/**
+	 * The queues of this engine's tasks plus every queue with a persisted state, sorted by name.
+	 * `paused` is read from Postgres (the source of truth).
+	 */
+	list(): Promise<QueueInfo[]>;
+	/**
+	 * Changes THIS process's worker concurrency for the queue at runtime (integer >= 1), until the
+	 * process restarts: not persisted, other processes are not affected. A decrease stops new
+	 * fetches beyond the new limit at once (running jobs finish); an increase applies at the
+	 * worker's next fetch. Requires a started worker for the queue (`ConfigError` otherwise).
+	 * Keep `pool.max` above the total concurrency + 5 (a warning is logged when it is not).
+	 */
+	scale(name: string, concurrency: number): Promise<void>;
+}
+
 /** One `ctx.logger` entry of a run (`run_logs`). */
 export interface RunLogEntry {
 	/** Monotonic per insert order (bigserial, as a string); use it as `afterId` to page/tail. */
@@ -325,6 +452,23 @@ export interface RunEvent {
 	error: SerializedError | null;
 	/** `runs.updated_at` read right after the transition. */
 	updatedAt: Date;
+	/**
+	 * Wall-clock start of the CURRENT EXECUTION this transition ends/suspends -- since its most
+	 * recent acquisition or resume, not the whole attempt's history across earlier suspensions (DB
+	 * clock, decision 17). Present for `run:completed`/`run:failed`/`run:retrying`/`run:waiting`;
+	 * absent otherwise -- e.g. `run:queued` (including a suspend that requeues right away because
+	 * everything it waited for was already resolved by the time the suspension transaction ran:
+	 * that's a `queued` transition, not a `waiting` execution with something pending), `run:started`,
+	 * `run:canceled`, a stall recovery -- where there is no execution to time from this process's
+	 * point of view.
+	 */
+	startedAt?: Date;
+	/**
+	 * How long the CURRENT EXECUTION ran before this write (monotonic clock, `performance.now()`;
+	 * never persisted). Same presence rule and "current execution, not the whole attempt" caveat as
+	 * {@link RunEvent.startedAt}.
+	 */
+	durationMs?: number;
 }
 
 export type RunEventHandler = (event: RunEvent) => void | Promise<void>;
@@ -345,6 +489,21 @@ export interface EngineRuns {
 	cancel(run: string | RunHandle<unknown>): Promise<CancelRunOutcome>;
 	/** New run of the same task with the same payload (no idempotency key). */
 	replay<O = unknown>(run: string | RunHandle<O>): Promise<RunHandle<O>>;
+	/**
+	 * Cancels up to `limit` `queued`/`running`/`waiting` runs matching `filter`, oldest first, each
+	 * exactly like `cancel()` (descendants too, local aborts, pub/sub, events), in its own short
+	 * transaction (no transaction spans the batch). Safe to run concurrently with anything
+	 * (per-run row locks; a run finished meanwhile is skipped).
+	 */
+	cancelMany(filter: BatchRunsFilter): Promise<CancelManyResult>;
+	/**
+	 * Retries up to `limit` `failed` top-level runs matching `filter`, oldest first, like
+	 * `replay()`: a NEW run of the same task with the same payload (the failed run stays as it is,
+	 * `attempt` starts over at 1). Each failed run is retried at most once, even by concurrent
+	 * calls (internal idempotency key `__retry:<runId>`): a run already retried no longer matches.
+	 * Children (runs with a parent) are left out: their failure was already delivered to the parent.
+	 */
+	retryFailed(filter: BatchRunsFilter): Promise<RetryFailedResult>;
 	/** The run's `ctx.logger` entries, oldest first (page with `afterId`). */
 	logs(run: string | RunHandle<unknown>, options?: RunLogsOptions): Promise<RunLogPage>;
 	/** The run's recorded steps, in `seq` order. */
@@ -418,8 +577,12 @@ export interface Engine {
 	runs: EngineRuns;
 	tokens: EngineTokens;
 	schedules: EngineSchedules;
+	/** Queue control (decision 27): pause/resume across processes, list, local scale. */
+	queues: EngineQueues;
 	/** Local run events of this process. */
 	events: EngineEvents;
+	/** The logger this engine was configured with (`config.logger`; default: warn/error to `console`). */
+	readonly logger: EngineLogger;
 }
 
 /**
@@ -429,7 +592,10 @@ export interface Engine {
  * excludes `migrate`/`start`/`stop`, which only `Engine` has in this shape (`TestEngine.stop()`
  * differs -- it ends open subscriptions/stream reads instead of a graceful worker shutdown).
  */
-export type EngineClient = Pick<Engine, "trigger" | "runs" | "tokens" | "schedules" | "events">;
+export type EngineClient = Pick<
+	Engine,
+	"trigger" | "runs" | "tokens" | "schedules" | "events" | "queues"
+>;
 
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
@@ -460,6 +626,8 @@ export interface EngineBackend {
 	 * (test engine): `trigger(..., { tx })` is a `ConfigError`.
 	 */
 	createRunInTransaction?(tx: TransactionClient, input: NewRun): Promise<CreateRunResult>;
+	/** Called after `queues.scale()` changed a worker's concurrency (pool sizing warning). */
+	onScaled?(): void;
 }
 
 /** Lifecycle state owned by the engine wrapping the core. @internal */
@@ -484,6 +652,12 @@ export interface EngineCore {
 	tokens: EngineTokens;
 	schedules: EngineSchedules;
 	events: EngineEvents;
+	queues: EngineQueues;
+	/**
+	 * Decision 27: re-applies every persisted queue pause state to the transport; returns how many
+	 * queues had to change. Throws on a store/transport failure.
+	 */
+	syncQueueStates(): Promise<number>;
 	/** The subscriber side, created on first use. */
 	getPubSub(): PubSub;
 	/** The subscriber side if it was already created. */
@@ -536,6 +710,8 @@ export function createEngineCore(
 			attempt: info.attempt,
 			error: info.error,
 			updatedAt: info.updatedAt,
+			...(info.startedAt !== undefined ? { startedAt: info.startedAt } : {}),
+			...(info.durationMs !== undefined ? { durationMs: info.durationMs } : {}),
 		};
 		const onError = (error: unknown) =>
 			logger.error({ err: error, event: name, runId: info.runId }, "engine.events handler failed");
@@ -654,17 +830,29 @@ export function createEngineCore(
 	/** Ends every open `runs.subscribe` iteration (on `stop()`). */
 	const openSubscriptions = new Set<() => void>();
 
+	type CreateRunOptions = {
+		delayMs: number;
+		idempotency?: { key: string; ttlMs: number | null } | undefined;
+		debounce?: NewRunDebounce | undefined;
+		concurrencyKey?: string | undefined;
+		tx?: TransactionClient | undefined;
+	};
+
 	async function createRun(
 		task: AnyTask,
 		payload: unknown,
-		options: {
-			delayMs: number;
-			idempotency?: { key: string; ttlMs: number } | undefined;
-			debounce?: NewRunDebounce | undefined;
-			concurrencyKey?: string | undefined;
-			tx?: TransactionClient | undefined;
-		}
+		options: CreateRunOptions
 	): Promise<RunHandle<never>> {
+		const { id, taskId } = await createRunDetailed(task, payload, options);
+		return { id, taskId };
+	}
+
+	/** {@link createRun}, also telling whether the run was created (`runs.retryFailed`). */
+	async function createRunDetailed(
+		task: AnyTask,
+		payload: unknown,
+		options: CreateRunOptions
+	): Promise<{ id: string; taskId: string; kind: CreateRunResult["kind"] }> {
 		assertSerializable(payload, {
 			label: `payload of task "${task.id}"`,
 			maxBytes: resolved.limits.maxPayloadBytes,
@@ -684,7 +872,7 @@ export function createEngineCore(
 			// Decision 26: nothing is enqueued or published here (the caller's transaction is not
 			// committed); the engine that claims the run after the commit does both.
 			const result = await createRunInCallerTransaction(options.tx, input);
-			return { id: result.run.id, taskId: result.run.taskId };
+			return { id: result.run.id, taskId: result.run.taskId, kind: result.kind };
 		}
 		const result = await store.runs.create(input);
 		// Decision 9: only a newly created run is enqueued; an existing one is returned as-is.
@@ -708,7 +896,7 @@ export function createEngineCore(
 			await enqueue(deps, result.enqueue);
 			await transport.removeRunJob(result.run.queue, result.run.id, result.staleSeq);
 		}
-		return { id: result.run.id, taskId: result.run.taskId };
+		return { id: result.run.id, taskId: result.run.taskId, kind: result.kind };
 	}
 
 	async function createRunInCallerTransaction(
@@ -786,6 +974,172 @@ export function createEngineCore(
 		clearTimeout(timer);
 	}
 
+	/**
+	 * `runs.cancel()` of one run, for `cancelMany` (decision 5/10 semantics unchanged: store cancel,
+	 * local aborts + pub/sub, parent resume, expire-job cleanup). A deadlock (only possible when
+	 * something outside the documented lock order touches the same runs) is retried once.
+	 *
+	 * Item 2: never throws -- an unexpected (non-deadlock) error canceling one run must not discard
+	 * `mapBounded`'s results for the others in the same page, so it's caught here and reported back
+	 * as a `"failed"` outcome instead of propagating.
+	 */
+	async function cancelOneOfBatch(
+		runId: string
+	): Promise<{ kind: "canceled"; ids: string[] } | { kind: "failed"; error: BatchRunError }> {
+		const reason = "canceled via engine.runs.cancelMany()";
+		try {
+			const result = await retryOnDeadlock(() => store.runs.cancel(runId, reason));
+			if (result.kind !== "canceled") return { kind: "canceled", ids: [] };
+			await cancelLocally({ transport, active, notify: notifier }, result.canceled);
+			await afterResolution(deps, result.parent, result.expireJobsToRemove);
+			return { kind: "canceled", ids: result.canceled.map(c => c.runId) };
+		} catch (error) {
+			return { kind: "failed", error: batchRunError(error) };
+		}
+	}
+
+	/** Decision 25: a replay/retry keeps the original's concurrency key while the queue declares one. */
+	function replayedConcurrencyKey(task: AnyTask, record: RunRecord): string | undefined {
+		return record.concurrencyKey !== null &&
+			registry.queues.get(taskQueueName(task))?.concurrencyKey !== undefined
+			? record.concurrencyKey
+			: undefined;
+	}
+
+	async function retryOneOfBatch(
+		record: RunRecord
+	): Promise<{ newRunId: string } | { reason: RetrySkipReason }> {
+		const task = registry.tasks.get(record.taskId);
+		if (!task) return { reason: "task_not_registered" };
+		let created: { id: string; taskId: string; kind: CreateRunResult["kind"] };
+		try {
+			created = await createRunDetailed(task, record.payload, {
+				delayMs: 0,
+				idempotency: { key: retryIdempotencyKey(record.id), ttlMs: null },
+				concurrencyKey: replayedConcurrencyKey(task, record),
+			});
+		} catch (error) {
+			// Item 2: a bad stored payload (or other per-run ConfigError, e.g. a queue that no
+			// longer declares the concurrency key it was created with) would throw the same way on
+			// every future call too -- skip it instead of failing the whole batch.
+			if (error instanceof SerializationError || error instanceof ConfigError) {
+				return { reason: "invalid_payload" };
+			}
+			throw error;
+		}
+		return created.kind === "created" ? { newRunId: created.id } : { reason: "already_retried" };
+	}
+
+	// --- Queue control (decision 27). ---
+	const systemQueue = systemQueueName(resolved.prefix);
+
+	async function applyQueuePause(queue: string, paused: boolean): Promise<void> {
+		if (paused) await transport.pauseQueue(queue);
+		else await transport.resumeQueue(queue);
+	}
+
+	async function setQueuePaused(name: unknown, paused: boolean): Promise<QueueState> {
+		assertNotStopped();
+		const method = paused ? "queues.pause" : "queues.resume";
+		if (typeof name !== "string") {
+			throw new ConfigError(
+				`${method}: the queue name must be a string, got ${describeOffendingValue(name)}`
+			);
+		}
+		const queue = validateQueueName(name);
+		if (queue === systemQueue) {
+			throw new ConfigError(`${method}: the internal system queue "${queue}" cannot be paused`);
+		}
+		if (!registry.queues.has(queue) && (await store.queues.get(queue)) === null) {
+			throw new ConfigError(
+				`${method}: unknown queue "${queue}"; this engine's tasks use ` +
+					`${[...registry.queues.keys()].map(q => `"${q}"`).join(", ") || "no queue"}`
+			);
+		}
+		// Postgres first (the source of truth, decision 1), then the Redis flag. A failed Redis call
+		// only warns: the leader's reconciler tick and every start() re-apply the persisted state.
+		const { record } = await store.queues.setPaused(queue, paused);
+		try {
+			await applyQueuePause(queue, paused);
+			// A concurrent pause/resume (maybe from another process) may have committed after our
+			// write and applied its flag before ours: converge on what Postgres holds now.
+			const current = await store.queues.get(queue);
+			if (current && current.paused !== paused) await applyQueuePause(queue, current.paused);
+		} catch (error) {
+			logger.warn(
+				{ err: error, queue, paused },
+				`${method}: the state is saved in Postgres, but applying it to BullMQ failed; the ` +
+					"leader's next reconciler tick (or the next start()) applies it"
+			);
+		}
+		return { name: queue, paused: record.paused, updatedAt: record.updatedAt };
+	}
+
+	async function syncQueueStates(): Promise<number> {
+		let fixed = 0;
+		for (const row of await store.queues.list()) {
+			if (row.queue === systemQueue) continue;
+			if ((await transport.isQueuePaused(row.queue)) === row.paused) continue;
+			await applyQueuePause(row.queue, row.paused);
+			fixed++;
+			logger.info(
+				{ queue: row.queue, paused: row.paused },
+				"queue pause state re-applied to BullMQ from Postgres"
+			);
+		}
+		return fixed;
+	}
+
+	const queues: EngineQueues = {
+		pause: name => setQueuePaused(name, true),
+		resume: name => setQueuePaused(name, false),
+		async list(): Promise<QueueInfo[]> {
+			const states = new Map((await store.queues.list()).map(r => [r.queue, r]));
+			const activeByQueue = new Map<string, number>();
+			for (const execution of active.values()) {
+				const queue = execution.run.queue;
+				activeByQueue.set(queue, (activeByQueue.get(queue) ?? 0) + 1);
+			}
+			const names = [...new Set([...registry.queues.keys(), ...states.keys()])]
+				.filter(name => name !== systemQueue)
+				.sort();
+			return names.map((name): QueueInfo => {
+				const declared = registry.queues.get(name);
+				const state = states.get(name);
+				return {
+					name,
+					paused: state?.paused ?? false,
+					updatedAt: state?.updatedAt ?? null,
+					declared: declared !== undefined,
+					declaredConcurrency: declared?.concurrency ?? null,
+					concurrency: transport.workerConcurrency(name) ?? null,
+					activeLocal: activeByQueue.get(name) ?? 0,
+				};
+			});
+		},
+		async scale(name, concurrency) {
+			assertNotStopped();
+			if (
+				!Number.isInteger(concurrency) ||
+				concurrency < 1 ||
+				concurrency > MAX_QUEUE_SCALE_CONCURRENCY
+			) {
+				throw new ConfigError(
+					`queues.scale: concurrency must be an integer between 1 and ${MAX_QUEUE_SCALE_CONCURRENCY}, got ${describeOffendingValue(concurrency)}`
+				);
+			}
+			if (typeof name !== "string" || !transport.setWorkerConcurrency(name, concurrency)) {
+				throw new ConfigError(
+					`queues.scale: this process runs no worker for queue ${describeOffendingValue(name)}; ` +
+						"scale applies to this process's own workers: call it after start() on an engine " +
+						"that started that queue"
+				);
+			}
+			logger.info({ queue: name, concurrency }, "queue worker concurrency changed in this process");
+			backend.onScaled?.();
+		},
+	};
+
 	const runs: EngineRuns = {
 		async get<O>(run: string | RunHandle<O>): Promise<Run<O> | null> {
 			const runId = runIdOf(run);
@@ -830,12 +1184,56 @@ export function createEngineCore(
 				delayMs: 0,
 				// Decision 25: the replay keeps the original's concurrency key while the queue still
 				// declares one (never the debounce key: a replay is an explicit extra run).
-				concurrencyKey:
-					record.concurrencyKey !== null &&
-					registry.queues.get(taskQueueName(task))?.concurrencyKey !== undefined
-						? record.concurrencyKey
-						: undefined,
+				concurrencyKey: replayedConcurrencyKey(task, record),
 			});
+		},
+
+		async cancelMany(filter: BatchRunsFilter): Promise<CancelManyResult> {
+			assertNotStopped();
+			const page = await store.runs.listBatchCandidates({
+				purpose: "cancel",
+				...validBatchFilter("runs.cancelMany", filter),
+			});
+			const perRun = await mapBounded(page.items, BATCH_CONCURRENCY, r => cancelOneOfBatch(r.id));
+			const canceled: string[] = [];
+			const failed: CancelManyResult["failed"] = [];
+			page.items.forEach((record, i) => {
+				const outcome = perRun[i];
+				if (!outcome) return;
+				if (outcome.kind === "canceled") canceled.push(...outcome.ids);
+				else failed.push({ runId: record.id, error: outcome.error });
+			});
+			return {
+				canceled,
+				failed,
+				hasMore: page.nextCursor !== null,
+				nextCursor: page.nextCursor,
+			};
+		},
+
+		async retryFailed(filter: BatchRunsFilter): Promise<RetryFailedResult> {
+			assertNotStopped();
+			const page = await store.runs.listBatchCandidates({
+				purpose: "retry",
+				...validBatchFilter("runs.retryFailed", filter),
+			});
+			const outcomes = await mapBounded(page.items, BATCH_CONCURRENCY, retryOneOfBatch);
+			const result: RetryFailedResult = {
+				retried: [],
+				skipped: [],
+				hasMore: page.nextCursor !== null,
+				nextCursor: page.nextCursor,
+			};
+			page.items.forEach((record, i) => {
+				const outcome = outcomes[i];
+				if (!outcome) return;
+				if ("newRunId" in outcome) {
+					result.retried.push({ runId: record.id, newRunId: outcome.newRunId });
+				} else {
+					result.skipped.push({ runId: record.id, reason: outcome.reason });
+				}
+			});
+			return result;
 		},
 
 		async logs(run, options = {}): Promise<RunLogPage> {
@@ -1043,6 +1441,8 @@ export function createEngineCore(
 		tokens,
 		schedules,
 		events,
+		queues,
+		syncQueueStates,
 		getPubSub,
 		currentPubSub: () => pubsub,
 		endSubscriptions() {
@@ -1171,10 +1571,11 @@ export function createEngine(config: EngineConfig): Engine {
 			},
 			streams,
 			readStream: readRunStream,
+			onScaled: () => warnScaledPoolSizing(),
 			createRunInTransaction: (tx, input) =>
 				createSqlTxRunStore(tx, resolved.schema).create({
 					...input,
-					outbox: { channel: outbox.channel },
+					outbox: { channel: outbox.channel, notify: resolved.outbox.notify },
 				}),
 		},
 		{ isShuttingDown: () => shuttingDown, assertNotStopped }
@@ -1220,6 +1621,7 @@ export function createEngine(config: EngineConfig): Engine {
 		graceMs: resolved.reconciler.graceMs,
 		stallTimeoutMs: resolved.stallTimeoutMs,
 		batchSize: resolved.reconciler.batchSize,
+		reconcileQueues: core.syncQueueStates,
 		reconcileSchedules: createReconcileSchedulesHook({
 			store,
 			transport,
@@ -1359,6 +1761,7 @@ export function createEngine(config: EngineConfig): Engine {
 			});
 			await claimPrefix();
 			warnPoolSizing(options.queues);
+			warnOutboxConfig();
 
 			// Item 11: everything that can fail runs BEFORE the workers start, so a failed start()
 			// leaves no worker behind and can be retried. The declarative sync only needs the
@@ -1372,6 +1775,11 @@ export function createEngine(config: EngineConfig): Engine {
 				maxPayloadBytes: resolved.limits.maxPayloadBytes,
 				pruneDeclarative: resolved.schedules.pruneDeclarative,
 			});
+
+			// Decision 27: a queue paused in Postgres is paused in BullMQ BEFORE any worker fetches
+			// (Redis lost the flag on a FLUSHALL, or a pause's Redis call failed). A failure here
+			// fails start() (retryable): starting workers could run jobs of a paused queue.
+			await core.syncQueueStates();
 
 			// Subscribed before the workers, so a cancel published for a run acquired right away is
 			// not missed. `ready` never rejects.
@@ -1480,12 +1888,52 @@ export function createEngine(config: EngineConfig): Engine {
 	}
 
 	/**
+	 * Item 6: `outbox.notify: false` (decision 26) means every `trigger(..., { tx })` waits for the
+	 * poll fallback (or a late catch-up sweep on reconnect) to be dispatched, instead of the
+	 * near-instant `pg_notify` wake-up. Combined with a `pollIntervalMs` this high, that trade is
+	 * very likely accidental (the option exists to avoid the commit-time NOTIFY lock, not to make
+	 * dispatch slow), so this only warns -- the config is honored either way.
+	 */
+	function warnOutboxConfig(): void {
+		if (resolved.outbox.notify) return;
+		if (resolved.outbox.pollIntervalMs <= OUTBOX_NOTIFY_FALSE_WARN_THRESHOLD_MS) return;
+		logger.warn(
+			{ pollIntervalMs: resolved.outbox.pollIntervalMs },
+			`outbox.notify is false and outbox.pollIntervalMs is ${resolved.outbox.pollIntervalMs}ms ` +
+				`(above ${OUTBOX_NOTIFY_FALSE_WARN_THRESHOLD_MS}ms): trigger(..., { tx }) runs will wait ` +
+				"up to that long to dispatch instead of the near-instant NOTIFY wake-up; this is likely " +
+				"unintentional -- lower pollIntervalMs, or leave notify at its default (true)"
+		);
+	}
+
+	/** `queues.scale()`: the same pool guide as {@link warnPoolSizing}, over the live worker concurrency. */
+	function warnScaledPoolSizing(): void {
+		const concurrency = allQueues.reduce(
+			(sum, q) => sum + (transport.workerConcurrency(q.name) ?? 0),
+			0
+		);
+		const recommended = Math.max(DEFAULTS.poolMax, concurrency + DEFAULTS.poolHeadroom);
+		const poolOptions = pool.options as { max?: number };
+		const max = ownsPool
+			? (resolved.poolMax ?? recommendedPoolMax(allQueues))
+			: (poolOptions.max ?? DEFAULTS.poolMax);
+		if (max < recommended) {
+			logger.warn(
+				{ poolMax: max, recommended },
+				`postgres pool.max (${max}) is below this process's worker concurrency + ` +
+					`${DEFAULTS.poolHeadroom} (${recommended}) after queues.scale(): runs will wait for ` +
+					"connections and heartbeats may fail"
+			);
+		}
+	}
+
+	/**
 	 * Decision 26: claims committed `trigger(..., { tx })` runs, publishes `queued` (the transition
 	 * the caller's `trigger` could not publish before its commit) and enqueues them. An enqueue lost
 	 * here is recovered by the reconciler (decision 1): the flag is already cleared.
 	 */
 	async function dispatchOutboxBatch(): Promise<boolean> {
-		const claim = await store.runs.claimOutbox(OUTBOX_BATCH_SIZE);
+		const claim = await store.runs.claimOutbox(resolved.outbox.batchSize);
 		await Promise.all(
 			claim.enqueue.map(item => {
 				notifyStatus({
@@ -1500,7 +1948,7 @@ export function createEngine(config: EngineConfig): Engine {
 				return enqueue(deps, item);
 			})
 		);
-		return claim.claimed >= OUTBOX_BATCH_SIZE;
+		return claim.claimed >= resolved.outbox.batchSize;
 	}
 
 	/**
@@ -1520,6 +1968,8 @@ export function createEngine(config: EngineConfig): Engine {
 			channel: outbox.channel,
 			logger,
 			dispatchBatch: dispatchOutboxBatch,
+			pollIntervalMs: resolved.outbox.pollIntervalMs,
+			reconnectMaxMs: resolved.outbox.reconnectMaxMs,
 		});
 		// start() never rejects on connection problems (it warns and retries); anything else
 		// unexpected is logged rather than left as an unhandled rejection.
@@ -1582,7 +2032,8 @@ export function createEngine(config: EngineConfig): Engine {
 			report.orphanWaiting +
 			report.stalled.requeued +
 			report.stalled.failed +
-			report.expiredWaitpoints;
+			report.expiredWaitpoints +
+			report.queueStates;
 		if (acted > 0 || report.errors > 0) logger.info({ ...report }, "reconciler tick");
 		if (leaderLoopStopped) return;
 		await scheduleRetention();
@@ -1795,6 +2246,8 @@ export function createEngine(config: EngineConfig): Engine {
 		tokens: core.tokens,
 		schedules: core.schedules,
 		events: core.events,
+		queues: core.queues,
+		logger,
 	};
 }
 
@@ -1821,6 +2274,117 @@ function statusOfTransition(transition: RunTransition): RunStatus {
 
 function isTerminal(status: RunStatus): boolean {
 	return (TERMINAL_RUN_STATUSES as readonly RunStatus[]).includes(status);
+}
+
+/**
+ * How many runs of one `cancelMany`/`retryFailed` page are handled at once: each one is its own
+ * short transaction (plus Redis calls), so a small fan-out cuts the wall time without taking more
+ * than a few pool connections.
+ */
+const BATCH_CONCURRENCY = 4;
+
+/**
+ * `fn` over `items` with at most `concurrency` in flight, results in input order. On the first
+ * failure no new item starts; the ones in flight are awaited, then that error is thrown (the batch
+ * operations are safe to call again: cancel skips finished runs, retry is keyed per run).
+ */
+async function mapBounded<T, R>(
+	items: readonly T[],
+	concurrency: number,
+	fn: (item: T) => Promise<R>
+): Promise<R[]> {
+	const results: R[] = new Array(items.length);
+	let next = 0;
+	let failure: { error: unknown } | undefined;
+	async function worker(): Promise<void> {
+		while (failure === undefined && next < items.length) {
+			const index = next++;
+			try {
+				results[index] = await fn(items[index] as T);
+			} catch (error) {
+				failure ??= { error };
+			}
+		}
+	}
+	await Promise.all(Array.from({ length: Math.min(concurrency, items.length) }, worker));
+	if (failure) throw failure.error;
+	return results;
+}
+
+/** Item 2: a compact `{ name, message }` for `CancelManyResult.failed`/skip reporting. */
+function batchRunError(error: unknown): BatchRunError {
+	return {
+		name: error instanceof Error ? error.name : "Error",
+		message: error instanceof Error ? error.message : String(error),
+	};
+}
+
+/** Retries `fn` once on a Postgres deadlock (`40P01`); every other error propagates. */
+async function retryOnDeadlock<T>(fn: () => Promise<T>): Promise<T> {
+	try {
+		return await fn();
+	} catch (error) {
+		if ((error as { code?: unknown } | null)?.code !== "40P01") throw error;
+		return fn();
+	}
+}
+
+/** Validates a {@link BatchRunsFilter} into the store's shape (without `purpose`). */
+function validBatchFilter(method: string, filter: unknown): Omit<BatchCandidatesFilter, "purpose"> {
+	if (filter === null || typeof filter !== "object") {
+		throw new ConfigError(
+			`${method}: pass a filter object with a limit, e.g. { taskId, limit: 100 }; got ${describeOffendingValue(filter)}`
+		);
+	}
+	const f = filter as Partial<Record<keyof BatchRunsFilter, unknown>>;
+	const { limit } = f;
+	if (
+		typeof limit !== "number" ||
+		!Number.isInteger(limit) ||
+		limit < 1 ||
+		limit > MAX_BATCH_LIMIT
+	) {
+		throw new ConfigError(
+			`${method}: filter.limit is required and must be an integer from 1 to ${MAX_BATCH_LIMIT}, got ${describeOffendingValue(limit)}`
+		);
+	}
+	const out: Omit<BatchCandidatesFilter, "purpose"> = { limit };
+	for (const key of ["taskId", "queue"] as const) {
+		const value = f[key];
+		if (value === undefined) continue;
+		if (typeof value !== "string") {
+			throw new ConfigError(
+				`${method}: filter.${key} must be a string, got ${describeOffendingValue(value)}`
+			);
+		}
+		out[key] = value;
+	}
+	for (const key of ["createdFrom", "createdTo"] as const) {
+		const value = f[key];
+		if (value === undefined) continue;
+		if (!(value instanceof Date) || Number.isNaN(value.getTime())) {
+			throw new ConfigError(
+				`${method}: filter.${key} must be a valid Date, got ${describeOffendingValue(value)}`
+			);
+		}
+		out[key] = value;
+	}
+	if (f.cursor !== undefined) {
+		const cursor = f.cursor as Partial<RunCursor> | null;
+		if (
+			cursor === null ||
+			typeof cursor !== "object" ||
+			!(cursor.createdAt instanceof Date) ||
+			Number.isNaN(cursor.createdAt.getTime()) ||
+			!isUuid(cursor.id)
+		) {
+			throw new ConfigError(
+				`${method}: filter.cursor must be the nextCursor of a previous call, got ${describeOffendingValue(f.cursor)}`
+			);
+		}
+		out.cursor = { createdAt: cursor.createdAt, id: cursor.id };
+	}
+	return out;
 }
 
 function clampLimit(limit: number, max: number): number {

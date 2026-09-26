@@ -464,6 +464,59 @@ describe("child finishing before the parent's suspension transaction", () => {
 		await sleep(200);
 		expect(parentExecutions).toBe(2);
 	});
+
+	// Item 5: `suspendRun`'s "requeued" branch (everything it suspended for was already resolved by
+	// the time the suspension transaction ran) used to send `startedAt`/`durationMs` on a
+	// `transition: "queued"` event -- same bug class as any other `run:queued`, which the docs
+	// (`RunStatusInfo`/`RunEvent` JSDoc, README) already say never carries attempt telemetry.
+	it("a requeued suspension's run:queued event carries no startedAt/durationMs", async () => {
+		const queue = uniqueQueue();
+		const child = defineTask({
+			id: uniqueTaskId("child-fast-2"),
+			queue: { name: queue, concurrency: 2 },
+			run: async (p: { n: number }) => p.n + 1,
+		});
+		const parent = defineTask({
+			id: uniqueTaskId("parent-2"),
+			queue: { name: queue, concurrency: 2 },
+			run: async (_p: { v: number }, ctx) => {
+				const [result] = await Promise.all([
+					ctx.step.triggerAndWait("c", child, { n: 1 }),
+					ctx.step.run("hold", async () => {
+						await waitFor(
+							async () => {
+								const { rows } = await ns.pool.query<{ status: string }>(
+									`SELECT status FROM ${t("runs")} WHERE parent_run_id = $1`,
+									[ctx.run.id]
+								);
+								return rows[0]?.status === "completed";
+							},
+							{ timeoutMs: 10_000, intervalMs: 20 }
+						);
+						return "held";
+					}),
+				]);
+				return result;
+			},
+		});
+		const engine = await startedEngine([child, parent]);
+		const queuedEvents: Array<{ runId: string; startedAt?: Date; durationMs?: number }> = [];
+		engine.events.on("run:queued", e => {
+			queuedEvents.push(e);
+		});
+		const handle = await engine.trigger(parent, { v: 1 });
+		await waitForStatus(engine, handle.id, "completed");
+
+		// Two `run:queued` events for this run: the initial trigger, then the requeue-after-suspend
+		// (not `run:waiting`, since nothing was left pending by the time the suspension transaction
+		// ran). Neither carries startedAt/durationMs -- the second is the one this bug affected.
+		const forThisRun = queuedEvents.filter(e => e.runId === handle.id);
+		expect(forThisRun).toHaveLength(2);
+		for (const e of forThisRun) {
+			expect(e.startedAt).toBeUndefined();
+			expect(e.durationMs).toBeUndefined();
+		}
+	});
 });
 
 describe("steps the task did not await", () => {

@@ -32,6 +32,27 @@ export interface RunStatusInfo {
 	updatedAt: Date;
 	/** Names the transition this process made; when omitted it is derived from `status`. */
 	transition?: RunTransition;
+	/**
+	 * Wall-clock start of THIS EXECUTION -- the current attempt, from its most recent acquisition
+	 * or resume, not the whole attempt's history: `run.updatedAt` right after `acquire` (decision
+	 * 17, DB clock -- acquire's `UPDATE` sets `updated_at = now()` in the same statement that starts
+	 * the attempt). A suspended-then-resumed attempt (sleep, a waited waitpoint) restarts this clock
+	 * on each resume; it is never the sum across suspensions, and never the attempt's original
+	 * start if it has suspended since. Carried by the executor (`execute-run.ts`) on the writes that
+	 * end or suspend an execution (`completed`/`failed`/`retrying`/`waiting`, i.e. a suspend that
+	 * left something pending); absent elsewhere -- e.g. `queued` from a fresh trigger, `canceled`,
+	 * stall recovery, AND a suspend that requeues right away because everything it waited for was
+	 * already resolved by the time the suspension transaction ran (`transition: "queued"`, not an
+	 * execution suspending with something still pending) -- where there is no execution to time.
+	 */
+	startedAt?: Date;
+	/**
+	 * How long THIS EXECUTION ran, from its acquisition/resume to this write (monotonic clock,
+	 * `performance.now()` in the executor -- never the DB clock, so it is immune to clock
+	 * skew/adjustment). Telemetry only: never persisted to Postgres. Same presence rule and same
+	 * "current execution, not the whole attempt" caveat as {@link startedAt}.
+	 */
+	durationMs?: number;
 }
 
 /**

@@ -116,6 +116,13 @@ export interface ScheduleRow {
 	readonly updatedAt: number;
 }
 
+/** Decision 27: `queue_state`. */
+export interface QueueStateRow {
+	readonly queue: string;
+	readonly paused: boolean;
+	readonly updatedAt: number;
+}
+
 /** All tables. `steps` is keyed by run id; each inner map is replaced (never mutated) on write. */
 export class MemDb {
 	readonly runs = new Map<string, RunRow>();
@@ -125,6 +132,7 @@ export class MemDb {
 	readonly keys = new Map<string, KeyRow>();
 	readonly logs = new Map<bigint, LogRow>();
 	readonly schedules = new Map<string, ScheduleRow>();
+	readonly queueState = new Map<string, QueueStateRow>();
 	/** `run_logs.id` bigserial: like a Postgres sequence, never rolled back. */
 	logSeq = 0n;
 }

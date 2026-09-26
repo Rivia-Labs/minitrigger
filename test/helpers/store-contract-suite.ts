@@ -747,6 +747,29 @@ export function defineStoreContractSuite(get: () => StoreHarness): void {
 			expect(again.items.map(r => r.runId)).toEqual(ids.slice(0, 2));
 		});
 
+		// Item 1 (paused-queue perf): the reconciler must be able to skip re-adding jobs for a
+		// queue it already knows is paused, so a big paused backlog can't delay other queues.
+		it("listStaleQueued excludes the given queue names", async () => {
+			const paused = await s().runs.create(newRun({ queue: "paused" }));
+			const other = await s().runs.create(newRun({ queue: "default" }));
+			await get().advance(60_000);
+			const { items: res } = await s().runs.listStaleQueued(30_000, 10, null, ["paused"]);
+			expect(res.map(r => r.runId)).toEqual([other.run.id]);
+			expect(res.map(r => r.runId)).not.toContain(paused.run.id);
+		});
+
+		it("listStaleWaiting excludes the given queue names", async () => {
+			const a = await running({ queue: "paused" });
+			const b = await running({ queue: "default" });
+			await sleepStep(a.owner, "nap", 0, 1_000);
+			expect((await s().runs.suspend(a.owner)).kind).toBe("sleeping");
+			await sleepStep(b.owner, "nap", 0, 1_000);
+			expect((await s().runs.suspend(b.owner)).kind).toBe("sleeping");
+			await get().advance(60_000);
+			const { items: res } = await s().runs.listStaleWaiting(30_000, 10, null, ["paused"]);
+			expect(res.map(r => r.runId)).toEqual([b.owner.runId]);
+		});
+
 		it("listStaleWaiting pages with a (run_after, id) cursor", async () => {
 			const ids: string[] = [];
 			for (let i = 0; i < 3; i++) {

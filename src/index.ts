@@ -1,5 +1,8 @@
 export type { EngineConfig, EngineLimits, EngineLogFn, EngineLogger } from "./config.js";
 export {
+	type BatchRunError,
+	type BatchRunsFilter,
+	type CancelManyResult,
 	type CancelRunOutcome,
 	type CompleteTokenOutcome,
 	createEngine,
@@ -7,10 +10,15 @@ export {
 	type Engine,
 	type EngineClient,
 	type EngineEvents,
+	type EngineQueues,
 	type EngineRuns,
 	type EngineTokens,
 	type ListRunsOptions,
+	type QueueInfo,
+	type QueueState,
 	type ReadStreamOptions,
+	type RetryFailedResult,
+	type RetrySkipReason,
 	type Run,
 	type RunEvent,
 	type RunEventHandler,
@@ -67,6 +75,7 @@ export type {
 	WaitResult,
 } from "./task.js";
 export { defineTask } from "./task.js";
+export { attachDefaultLogger } from "./telemetry.js";
 // Test-mode (`createTestEngine`) lives at the `@rivia-labs/minitrigger/testing` subpath, not
 // here: it shares this entry's chunks (errors, engine core) under `splitting: true`, so
 // `instanceof NonDeterminismError` etc. still work for errors thrown by the testing entry, but a

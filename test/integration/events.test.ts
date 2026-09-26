@@ -86,6 +86,13 @@ describe("engine.events", () => {
 		const completed = seen[2];
 		expect(completed).toMatchObject({ runId: handle.id, taskId: task.id, attempt: 1, error: null });
 		expect(completed?.updatedAt).toBeInstanceOf(Date);
+		// Attempt telemetry (durationMs/startedAt): present on the terminal write, absent on `started`
+		// (which doesn't end an attempt).
+		expect(completed?.startedAt).toBeInstanceOf(Date);
+		expect(typeof completed?.durationMs).toBe("number");
+		expect(completed?.durationMs).toBeGreaterThanOrEqual(0);
+		expect(seen[1]?.durationMs).toBeUndefined();
+		expect(seen[1]?.startedAt).toBeUndefined();
 		await waitFor(() => errors.length >= 2, { timeoutMs: 2_000 });
 		expect(errors.map(e => e.message)).toEqual([
 			"engine.events handler failed",
@@ -133,6 +140,11 @@ describe("engine.events", () => {
 		expect(seen[0]?.error?.message).toBe("attempt 1 failed");
 		expect(seen[1]).toMatchObject({ runId: handle.id, attempt: 2 });
 		expect(seen[1]?.error?.message).toBe("attempt 2 failed");
+		// run:retrying and run:failed both carry attempt telemetry.
+		for (const e of [seen[0], seen[1]]) {
+			expect(e?.startedAt).toBeInstanceOf(Date);
+			expect(typeof e?.durationMs).toBe("number");
+		}
 
 		const fatalHandle = await engine.trigger(fatal);
 		await waitFor(() => seen.some(e => e.runId === fatalHandle.id), { timeoutMs: 10_000 });
@@ -152,9 +164,11 @@ describe("engine.events", () => {
 		});
 		const engine = makeEngine([task]);
 		const names: string[] = [];
+		const seen: RunEvent[] = [];
 		for (const name of ["run:waiting", "run:canceled"] as const) {
 			engine.events.on(name, e => {
 				names.push(`${e.name}:${e.status}`);
+				seen.push(e);
 			});
 		}
 		await engine.start();
@@ -163,5 +177,10 @@ describe("engine.events", () => {
 		expect(await engine.runs.cancel(handle.id)).toBe("canceled");
 		await waitFor(() => names.includes("run:canceled:canceled"), { timeoutMs: 5_000 });
 		expect(names).toEqual(["run:waiting:waiting", "run:canceled:canceled"]);
+		// run:waiting carries attempt telemetry (it suspended an in-flight attempt); run:canceled
+		// isn't an attempt-ending write from the executor's point of view, so it doesn't.
+		expect(seen[0]?.startedAt).toBeInstanceOf(Date);
+		expect(typeof seen[0]?.durationMs).toBe("number");
+		expect(seen[1]?.durationMs).toBeUndefined();
 	});
 });

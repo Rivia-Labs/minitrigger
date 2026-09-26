@@ -131,6 +131,9 @@ export async function executeRun(deps: ExecutorDeps, job: RunJob): Promise<void>
 		log.debug({ runId: job.runId, seq: job.seq }, "stale or duplicate run job ignored");
 		return;
 	}
+	// Start of this attempt's clock (monotonic, telemetry only): from here to whichever write ends
+	// or suspends the attempt (`settle`/`failAttempt`/`suspendRun`).
+	const acquiredAtMonotonic = performance.now();
 	// Checked in the same synchronous step as `active.add` below: a run is either visible to
 	// `stop()`'s hand-back or handed back here, never neither.
 	if (deps.isShuttingDown?.()) {
@@ -150,7 +153,7 @@ export async function executeRun(deps: ExecutorDeps, job: RunJob): Promise<void>
 		transition: "started",
 	});
 	try {
-		await runAcquired(deps, state);
+		await runAcquired(deps, state, acquiredAtMonotonic);
 	} catch (error) {
 		log.error(
 			{ runId: run.id, taskId: run.taskId, err: error },
@@ -191,7 +194,11 @@ async function handBackLateAcquire(
 	}
 }
 
-async function runAcquired(deps: ExecutorDeps, state: ExecutionState): Promise<void> {
+async function runAcquired(
+	deps: ExecutorDeps,
+	state: ExecutionState,
+	acquiredAtMonotonic: number
+): Promise<void> {
 	const { run } = state;
 	const task = deps.registry.tasks.get(run.taskId);
 	const logger = createRunLogger(
@@ -251,7 +258,7 @@ async function runAcquired(deps: ExecutorDeps, state: ExecutionState): Promise<v
 		// gone).
 		await logger.close();
 		await progress.close();
-		await settle(deps, state, task, outcome, maxDurationMs);
+		await settle(deps, state, task, outcome, maxDurationMs, acquiredAtMonotonic);
 	} finally {
 		// The attempt is over (terminal write, retry, suspension, release or an unexpected
 		// error): stop whatever user code is still running, e.g. the other steps of a rejected
@@ -503,12 +510,18 @@ function invoke(
 	);
 }
 
+/** Elapsed time of the current attempt (telemetry only; monotonic clock, never the DB clock). */
+function elapsedMs(acquiredAtMonotonic: number): number {
+	return performance.now() - acquiredAtMonotonic;
+}
+
 async function settle(
 	deps: ExecutorDeps,
 	state: ExecutionState,
 	task: AnyTask | undefined,
 	outcome: Outcome,
-	maxDurationMs: number | undefined
+	maxDurationMs: number | undefined,
+	acquiredAtMonotonic: number
 ): Promise<void> {
 	const log = deps.config.logger;
 	const fields = { runId: state.runId, taskId: state.taskId, attempt: state.run.attempt };
@@ -521,12 +534,12 @@ async function settle(
 	// same code would hit it again. An abort that already cleared ownership still wins.
 	const ownershipGone = outcome.kind === "aborted" && outcome.reason !== "timeout";
 	if (state.fatalError !== undefined && !ownershipGone) {
-		return failAttempt(deps, state, task, state.fatalError, false);
+		return failAttempt(deps, state, task, state.fatalError, false, acquiredAtMonotonic);
 	}
 
 	switch (outcome.kind) {
 		case "suspended":
-			return suspendRun(deps, state);
+			return suspendRun(deps, state, acquiredAtMonotonic);
 
 		case "aborted":
 			switch (outcome.reason) {
@@ -534,13 +547,14 @@ async function settle(
 					// `maxDurationMs` expired during the pre-suspension settle (the execution still
 					// owns the run): the suspension wins (decision 2), no attempt is counted. The
 					// in-flight steps that did not finish were never persisted and re-run on replay.
-					if (state.suspended) return suspendRun(deps, state);
+					if (state.suspended) return suspendRun(deps, state, acquiredAtMonotonic);
 					return failAttempt(
 						deps,
 						state,
 						task,
 						timeoutError(state.taskId, maxDurationMs ?? 0),
-						true
+						true,
+						acquiredAtMonotonic
 					);
 				case "shutdown":
 					return;
@@ -567,7 +581,8 @@ async function settle(
 				state,
 				task,
 				outcome.error,
-				!(outcome.error instanceof AbortTaskRunError)
+				!(outcome.error instanceof AbortTaskRunError),
+				acquiredAtMonotonic
 			);
 
 		case "success": {
@@ -583,7 +598,7 @@ async function settle(
 				});
 			} catch (error) {
 				// Deterministic for the same code path: retrying would not help.
-				return failAttempt(deps, state, task, error, false);
+				return failAttempt(deps, state, task, error, false, acquiredAtMonotonic);
 			}
 			const result = await deps.store.runs.complete(state.owner, output);
 			if (result.kind === "lost") return onLost(deps, state);
@@ -595,6 +610,8 @@ async function settle(
 				error: null,
 				updatedAt: result.updatedAt,
 				transition: "completed",
+				startedAt: state.run.updatedAt,
+				durationMs: elapsedMs(acquiredAtMonotonic),
 			});
 			return afterResolution(deps, result.parent, result.expireJobsToRemove);
 		}
@@ -605,7 +622,11 @@ async function settle(
  * The suspension transaction (decision 3), after the in-flight steps settled. `attempt` is never
  * incremented. The BullMQ job then completes, so a suspended run does not hold a worker slot.
  */
-async function suspendRun(deps: ExecutorDeps, state: ExecutionState): Promise<void> {
+async function suspendRun(
+	deps: ExecutorDeps,
+	state: ExecutionState,
+	acquiredAtMonotonic: number
+): Promise<void> {
 	const fields = { runId: state.runId, taskId: state.taskId, attempt: state.run.attempt };
 	const result = await deps.store.runs.suspend(state.owner);
 	if (result.kind !== "lost") {
@@ -613,6 +634,12 @@ async function suspendRun(deps: ExecutorDeps, state: ExecutionState): Promise<vo
 		const status = result.kind === "waiting_on_waitpoints" ? "waiting" : result.enqueue.status;
 		const updatedAt =
 			result.kind === "waiting_on_waitpoints" ? result.updatedAt : result.enqueue.updatedAt;
+		// Item 5: "requeued" (everything this suspend waited for was already resolved by the time
+		// the suspension transaction ran) is a `transition: "queued"` event, same as any other
+		// (re)queue -- no startedAt/durationMs (see the RunStatusInfo/RunEvent JSDoc and the README
+		// events section: absent on `run:queued`). Only `waiting`/`sleeping` are timing an attempt
+		// that just suspended.
+		const requeued = result.kind === "requeued";
 		deps.notify?.status({
 			runId: state.runId,
 			taskId: state.taskId,
@@ -620,7 +647,10 @@ async function suspendRun(deps: ExecutorDeps, state: ExecutionState): Promise<vo
 			attempt: state.run.attempt,
 			error: state.run.error,
 			updatedAt,
-			transition: result.kind === "requeued" ? "queued" : "waiting",
+			transition: requeued ? "queued" : "waiting",
+			...(requeued
+				? {}
+				: { startedAt: state.run.updatedAt, durationMs: elapsedMs(acquiredAtMonotonic) }),
 		});
 	}
 	switch (result.kind) {
@@ -656,12 +686,14 @@ async function failAttempt(
 	state: ExecutionState,
 	task: AnyTask | undefined,
 	error: unknown,
-	retryable: boolean
+	retryable: boolean,
+	acquiredAtMonotonic: number
 ): Promise<void> {
 	const { run } = state;
 	const serialized: SerializedError = formatError(error, retryable);
 	const log = deps.config.logger;
 	const fields = { runId: run.id, taskId: run.taskId, attempt: run.attempt };
+	const durationMs = elapsedMs(acquiredAtMonotonic);
 
 	if (!retryable || run.attempt >= run.maxAttempts) {
 		const result = await deps.store.runs.fail(state.owner, serialized);
@@ -674,6 +706,8 @@ async function failAttempt(
 			error: serialized,
 			updatedAt: result.updatedAt,
 			transition: "failed",
+			startedAt: run.updatedAt,
+			durationMs,
 		});
 		log.warn({ ...fields, error: serialized }, "run failed");
 		return afterResolution(deps, result.parent, result.expireJobsToRemove);
@@ -691,6 +725,8 @@ async function failAttempt(
 		error: serialized,
 		updatedAt: result.enqueue.updatedAt,
 		transition: "retrying",
+		startedAt: run.updatedAt,
+		durationMs,
 	});
 	log.info({ ...fields, error: serialized, delayMs: result.enqueue.delayMs }, "run will retry");
 	await enqueue(deps, result.enqueue);
