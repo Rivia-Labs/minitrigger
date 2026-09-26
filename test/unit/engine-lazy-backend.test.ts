@@ -77,6 +77,38 @@ describe("lazy BullMQ backend", () => {
 		await engine.stop();
 	});
 
+	it("write paths that enqueue load the backend BEFORE touching Postgres", async () => {
+		vi.doMock(BULLMQ_BACKEND, () => {
+			throw missingPackage("ioredis");
+		});
+		const { createEngine, ConfigError } = await loadEngineModules();
+		const { defineTask } = await import("../../src/index.js");
+		const { Pool } = await import("pg");
+		const pool = new Pool({ connectionString: POSTGRES });
+		const query = vi.spyOn(pool, "query");
+		const connect = vi.spyOn(pool, "connect");
+		const task = defineTask({ id: "lazy-task", queue: { name: "q" }, run: async () => null });
+		const engine = createEngine({ ...bullmqConfig(), postgres: { pool }, tasks: [task] });
+		const runId = "00000000-0000-4000-8000-000000000000";
+
+		// Without this, trigger() inserted the run and only its best-effort enqueue failed (logged
+		// as a lost enqueue) -- the call resolved and the run waited for another reconciler.
+		await expect(engine.trigger(task, undefined)).rejects.toBeInstanceOf(ConfigError);
+		await expect(engine.trigger(task, undefined)).rejects.toThrow(/pnpm add bullmq ioredis/);
+		// (`runs.replay` reads the original run first, then creates through the same path as trigger.)
+		await expect(engine.runs.retryFailed({ limit: 10 })).rejects.toBeInstanceOf(ConfigError);
+		await expect(engine.tokens.complete(runId, null)).rejects.toBeInstanceOf(ConfigError);
+		await expect(engine.queues.pause("q")).rejects.toBeInstanceOf(ConfigError);
+		await expect(engine.queues.resume("q")).rejects.toBeInstanceOf(ConfigError);
+		expect(query).not.toHaveBeenCalled();
+		expect(connect).not.toHaveBeenCalled();
+
+		// Validation errors still come first.
+		await expect(engine.runs.retryFailed({ limit: 0 })).rejects.toThrow(/limit/);
+		await engine.stop();
+		await pool.end();
+	});
+
 	it("rethrows any other load error as is", async () => {
 		const failure = new TypeError("boom at module evaluation");
 		vi.doMock(BULLMQ_BACKEND, () => {
@@ -189,6 +221,31 @@ describe("createLazyBackend", () => {
 		expect(loadFactory).not.toHaveBeenCalled();
 		expect(runtime.isReady()).toBe(false);
 		expect(runtime.transport.workerConcurrency("q")).toBeUndefined();
+	});
+
+	it("closeWorkers seals before awaiting a load in flight: a failed load is never retried", async () => {
+		const { createLazyBackend } = await import("../../src/backends/lazy.js");
+		let rejectLoad: (error: Error) => void = () => {};
+		const loadFactory = vi.fn(
+			() =>
+				new Promise<BackendFactory>((_resolve, reject) => {
+					rejectLoad = reject;
+				})
+		);
+		const ctx = { logger: quiet } as unknown as BackendContext;
+		const runtime = createLazyBackend(ctx, loadFactory);
+		const first = runtime.transport.enqueueRun({ queue: "q", runId: "r", seq: 1, delayMs: 0 });
+		const closing = runtime.transport.closeWorkers({ timeoutMs: 10 });
+		// Sealed while the load is in flight: this joins it instead of starting another one.
+		const second = runtime.transport.enqueueRun({ queue: "q", runId: "r", seq: 2, delayMs: 0 });
+		rejectLoad(new Error("load failed"));
+		await expect(first).rejects.toThrow("load failed");
+		await expect(second).rejects.toThrow("load failed");
+		await expect(closing).resolves.toEqual({ stillActive: [] });
+		await expect(
+			runtime.transport.enqueueRun({ queue: "q", runId: "r", seq: 3, delayMs: 0 })
+		).rejects.toThrow(/stopped/);
+		expect(loadFactory).toHaveBeenCalledOnce();
 	});
 
 	it("closeWorkers during a load awaits it and closes the loaded transport", async () => {

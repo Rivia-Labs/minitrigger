@@ -844,6 +844,17 @@ export function createEngineCore(
 		pubsub ??= backend.createPubSub();
 		return pubsub;
 	}
+
+	/**
+	 * A backend loaded on demand (`EngineBackend.load`) is loaded BEFORE a write that goes on to
+	 * enqueue: otherwise a load failure (a missing optional peer, `ConfigError`) would surface only
+	 * inside the best-effort enqueue after the Postgres write, logged as a lost enqueue, and the
+	 * call would resolve. Skipped once stop() began (writes still allowed while draining, e.g.
+	 * `tokens.complete`, keep their best-effort enqueue; a stopping engine never starts a load).
+	 */
+	async function loadBackendForWrite(): Promise<void> {
+		if (backend.load && !lifecycle.isShuttingDown()) await backend.load();
+	}
 	/**
 	 * Ends every open `runs.subscribe` iteration: quietly on `stop()`, or with the given error
 	 * (thrown by the iteration) when its subscriber was discarded by a failed start().
@@ -877,6 +888,8 @@ export function createEngineCore(
 			label: `payload of task "${task.id}"`,
 			maxBytes: resolved.limits.maxPayloadBytes,
 		});
+		// Before the insert: `trigger`, `runs.replay` and `runs.retryFailed` all create runs here.
+		await loadBackendForWrite();
 		const input: NewRun = {
 			id: randomUUID(),
 			taskId: task.id,
@@ -1085,6 +1098,7 @@ export function createEngineCore(
 					`${[...registry.queues.keys()].map(q => `"${q}"`).join(", ") || "no queue"}`
 			);
 		}
+		await loadBackendForWrite();
 		// Postgres first (the source of truth, decision 1), then the Redis flag. A failed Redis call
 		// only warns: the leader's reconciler tick and every start() re-apply the persisted state.
 		const { record } = await store.queues.setPaused(queue, paused);
@@ -1260,10 +1274,11 @@ export function createEngineCore(
 
 		async retryFailed(filter: BatchRunsFilter): Promise<RetryFailedResult> {
 			assertNotStopped();
-			const page = await store.runs.listBatchCandidates({
-				purpose: "retry",
-				...validBatchFilter("runs.retryFailed", filter),
-			});
+			// Once for the whole batch: a load failure fails the call, instead of being reported per
+			// run as an `invalid_payload` skip (retryOneOfBatch maps ConfigError to that).
+			const valid = validBatchFilter("runs.retryFailed", filter);
+			await loadBackendForWrite();
+			const page = await store.runs.listBatchCandidates({ purpose: "retry", ...valid });
 			const outcomes = await mapBounded(page.items, BATCH_CONCURRENCY, retryOneOfBatch);
 			const result: RetryFailedResult = {
 				retried: [],
@@ -1480,6 +1495,7 @@ export function createEngineCore(
 			if (typeof tokenId !== "string" || !UUID_PATTERN.test(tokenId)) {
 				return { completed: false, reason: "not_found" };
 			}
+			await loadBackendForWrite();
 			const result = await store.waitpoints.completeToken(tokenId, value as Json);
 			switch (result.kind) {
 				case "not_found":

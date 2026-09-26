@@ -32,11 +32,15 @@ export function createLazyBackend(
 ): BackendRuntime {
 	let current: BackendRuntime | undefined;
 	let loading: Promise<BackendRuntime> | undefined;
-	/** Set by a `closeWorkers` that found nothing loaded: no load may start after it. */
+	/**
+	 * Set by `closeWorkers` (stop()): from then on no NEW load starts (it would open connections
+	 * nothing closes); a load already in flight is still returned, and awaited by `closeWorkers`.
+	 */
 	let sealed = false;
 
 	function ensure(): Promise<BackendRuntime> {
 		if (current) return Promise.resolve(current);
+		// While sealed, only the load already in flight (awaited and closed by closeWorkers).
 		if (loading) return loading;
 		if (sealed) {
 			return Promise.reject(new MinitriggerError("this engine was stopped; create a new one"));
@@ -47,8 +51,10 @@ export function createLazyBackend(
 			return runtime;
 		});
 		loading = attempt;
-		// A failed load is not memoized: a later call tries again (and fails the same way if the
-		// package is really missing).
+		// A failed load is not memoized here: a later call tries again. But Node caches a failed
+		// module graph (ESM `import()`, which the CJS build uses too for this chunk), so installing
+		// the missing peer while the process runs most likely does not help: the retry fails the
+		// same way until the process restarts.
 		attempt.catch(() => {
 			if (loading === attempt) loading = undefined;
 		});
@@ -68,12 +74,13 @@ export function createLazyBackend(
 		listJobSchedulers: async () => (await ensure()).transport.listJobSchedulers(),
 		startWorkers: async opts => (await ensure()).transport.startWorkers(opts),
 		async closeWorkers(opts) {
+			// Sealed first: nothing may start a new load while (or after) this waits for one.
+			sealed = true;
 			if (!current && loading) {
 				// A load in progress (a trigger or start() racing stop()): close what it builds.
 				await loading.catch(() => undefined);
 			}
 			if (!current) {
-				sealed = true;
 				// Same contract as the real transport: a failing callback is logged, closing continues.
 				await opts.beforeClose?.([]).catch((error: unknown) => {
 					ctx.logger.warn({ err: error }, "error before closing the workers");
