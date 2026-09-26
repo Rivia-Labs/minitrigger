@@ -176,6 +176,12 @@
   "peerDependenciesMeta": {
     "@types/pg": {
       "optional": true
+    },
+    "bullmq": {
+      "optional": true
+    },
+    "ioredis": {
+      "optional": true
     }
   }
 }

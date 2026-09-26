@@ -8,10 +8,10 @@
 
 import { randomUUID } from "node:crypto";
 import { Pool } from "pg";
-import { createBullmqBackend } from "./backends/bullmq.js";
+import { createLazyBackend } from "./backends/lazy.js";
 import { createPostgresBackend } from "./backends/postgres.js";
 import { withTimeout } from "./backends/shared.js";
-import type { BackendContext, BackendRuntime } from "./backends/types.js";
+import type { BackendContext, BackendFactory, BackendRuntime } from "./backends/types.js";
 import {
 	assertTimerMs,
 	assertTtlWithinRetention,
@@ -625,6 +625,12 @@ export interface EngineBackend {
 	createRunInTransaction?(tx: TransactionClient, input: NewRun): Promise<CreateRunResult>;
 	/** Called after `queues.scale()` changed a worker's concurrency (pool sizing warning). */
 	onScaled?(): void;
+	/**
+	 * A backend loaded on demand (`transport: "bullmq"`, decision 14 amendment): loads it, so that
+	 * `createPubSub()` (synchronous) can be called. Awaited by `runs.subscribe` before it creates the
+	 * subscriber; `start()` loads it in its first step. Absent: always loaded.
+	 */
+	load?(): Promise<void>;
 }
 
 /** Lifecycle state owned by the engine wrapping the core. @internal */
@@ -1349,6 +1355,12 @@ export function createEngineCore(
 		signal: AbortSignal | undefined
 	): AsyncGenerator<RunStatusUpdate, void, undefined> {
 		if (!UUID_PATTERN.test(runId) || signal?.aborted) return;
+		if (backend.load) {
+			// A backend loaded on demand must be loaded before `getPubSub()` (synchronous). A stop()
+			// begun meanwhile ends the iteration quietly, as it would have ended it right after.
+			await backend.load();
+			if (signal?.aborted || lifecycle.isShuttingDown()) return;
+		}
 		const pending: RunStatusMessage[] = [];
 		let wake: (() => void) | undefined;
 		let ended = false;
@@ -1513,6 +1525,49 @@ export function createEngineCore(
 	};
 }
 
+/** `import()`/`require()` codes for a module that could not be resolved. */
+const MODULE_NOT_FOUND_CODES: ReadonlySet<unknown> = new Set([
+	"ERR_MODULE_NOT_FOUND",
+	"MODULE_NOT_FOUND",
+]);
+/** `Cannot find package 'ioredis' imported from ...` / `Cannot find module 'bullmq'`. */
+const MISSING_PEER_PATTERN = /['"](?:bullmq|ioredis)(?:\/[^'"]*)?['"]/;
+
+/**
+ * Whether `error` (or an error in its `cause` chain) says `bullmq` or `ioredis` itself could not
+ * be resolved -- not a file inside them, not another package.
+ */
+function isMissingOptionalPeer(error: unknown): boolean {
+	let current: unknown = error;
+	for (let depth = 0; depth < 5 && current instanceof Error; depth++) {
+		const code = (current as { code?: unknown }).code;
+		if (MODULE_NOT_FOUND_CODES.has(code) && MISSING_PEER_PATTERN.test(current.message)) {
+			return true;
+		}
+		current = current.cause;
+	}
+	return false;
+}
+
+/**
+ * Loads `src/backends/bullmq.ts` (its own chunk: the dynamic `import()` keeps it, and with it
+ * `bullmq`/`ioredis`, out of the static graph of every entry). A missing optional peer is a
+ * `ConfigError` with the install hint; any other load error is rethrown as is.
+ */
+async function loadBullmqBackendFactory(): Promise<BackendFactory> {
+	try {
+		const module = await import("./backends/bullmq.js");
+		return module.createBullmqBackend;
+	} catch (error) {
+		if (!isMissingOptionalPeer(error)) throw error;
+		throw new ConfigError(
+			'transport "bullmq" needs the optional peers bullmq and ioredis: pnpm add bullmq ioredis ' +
+				'(or use transport: "postgres")',
+			{ cause: error }
+		);
+	}
+}
+
 export function createEngine(config: EngineConfig): Engine {
 	const resolved = resolveConfig(config);
 	const { logger } = resolved;
@@ -1579,10 +1634,13 @@ export function createEngine(config: EngineConfig): Engine {
 		isActiveLocally: runId => requireCore().active.get(runId) !== undefined,
 		notifyStatus: info => requireCore().notifyStatus(info),
 	};
+	// Decision 14 amendment: the BullMQ backend (the only module reaching `bullmq`/`ioredis`) is
+	// loaded on first use, so an engine on `transport: "postgres"` -- and the main entry and
+	// `/testing` themselves -- never load those optional peers.
 	const runtime: BackendRuntime =
 		resolved.transport === "postgres"
 			? createPostgresBackend(backendContext)
-			: createBullmqBackend(backendContext);
+			: createLazyBackend(backendContext, loadBullmqBackendFactory);
 	const { transport } = runtime;
 
 	const core = createEngineCore(resolved, registry, runtime.backend, {
