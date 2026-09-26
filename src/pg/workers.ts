@@ -31,6 +31,13 @@ const CLAIM_BACKOFF_MAX_MS = 30_000;
 /** At most one "claim failed" warning per worker in this window. */
 const CLAIM_WARN_INTERVAL_MS = 10_000;
 const SCHEDULE_TICK = "schedule-tick";
+/**
+ * How long `drain()` waits for the claim statement in flight when `stopClaiming()` ran, on its own
+ * budget (not `timeoutMs`, which bounds the executions): abandoning a slow claim would launch the
+ * runs it brings after `stop()` resolved, outside the drain and the hand-back (spec §3.4). The
+ * BullMQ path bounds the equivalent in-flight `acquire` the same way (`IN_FLIGHT_DRAIN_MS`).
+ */
+export const CLAIM_DRAIN_TIMEOUT_MS = 5_000;
 
 export interface WorkerPolling {
 	/** Longest sleep between two claims when nothing is due sooner. */
@@ -255,10 +262,10 @@ function createClaimLoop<T>(spec: LoopSpec<T>): ClaimWorker<T> {
 		},
 		async drain(timeoutMs) {
 			const deadline = now() + timeoutMs;
-			const bounded = async (p: Promise<unknown>): Promise<void> => {
+			const bounded = async (p: Promise<unknown>, until: number): Promise<void> => {
 				let t: ReturnType<typeof setTimeout> | undefined;
 				const expired = new Promise<void>(resolve => {
-					t = setTimeoutFn(resolve, Math.max(0, deadline - now()));
+					t = setTimeoutFn(resolve, Math.max(0, until - now()));
 					t.unref?.();
 				});
 				try {
@@ -267,10 +274,11 @@ function createClaimLoop<T>(spec: LoopSpec<T>): ClaimWorker<T> {
 					clearTimeout(t);
 				}
 			};
-			// The claim in flight, and the launch of what it brings.
-			if (current) await bounded(current);
+			// The claim in flight, and the launch of what it brings: its own bound, so the runs it
+			// claimed are launched (and handed back by the executor) before stop() moves on.
+			if (current) await bounded(current, Math.max(deadline, now() + CLAIM_DRAIN_TIMEOUT_MS));
 			if (active.size > 0) {
-				await bounded(Promise.allSettled([...active].map(a => a.done)));
+				await bounded(Promise.allSettled([...active].map(a => a.done)), deadline);
 			}
 			return [...active].map(a => a.item);
 		},

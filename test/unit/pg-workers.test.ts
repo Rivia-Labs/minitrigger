@@ -395,6 +395,52 @@ describe("queue worker", () => {
 		expect(c.claim.nextDueAt).not.toHaveBeenCalled();
 	});
 
+	it("drain() keeps waiting for a claim in flight past its timeoutMs (bounded separately) and launches its runs", async () => {
+		// A claim slower than `shutdownTimeoutMs` must not be abandoned: the runs it brings would be
+		// launched after stop() resolved, outside the drain and the hand-back (spec §3.4).
+		const c = fakeClaim();
+		const p = controlledProcess();
+		const { worker } = queueWorker(c.claim, p.process);
+		const gate = deferred();
+		c.holdClaims(gate.promise);
+		worker.start();
+		await flush();
+		worker.stopClaiming();
+		let result: RunRecord[] | undefined;
+		void worker.drain(100).then(r => {
+			result = r;
+		});
+		await vi.advanceTimersByTimeAsync(400);
+		expect(result).toBeUndefined();
+
+		c.backlog.push(run("r1"));
+		gate.resolve();
+		await flush();
+		expect(p.process).toHaveBeenCalledWith(expect.objectContaining({ id: "r1" }));
+		// The executions' own budget (100 ms) already ran out: r1 is returned as still in flight.
+		expect(result?.map(r => r.id)).toEqual(["r1"]);
+		p.finish("r1");
+		await flush();
+	});
+
+	it("drain() gives up on a claim that never settles after the claim drain bound", async () => {
+		const c = fakeClaim();
+		const p = controlledProcess();
+		const { worker } = queueWorker(c.claim, p.process);
+		c.holdClaims(new Promise<void>(() => {}));
+		worker.start();
+		await flush();
+		worker.stopClaiming();
+		let result: RunRecord[] | undefined;
+		void worker.drain(100).then(r => {
+			result = r;
+		});
+		await vi.advanceTimersByTimeAsync(4_900);
+		expect(result).toBeUndefined();
+		await vi.advanceTimersByTimeAsync(200);
+		expect(result).toEqual([]);
+	});
+
 	it("globalConcurrency is passed to claimRuns and onSlotFreed fires when a run ends", async () => {
 		const c = fakeClaim();
 		c.backlog.push(run("r1"));
