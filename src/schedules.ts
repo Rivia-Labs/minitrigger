@@ -176,6 +176,12 @@ export interface SchedulesApiDeps {
 	assertNotStopped?: () => void;
 	/** Throws only once the engine is fully stopped (list calls it; it works while stopping). */
 	assertNotClosed?: () => void;
+	/**
+	 * Runs after validation, before the Postgres write of `upsert`/`delete`: loads a backend
+	 * loaded on demand, so a missing optional peer is a `ConfigError` with nothing written (the
+	 * scheduler sync after the write only warns).
+	 */
+	beforeWrite?: () => Promise<void>;
 }
 
 export function createSchedulesApi(deps: SchedulesApiDeps): EngineSchedules {
@@ -197,6 +203,7 @@ export function createSchedulesApi(deps: SchedulesApiDeps): EngineSchedules {
 			label: `payload of schedule "${id}"`,
 			maxBytes: maxPayloadBytes,
 		});
+		await deps.beforeWrite?.();
 
 		const result = await store.schedules.upsert(
 			{
@@ -227,6 +234,7 @@ export function createSchedulesApi(deps: SchedulesApiDeps): EngineSchedules {
 	async function del(id: string): Promise<boolean> {
 		assertNotStopped();
 		if (typeof id !== "string") return false;
+		await deps.beforeWrite?.();
 		const deleted = await store.schedules.delete(id);
 		if (deleted) {
 			try {

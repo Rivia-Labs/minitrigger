@@ -100,6 +100,11 @@ describe("lazy BullMQ backend", () => {
 		await expect(engine.tokens.complete(runId, null)).rejects.toBeInstanceOf(ConfigError);
 		await expect(engine.queues.pause("q")).rejects.toBeInstanceOf(ConfigError);
 		await expect(engine.queues.resume("q")).rejects.toBeInstanceOf(ConfigError);
+		// Schedules: the scheduler sync after the Postgres write would only warn.
+		await expect(
+			engine.schedules.upsert({ id: "s1", task, cron: "* * * * *" })
+		).rejects.toBeInstanceOf(ConfigError);
+		await expect(engine.schedules.delete("s1")).rejects.toBeInstanceOf(ConfigError);
 		expect(query).not.toHaveBeenCalled();
 		expect(connect).not.toHaveBeenCalled();
 

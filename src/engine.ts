@@ -825,6 +825,7 @@ export function createEngineCore(
 		maxPayloadBytes: resolved.limits.maxPayloadBytes,
 		assertNotStopped,
 		assertNotClosed,
+		beforeWrite: () => loadBackendForWrite(),
 	});
 
 	const deps: ExecutorDeps = {
