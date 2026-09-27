@@ -5,9 +5,10 @@
  * (and was re-claimed by another) never completes, delays or reschedules the row. Times always
  * come from the database (decision 17).
  */
+import { MinitriggerError } from "../../errors.js";
 import type { Json, ScheduleTickData, SystemJobRecord, SystemJobStore } from "../types.js";
 import { direct, type SqlContext, type SqlExecutor } from "./db.js";
-import { jsonParam, nowPlusMs } from "./resolve.js";
+import { DELAY_UNTIL_MIN_RUN_AFTER, jsonParam, nowPlusMs } from "./resolve.js";
 
 interface SystemJobRow {
 	job_id: string;
@@ -210,19 +211,20 @@ export function createSystemJobStore(exec: SqlExecutor, ctx: SqlContext): System
 			return rows.map(mapSystemJob);
 		},
 
-		async nextDueAt() {
+		async nextDueInMs() {
 			// Only future `run_after` (indexed). A job whose lock expires later is found by the
 			// worker's regular poll (`polling.intervalMs`), not by this wake-up hint.
-			const { rows } = await db().query<{ next: Date | null }>(
-				`SELECT min(run_after) AS next FROM ${table} WHERE run_after > now()`
+			// The delay is computed in SQL (decision 17): the app clock may drift from the DB's.
+			const { rows } = await db().query<{ ms: number | null }>(
+				`SELECT ${DELAY_UNTIL_MIN_RUN_AFTER} AS ms FROM ${table} WHERE run_after > now()`
 			);
-			return rows[0]?.next ?? null;
+			return rows[0]?.ms ?? null;
 		},
 
 		async now() {
 			const { rows } = await db().query<{ now: Date }>("SELECT now() AS now");
 			const row = rows[0];
-			if (!row) throw new Error("SELECT now() returned no row");
+			if (!row) throw new MinitriggerError("SELECT now() returned no row");
 			return row.now;
 		},
 	};

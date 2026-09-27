@@ -321,9 +321,9 @@ repositories that are not part of `StoreTx` and have no memory-store counterpart
 
 | Method      | SQL shape |
 | ----------- | --------- |
-| `claimRuns({ queue, limit })` | One statement, no explicit transaction: `WITH picked AS (SELECT r.id ... WHERE queue=$1 AND status IN ('queued','waiting') AND run_after <= now() AND NOT outbox_pending AND queue not paused ORDER BY run_after, created_at, id LIMIT $2 FOR UPDATE OF r SKIP LOCKED) UPDATE runs r SET status='running', execution_id=gen_random_uuid(), heartbeat_at=now(), started_at=<below>, debounce_key=NULL, updated_at=now() FROM picked RETURNING r.*` (columns qualified with `r.`; result re-sorted by `(run_after, created_at, id)`). `limit <= 0` → `[]` without a query. |
-| `claimRuns({ ..., globalConcurrency })` | Short transaction: `pg_advisory_xact_lock(hashtextextended('<schema>:<queue>:global', 0))`, then `count(*)` of the queue's `running` rows (fresh READ COMMITTED snapshot), then the same claim with `LIMIT least(limit, globalConcurrency - running)`; nothing claimed when that is `<= 0`. Exact across processes. |
-| `nextDueAt(queue)` | `min(run_after)` over the queue's `queued`/`waiting` rows with `run_after > now()`, or null. |
+| `claimRuns({ queue, limit })` | One claim statement in a short transaction whose only other statement is `SET LOCAL statement_timeout = 1500` (`CLAIM_STATEMENT_TIMEOUT_MS`: a claim can never commit after the worker's 5 s drain bound; a timeout is a failed claim, rolled back): `WITH picked AS (SELECT r.id ... WHERE queue=$1 AND status IN ('queued','waiting') AND run_after <= statement_timestamp() (not `now()`, frozen at the BEGIN) AND NOT outbox_pending AND queue not paused ORDER BY run_after, created_at, id LIMIT $2 FOR UPDATE OF r SKIP LOCKED) UPDATE runs r SET status='running', execution_id=gen_random_uuid(), heartbeat_at=now(), started_at=<below>, debounce_key=NULL, updated_at=now() FROM picked RETURNING r.*` (columns qualified with `r.`; result re-sorted by `(run_after, created_at, id)`). `limit <= 0` → `[]` without a query. |
+| `claimRuns({ ..., globalConcurrency })` | Short transaction (`SET LOCAL statement_timeout = 1500`, `CLAIM_STATEMENT_TIMEOUT_MS`): `pg_advisory_xact_lock(hashtextextended('<schema>:<queue>:global', 1))` (seed 1, so no decision-25 key `schema:queue:<concurrencyKey>` hashed with seed 0 can collide, `concurrencyKey: "global"` included), then `count(*)` of the queue's `running` rows (fresh READ COMMITTED snapshot), then the same claim with `LIMIT least(limit, globalConcurrency - running)`; nothing claimed when that is `<= 0`. Exact across processes. |
+| `nextDueInMs(queue)` | `greatest(0, ceil(extract(epoch from (min(run_after) - now())) * 1000))` over the queue's `queued`/`waiting` rows with `run_after > now()`, or null: the delay is computed on the DB clock (decision 17). |
 
 Mirrors `acquire` with two deliberate differences: `enqueue_seq` is unchanged (there is no job to
 fence; `release`/`retry`/`suspend` still bump it) and `concurrency_waits` is NOT reset (the
@@ -362,7 +362,7 @@ locked_by uuid, created_at)`, index `idx_system_jobs_due (run_after)`.
 | `rescheduleTick` | `run_after = $3, attempts = 0, data = jsonb_set(data, '{prevMillis}', ...)`, lock released; fenced. |
 | `remove` | Without `evenIfLocked`: `AND (locked_until IS NULL OR locked_until <= now())` (never removes an active job, like BullMQ). `evenIfLocked` removes a scheduler row even mid-tick. |
 | `get` / `listByName` | Plain reads (`listByName` ordered by `run_after, job_id`). |
-| `nextDueAt` | `min(run_after) WHERE run_after > now()` (indexed); a lock that expires later is found by the regular poll. |
+| `nextDueInMs` | Delay until `min(run_after) WHERE run_after > now()` (indexed), computed in SQL on the DB clock (decision 17); a lock that expires later is found by the regular poll. |
 | `now` | `SELECT now()` (decision 17). |
 
 Fencing: every write after a claim matches `job_id AND locked_by`. A token that is not a UUID

@@ -732,15 +732,30 @@ describeTransports("engine", transport => {
 				openGate = resolve;
 			});
 			const basePool = ns.pool;
+			const gatedQuery =
+				(target: { query: unknown }) =>
+				async (text: unknown, ...rest: unknown[]) => {
+					if (typeof text === "string" && text.includes("SET status = 'running'")) {
+						gateHit = true;
+						await gate;
+					}
+					return (target.query as (...args: unknown[]) => unknown).call(target, text, ...rest);
+				};
 			const gatedPool = new Proxy(basePool, {
 				get(target, prop) {
-					if (prop === "query") {
-						return async (text: unknown, ...rest: unknown[]) => {
-							if (typeof text === "string" && text.includes("SET status = 'running'")) {
-								gateHit = true;
-								await gate;
-							}
-							return (target.query as (...args: unknown[]) => unknown).call(target, text, ...rest);
+					if (prop === "query") return gatedQuery(target);
+					if (prop === "connect") {
+						// The Postgres transport claims on a checked-out client (inside a transaction
+						// with `SET LOCAL statement_timeout`): gate that client's query too.
+						return async () => {
+							const client = await target.connect();
+							return new Proxy(client, {
+								get(c, p) {
+									if (p === "query") return gatedQuery(c);
+									const v: unknown = Reflect.get(c, p, c);
+									return typeof v === "function" ? v.bind(c) : v;
+								},
+							});
 						};
 					}
 					const value: unknown = Reflect.get(target, prop, target);

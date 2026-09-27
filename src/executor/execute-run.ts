@@ -105,6 +105,10 @@ export async function executeRun(deps: ExecutorDeps, job: RunJob): Promise<void>
 
 	let run: RunRecord | null;
 	let executionId: string;
+	// Postgres transport: set once the claimed run's execution id is known, so a failure of the
+	// concurrency re-check can hand the run back instead of leaving it `running` until stall
+	// recovery (which would spend an attempt, or fail a run on its last one).
+	let claimedExecutionIdForRelease: string | undefined;
 	try {
 		const limit =
 			job.queue === undefined
@@ -113,6 +117,7 @@ export async function executeRun(deps: ExecutorDeps, job: RunJob): Promise<void>
 		if (job.claimed) {
 			run = job.claimed;
 			executionId = claimedExecutionId(job.claimed);
+			claimedExecutionIdForRelease = executionId;
 			if (run.concurrencyKey !== null) {
 				const check = await deps.store.runs.recheckConcurrencyLimit(
 					run.id,
@@ -151,6 +156,9 @@ export async function executeRun(deps: ExecutorDeps, job: RunJob): Promise<void>
 		}
 	} catch (error) {
 		log.error({ runId: job.runId, seq: job.seq, err: error }, "failed to acquire run");
+		if (job.claimed && claimedExecutionIdForRelease !== undefined) {
+			await releaseClaimedAfterError(deps, job.claimed, claimedExecutionIdForRelease);
+		}
 		return;
 	}
 	if (!run) {
@@ -196,6 +204,51 @@ function claimedExecutionId(run: RunRecord): string {
 		throw new MinitriggerError(`claimed run ${run.id} has no execution id`);
 	}
 	return run.executionId;
+}
+
+/**
+ * Postgres transport: the claim moved the run to `running`, but the executor failed before running
+ * it (e.g. the concurrency-key re-check threw). Best-effort `release` (no attempt spent, like a
+ * hand-back), then publish and enqueue the result, each step on its own: a failure of one never
+ * skips the others, and a run left `running` is still recovered by the stall reconciler.
+ */
+async function releaseClaimedAfterError(
+	deps: ExecutorDeps,
+	run: RunRecord,
+	executionId: string
+): Promise<void> {
+	const log = deps.config.logger;
+	const fields = { runId: run.id, taskId: run.taskId };
+	let result: Awaited<ReturnType<ExecutorDeps["store"]["runs"]["release"]>>;
+	try {
+		result = await deps.store.runs.release({ runId: run.id, executionId });
+	} catch (error) {
+		log.error(
+			{ ...fields, err: error },
+			"failed to release a claimed run; the stall reconciler will recover it"
+		);
+		return;
+	}
+	if (result.kind !== "released") return;
+	try {
+		deps.notify?.status({
+			runId: run.id,
+			taskId: run.taskId,
+			status: result.enqueue.status,
+			attempt: run.attempt,
+			error: run.error,
+			updatedAt: result.enqueue.updatedAt,
+			transition: "queued",
+		});
+	} catch (error) {
+		log.warn({ ...fields, err: error }, "failed to publish the status of a released run");
+	}
+	try {
+		await enqueue(deps, result.enqueue);
+	} catch (error) {
+		log.warn({ ...fields, err: error }, "failed to enqueue a released run; the poll will find it");
+	}
+	log.info(fields, "claimed run released after an error before it started");
 }
 
 /** Decision 20 for a run acquired after `stop()` began: release (no attempt) and re-enqueue. */

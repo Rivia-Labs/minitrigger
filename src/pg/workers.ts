@@ -31,6 +31,8 @@ const CLAIM_BACKOFF_MAX_MS = 30_000;
 /** At most one "claim failed" warning per worker in this window. */
 const CLAIM_WARN_INTERVAL_MS = 10_000;
 const SCHEDULE_TICK = "schedule-tick";
+/** Shortest sleep after a pass that left free slots, so no claim loop can spin. */
+export const MIN_IDLE_SLEEP_MS = 5;
 /**
  * How long `drain()` waits for the claim statement in flight when `stopClaiming()` ran, on its own
  * budget (not `timeoutMs`, which bounds the executions): abandoning a slow claim would launch the
@@ -118,7 +120,8 @@ interface LoopSpec<T> {
 	label: Record<string, unknown>;
 	concurrency: number;
 	claim(limit: number): Promise<T[]>;
-	nextDueAt(): Promise<Date | null>;
+	/** Delay until the next future row, computed on the DB clock (decision 17); null = none. */
+	nextDueInMs(): Promise<number | null>;
 	process(item: T): Promise<void>;
 	onProcessError(item: T, error: unknown): void;
 	onFinished?(): void;
@@ -168,11 +171,14 @@ function createClaimLoop<T>(spec: LoopSpec<T>): ClaimWorker<T> {
 				for (const item of items) launch(item);
 				if (stopped) return;
 				if (items.length < free) {
-					const next = await spec.nextDueAt();
+					const dueInMs = await spec.nextDueInMs();
 					if (stopped) return;
-					const delay = next
-						? Math.max(0, Math.min(spec.polling.intervalMs, next.getTime() - now()))
-						: spec.polling.intervalMs;
+					// Never a zero sleep after an empty pass, even with `jitterMs: 0`: a row due "now"
+					// by the DB clock is claimed on the next pass, not in a tight loop.
+					const delay =
+						dueInMs === null
+							? spec.polling.intervalMs
+							: Math.min(spec.polling.intervalMs, Math.max(MIN_IDLE_SLEEP_MS, dueInMs));
 					schedule(delay);
 					if (!again) return;
 				}
@@ -304,7 +310,7 @@ export function createQueueWorker(o: QueueWorkerOptions): QueueWorker {
 				limit,
 				...(o.globalConcurrency !== undefined ? { globalConcurrency: o.globalConcurrency } : {}),
 			}),
-		nextDueAt: () => o.claim.nextDueAt(o.queue),
+		nextDueInMs: () => o.claim.nextDueInMs(o.queue),
 		process: run => o.process(run),
 		onProcessError: (run, err) =>
 			o.logger.error({ queue: o.queue, runId: run.id, err }, "run processing failed unexpectedly"),
@@ -458,7 +464,7 @@ export function createSystemWorker(o: SystemWorkerOptions): SystemWorker {
 		label: { queue: "-system" },
 		concurrency: o.concurrency,
 		claim: limit => systemJobs.claim(limit, o.lockMs),
-		nextDueAt: () => systemJobs.nextDueAt(),
+		nextDueInMs: () => systemJobs.nextDueInMs(),
 		process: processRecord,
 		// Only bookkeeping writes reach here (handler errors are handled above): the lock expires
 		// and another claim retries the job.

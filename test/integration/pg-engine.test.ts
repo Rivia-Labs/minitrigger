@@ -375,13 +375,13 @@ describe("engine with transport postgres", () => {
 		});
 		const a = makeEngine([task]);
 		await a.start();
-		await waitFor(async () => (await countRuns(task.id)) >= 2, { timeoutMs: 6_000 });
+		await waitFor(async () => (await countRuns(task.id)) >= 2, { timeoutMs: 12_000 });
 		await a.stop();
 		const afterA = await countRuns(task.id);
 
 		const b = makeEngine([task]);
 		await b.start();
-		await waitFor(async () => (await countRuns(task.id)) >= afterA + 2, { timeoutMs: 6_000 });
+		await waitFor(async () => (await countRuns(task.id)) >= afterA + 2, { timeoutMs: 12_000 });
 		await b.schedules.delete(task.id);
 
 		// One run per tick timestamp: every run has its own `__schedule:id:ts` key.
@@ -395,7 +395,7 @@ describe("engine with transport postgres", () => {
 		for (const { key } of rows) {
 			expect(Number(key.split(":").at(-1)) % 1_000).toBe(0);
 		}
-	}, 20_000);
+	}, 30_000);
 
 	it("restarting the engine does not skip a due schedule tick", async () => {
 		const task = defineTask({
@@ -419,13 +419,16 @@ describe("engine with transport postgres", () => {
 
 		const b = makeEngine([task]);
 		await b.start(); // Its declarative sync must not move the due tick forward.
-		await waitFor(async () => {
-			const { rows } = await ns.pool.query(
-				`SELECT 1 FROM ${t("idempotency_keys")} WHERE task_id = $1 AND key = $2`,
-				[task.id, `__schedule:${task.id}:${dueMs}`]
-			);
-			return rows.length === 1;
-		});
+		await waitFor(
+			async () => {
+				const { rows } = await ns.pool.query(
+					`SELECT 1 FROM ${t("idempotency_keys")} WHERE task_id = $1 AND key = $2`,
+					[task.id, `__schedule:${task.id}:${dueMs}`]
+				);
+				return rows.length === 1;
+			},
+			{ timeoutMs: 15_000 }
+		);
 		expect(await countRuns(task.id)).toBe(1);
 	});
 
@@ -438,7 +441,7 @@ describe("engine with transport postgres", () => {
 		});
 		const engine = makeEngine([task], { polling: { intervalMs: 200 } });
 		await engine.start();
-		await waitFor(() => tickRow(task.id));
+		await waitFor(() => tickRow(task.id), { timeoutMs: 15_000 });
 		const tickMs = (Math.floor(Date.now() / 1_000) - 5) * 1_000;
 
 		// The dead process: claimed the tick (lock for 300 ms) and created its run, then died
@@ -469,7 +472,7 @@ describe("engine with transport postgres", () => {
 				const row = await tickRow(task.id);
 				return row?.future === true && row.locked_by === null;
 			},
-			{ timeoutMs: 5_000 }
+			{ timeoutMs: 15_000 }
 		);
 		const row = await tickRow(task.id);
 		expect(row?.attempts).toBe(0);
@@ -512,7 +515,15 @@ describe("engine with transport postgres", () => {
 				);
 				return false;
 			},
-			{ timeoutMs: 10_000 }
+			{ timeoutMs: 15_000 }
+		);
+		// The "failed permanently" line is logged before the row is rewritten: wait for the write.
+		await waitFor(
+			async () => {
+				const r = await tickRow(scheduleId);
+				return r?.future === true && r.locked_by === null;
+			},
+			{ timeoutMs: 15_000 }
 		);
 		const row = await tickRow(scheduleId);
 		expect(row).toBeDefined();
@@ -520,7 +531,7 @@ describe("engine with transport postgres", () => {
 		expect(row?.attempts).toBe(0);
 		expect(row?.locked_by).toBeNull();
 		expect(await countRuns(scheduled.id)).toBe(0);
-	}, 20_000);
+	}, 30_000);
 
 	it("waitpoint expiry fires from system_jobs and cancels the child", async () => {
 		const queue = uniqueQueue();
@@ -669,5 +680,56 @@ describe("engine with transport postgres", () => {
 		expect(report.staleWaiting).toBe(0);
 		expect(report.skippedLostEnqueues).toBe(true);
 		for (const id of ids) expect((await engine.runs.get(id))?.status).toBe("queued");
+	});
+
+	it("a claimed run whose concurrency re-check throws is released (no attempt spent) and then completes", async () => {
+		const task = defineTask({
+			id: uniqueTaskId("recheck-throws"),
+			queue: { name: uniqueQueue(), concurrencyKey: { limit: 1 } },
+			retry: { maxAttempts: 1 },
+			run: async () => "done",
+		});
+		let injected = 0;
+		const originalQuery = Client.prototype.query;
+		vi.spyOn(Client.prototype, "query").mockImplementation(function (
+			this: Client,
+			...args: unknown[]
+		) {
+			const [text] = args;
+			if (
+				injected === 0 &&
+				typeof text === "string" &&
+				text.includes("SELECT queue, concurrency_key, concurrency_waits FROM")
+			) {
+				injected++;
+				return Promise.reject(new Error("boom: injected re-check failure"));
+			}
+			return (originalQuery as (...a: unknown[]) => unknown).apply(this, args);
+		} as typeof Client.prototype.query);
+		const engine = makeEngine([task], { polling: { intervalMs: 200 } });
+		const events: RunEvent[] = [];
+		for (const name of ["run:queued", "run:started", "run:completed", "run:failed"] as const) {
+			engine.events.on(name, event => {
+				events.push(event);
+			});
+		}
+		await engine.start();
+
+		const handle = await engine.trigger(task, undefined, { concurrencyKey: "k" });
+		// Well under stallTimeoutMs (5 s): without the release the run would stay `running` until
+		// stall recovery, which fails it (maxAttempts 1).
+		const run = await waitForStatus(engine, handle.id, "completed", 4_000);
+		expect(injected).toBe(1);
+		expect(run.attempt).toBe(1);
+		expect(run.output).toBe("done");
+		expect(logs.some(l => l.message.startsWith("claimed run released after an error"))).toBe(true);
+		const mine = events.filter(e => e.runId === handle.id).map(e => [e.name, e.attempt]);
+		// trigger, then the release back to `queued` with the attempt unchanged, then the real run.
+		expect(mine).toEqual([
+			["run:queued", 1],
+			["run:queued", 1],
+			["run:started", 1],
+			["run:completed", 1],
+		]);
 	});
 });

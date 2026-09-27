@@ -154,7 +154,7 @@ export function createPgTransport(options: PgTransportOptions): Transport {
 			...(opts.delayMs !== undefined ? { delayMs: opts.delayMs } : {}),
 		});
 		// Same-process wake only (§3.5/Task 8 mapping): another process's `-system` worker picks
-		// this up on its own poll, bounded by `polling.intervalMs`/`nextDueAt`.
+		// this up on its own poll, bounded by `polling.intervalMs`/`nextDueInMs`.
 		systemWorker?.wake();
 	}
 
@@ -361,7 +361,11 @@ export function createPgTransport(options: PgTransportOptions): Transport {
 		// Pause (decision 27) is read straight from `queue_state` by the claim query itself; there
 		// is no separate flag to flip here.
 		async pauseQueue() {},
-		async resumeQueue() {},
+		async resumeQueue(queue) {
+			// Called after `queue_state` committed: wake every process's worker of the queue now
+			// instead of at its next poll (`polling.intervalMs`). Never throws (see enqueueRun).
+			batcher.notify(wakeChannel, queue);
+		},
 		async isQueuePaused(queue) {
 			const rec = await store.queues.get(queue);
 			return rec?.paused ?? false;

@@ -1213,8 +1213,11 @@ export interface ClaimRunsInput {
 export interface RunClaimStore {
 	/** Claimed runs ordered by `(run_after, created_at, id)`; `runAfter` is the pre-claim value. */
 	claimRuns(input: ClaimRunsInput): Promise<RunRecord[]>;
-	/** Next future `run_after` of the queue (only `queued`/`waiting`), or null. */
-	nextDueAt(queue: string): Promise<Date | null>;
+	/**
+	 * Milliseconds until the queue's next future `run_after` (only `queued`/`waiting`), computed
+	 * against the database clock (decision 17), or null when nothing is scheduled.
+	 */
+	nextDueInMs(queue: string): Promise<number | null>;
 }
 
 export interface ScheduleTickData {
@@ -1272,7 +1275,8 @@ export interface SystemJobStore {
 	remove(jobId: string, options?: { evenIfLocked?: boolean }): Promise<boolean>;
 	get(jobId: string): Promise<SystemJobRecord | null>;
 	listByName(name: string): Promise<SystemJobRecord[]>;
-	nextDueAt(): Promise<Date | null>;
+	/** Milliseconds until the next future `run_after`, against the database clock (decision 17). */
+	nextDueInMs(): Promise<number | null>;
 	/** The database's `now()` (decision 17), to compute cron occurrences. */
 	now(): Promise<Date>;
 }

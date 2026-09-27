@@ -5,6 +5,7 @@ import { SystemJobDelayed } from "../../src/executor/system.js";
 import {
 	createQueueWorker,
 	createSystemWorker,
+	MIN_IDLE_SLEEP_MS,
 	type PgSystemJob,
 	type QueueWorkerOptions,
 	type SystemWorkerOptions,
@@ -78,7 +79,7 @@ function deferred<T = void>() {
 function fakeClaim() {
 	const backlog: RunRecord[] = [];
 	const calls: ClaimRunsInput[] = [];
-	let nextDue: Date | null = null;
+	let nextDue: number | null = null;
 	let hold: Promise<void> | undefined;
 	let failNext = 0;
 	const claim = {
@@ -91,13 +92,13 @@ function fakeClaim() {
 			}
 			return backlog.splice(0, input.limit);
 		}),
-		nextDueAt: vi.fn(async () => nextDue),
+		nextDueInMs: vi.fn(async () => nextDue),
 	};
 	return {
 		claim,
 		backlog,
 		calls,
-		setNextDue(d: Date | null) {
+		setNextDue(d: number | null) {
 			nextDue = d;
 		},
 		holdClaims(p: Promise<void> | undefined) {
@@ -174,17 +175,12 @@ describe("queue worker", () => {
 		worker.stopClaiming();
 	});
 
-	it("after an empty claim sleeps until nextDueAt (bounded by intervalMs) plus jitter", async () => {
+	it("after an empty claim sleeps the DB-computed delay (bounded by intervalMs)", async () => {
 		const c = fakeClaim();
 		const p = controlledProcess();
 		const { worker } = queueWorker(c.claim, p.process);
-		// Each pass reads the next due time relative to the fake clock at that moment.
-		const dues: Array<(now: number) => Date | null> = [
-			now => new Date(now + 300),
-			now => new Date(now + 5000),
-			() => null,
-		];
-		c.claim.nextDueAt.mockImplementation(async () => dues.shift()?.(Date.now()) ?? null);
+		const dues: Array<number | null> = [300, 5000, null];
+		c.claim.nextDueInMs.mockImplementation(async () => dues.shift() ?? null);
 
 		const expectNextClaimAfter = async (ms: number) => {
 			const before = c.calls.length;
@@ -199,6 +195,40 @@ describe("queue worker", () => {
 		await expectNextClaimAfter(300); // due soon: not the full interval
 		await expectNextClaimAfter(1000); // due far away: bounded by intervalMs
 		await expectNextClaimAfter(1000); // nothing due: intervalMs
+		worker.stopClaiming();
+	});
+
+	it("uses only the DB-computed delay: an app clock far ahead of the DB changes nothing", async () => {
+		const c = fakeClaim();
+		const p = controlledProcess();
+		// `now()` (the app clock) is an hour ahead; the DB says the next row is due in 300 ms.
+		const { worker } = queueWorker(c.claim, p.process, { now: () => Date.now() + 3_600_000 });
+		c.setNextDue(300);
+		worker.start();
+		await flush();
+		expect(c.calls).toHaveLength(1);
+		await vi.advanceTimersByTimeAsync(299);
+		expect(c.calls).toHaveLength(1);
+		await vi.advanceTimersByTimeAsync(1);
+		expect(c.calls).toHaveLength(2);
+		worker.stopClaiming();
+	});
+
+	it("never spins: a 0 ms due delay with jitter 0 still sleeps MIN_IDLE_SLEEP_MS", async () => {
+		const c = fakeClaim();
+		const p = controlledProcess();
+		const { worker } = queueWorker(c.claim, p.process);
+		c.setNextDue(0);
+		worker.start();
+		await flush();
+		expect(c.calls).toHaveLength(1);
+		await vi.advanceTimersByTimeAsync(MIN_IDLE_SLEEP_MS - 1);
+		expect(c.calls).toHaveLength(1);
+		await vi.advanceTimersByTimeAsync(1);
+		expect(c.calls).toHaveLength(2);
+		// 100 ms later: at most one pass per MIN_IDLE_SLEEP_MS, not a hot loop.
+		await vi.advanceTimersByTimeAsync(100);
+		expect(c.calls.length).toBeLessThanOrEqual(2 + 100 / MIN_IDLE_SLEEP_MS);
 		worker.stopClaiming();
 	});
 
@@ -268,7 +298,7 @@ describe("queue worker", () => {
 		await flush();
 		await vi.advanceTimersByTimeAsync(5000);
 		expect(c.claim.claimRuns.mock.calls.length).toBe(calls);
-		expect(c.claim.nextDueAt).not.toHaveBeenCalled();
+		expect(c.claim.nextDueInMs).not.toHaveBeenCalled();
 		worker.stopClaiming();
 	});
 
@@ -392,7 +422,7 @@ describe("queue worker", () => {
 		await flush();
 		expect(result).toEqual([]);
 		expect(c.calls).toHaveLength(1);
-		expect(c.claim.nextDueAt).not.toHaveBeenCalled();
+		expect(c.claim.nextDueInMs).not.toHaveBeenCalled();
 	});
 
 	it("drain() keeps waiting for a claim in flight past its timeoutMs (bounded separately) and launches its runs", async () => {
@@ -512,7 +542,7 @@ function fakeSystemJobs(dbNow: Date) {
 	const backlog: SystemJobRecord[] = [];
 	const store = {
 		claim: vi.fn(async (limit: number, _lockMs: number) => backlog.splice(0, limit)),
-		nextDueAt: vi.fn(async () => null),
+		nextDueInMs: vi.fn(async () => null),
 		complete: vi.fn(async (_id: string, _lock: string) => true),
 		delay: vi.fn(async (_id: string, _lock: string, _ms: number) => true),
 		fail: vi.fn(

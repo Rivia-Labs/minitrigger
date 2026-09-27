@@ -77,16 +77,16 @@ function fakeBatcher(): NotifyBatcher & { calls: Array<{ channel: string; payloa
 function fakeClaim() {
 	const backlog: RunRecord[] = [];
 	const calls: ClaimRunsInput[] = [];
-	let nextDue: Date | null = null;
+	let nextDue: number | null = null;
 	return {
 		claimRuns: vi.fn(async (input: ClaimRunsInput) => {
 			calls.push(input);
 			return backlog.splice(0, input.limit);
 		}),
-		nextDueAt: vi.fn(async () => nextDue),
+		nextDueInMs: vi.fn(async () => nextDue),
 		backlog,
 		calls,
-		setNextDue(d: Date | null) {
+		setNextDue(d: number | null) {
 			nextDue = d;
 		},
 	};
@@ -101,7 +101,7 @@ function fakeClaimPerQueue(backlogs: Record<string, RunRecord[]>) {
 			const backlog = backlogs[input.queue] ?? [];
 			return backlog.splice(0, input.limit);
 		}),
-		nextDueAt: vi.fn(async () => null),
+		nextDueInMs: vi.fn(async () => null),
 		calls,
 	};
 }
@@ -158,7 +158,7 @@ function fakeSystemJobs(dbNow: Date) {
 		remove: vi.fn(async (jobId: string) => rows.delete(jobId)),
 		get: vi.fn(async (jobId: string) => rows.get(jobId) ?? null),
 		listByName: vi.fn(async (name: string) => [...rows.values()].filter(r => r.name === name)),
-		nextDueAt: vi.fn(async () => null),
+		nextDueInMs: vi.fn(async () => null),
 		now: vi.fn(async () => dbNow),
 	};
 	return { store, rows };
@@ -250,7 +250,7 @@ describe("createPgTransport", () => {
 		]);
 	});
 
-	it("removeRunJob and pauseQueue/resumeQueue are no-ops; isQueuePaused reads queue_state", async () => {
+	it("removeRunJob and pauseQueue are no-ops, resumeQueue wakes the queue; isQueuePaused reads queue_state", async () => {
 		const options = makeOptions();
 		const queues = (options.store as unknown as { queues: ReturnType<typeof fakeQueues> }).queues;
 		queues.get.mockImplementation(async (q: string) =>
@@ -259,8 +259,12 @@ describe("createPgTransport", () => {
 		const transport = createPgTransport(options);
 
 		await expect(transport.removeRunJob("q1", "r1", 1)).resolves.toBeUndefined();
+		const batcher = options.batcher as ReturnType<typeof fakeBatcher>;
 		await expect(transport.pauseQueue("q1")).resolves.toBeUndefined();
+		expect(batcher.calls).toEqual([]);
 		await expect(transport.resumeQueue("q1")).resolves.toBeUndefined();
+		// A resumed queue is claimed right away, not at the next poll.
+		expect(batcher.calls).toEqual([{ channel: channelName("wake", SCHEMA), payload: "q1" }]);
 		await expect(transport.isQueuePaused("q1")).resolves.toBe(true);
 		await expect(transport.isQueuePaused("q2")).resolves.toBe(false);
 	});

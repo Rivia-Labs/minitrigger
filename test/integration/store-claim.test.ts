@@ -2,6 +2,8 @@ import { randomUUID } from "node:crypto";
 import { escapeIdentifier } from "pg";
 import { beforeAll, describe, expect, it } from "vitest";
 import { migrate } from "../../src/migrations/migrate.js";
+import { CLAIM_DRAIN_TIMEOUT_MS } from "../../src/pg/workers.js";
+import { CLAIM_STATEMENT_TIMEOUT_MS } from "../../src/store/sql/claim.js";
 import { createSqlStore, type SqlStore } from "../../src/store/sql/index.js";
 import { useTestNamespace } from "../helpers/namespace.js";
 
@@ -128,6 +130,65 @@ describe("claimRuns", () => {
 		expect(new Set(results.flat().map(r => r.id)).size).toBe(3);
 	});
 
+	it("a blocked claim errors within CLAIM_STATEMENT_TIMEOUT_MS and leaves no run running (globalConcurrency)", async () => {
+		const q = uniqueQueue("tg");
+		const run = await newRun(q);
+		const holder = await ns.pool.connect();
+		try {
+			await holder.query("BEGIN");
+			// The same key the claim takes: the claim waits on it until its statement_timeout.
+			await holder.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 1))", [
+				`${s}:${q}:global`,
+			]);
+			const started = performance.now();
+			await expect(
+				store.claim.claimRuns({ queue: q, limit: 5, globalConcurrency: 2 })
+			).rejects.toMatchObject({ code: "57014" }); // query_canceled (statement_timeout)
+			const elapsed = performance.now() - started;
+			expect(elapsed).toBeGreaterThanOrEqual(CLAIM_STATEMENT_TIMEOUT_MS - 50);
+			expect(elapsed).toBeLessThan(CLAIM_DRAIN_TIMEOUT_MS);
+			await holder.query("ROLLBACK");
+		} finally {
+			holder.release();
+		}
+		expect((await store.runs.get(run.id))?.status).toBe("queued");
+		// The pooled client is healthy afterwards: no session-level timeout leaked.
+		const { rows } = await ns.pool.query<{ t: string }>(
+			"SELECT current_setting('statement_timeout') AS t"
+		);
+		expect(rows[0]?.t).toBe("0");
+		expect((await store.claim.claimRuns({ queue: q, limit: 5, globalConcurrency: 2 })).length).toBe(
+			1
+		);
+	});
+
+	it("a blocked plain claim errors within CLAIM_STATEMENT_TIMEOUT_MS and leaves no run running", async () => {
+		const q = uniqueQueue("tp");
+		const run = await newRun(q);
+		const holder = await ns.pool.connect();
+		try {
+			await holder.query("BEGIN");
+			// The claim reads queue_state (pause): an exclusive table lock blocks it.
+			await holder.query(`LOCK TABLE ${s}.queue_state IN ACCESS EXCLUSIVE MODE`);
+			const started = performance.now();
+			await expect(store.claim.claimRuns({ queue: q, limit: 5 })).rejects.toMatchObject({
+				code: "57014",
+			});
+			const elapsed = performance.now() - started;
+			expect(elapsed).toBeGreaterThanOrEqual(CLAIM_STATEMENT_TIMEOUT_MS - 50);
+			expect(elapsed).toBeLessThan(CLAIM_DRAIN_TIMEOUT_MS);
+			await holder.query("ROLLBACK");
+		} finally {
+			holder.release();
+		}
+		expect((await store.runs.get(run.id))?.status).toBe("queued");
+		expect((await store.claim.claimRuns({ queue: q, limit: 5 })).map(r => r.id)).toEqual([run.id]);
+	});
+
+	it("CLAIM_STATEMENT_TIMEOUT_MS x 3 (globalConcurrency worst case) stays under the drain bound", () => {
+		expect(CLAIM_STATEMENT_TIMEOUT_MS * 3).toBeLessThan(CLAIM_DRAIN_TIMEOUT_MS);
+	});
+
 	it("claims a waiting run with run_after set, never one with run_after NULL", async () => {
 		const q = uniqueQueue("w");
 		const ready = await newRun(q);
@@ -163,16 +224,17 @@ describe("claimRuns", () => {
 		]);
 	});
 
-	it("nextDueAt returns the earliest future run_after of the queue", async () => {
+	it("nextDueInMs returns the delay until the earliest future run_after of the queue", async () => {
 		const q = uniqueQueue("n");
-		expect(await store.claim.nextDueAt(q)).toBeNull();
+		expect(await store.claim.nextDueInMs(q)).toBeNull();
 		await newRun(q, { delayMs: 30_000 });
 		await newRun(q, { delayMs: 5_000 });
 		await newRun(q); // already due: not "future"
-		const next = await store.claim.nextDueAt(q);
-		if (next === null) throw new Error("expected a next due time");
-		expect(next.getTime() - Date.now()).toBeGreaterThan(3_000);
-		expect(next.getTime() - Date.now()).toBeLessThan(6_000);
+		const ms = await store.claim.nextDueInMs(q);
+		if (ms === null) throw new Error("expected a next due delay");
+		expect(Number.isInteger(ms)).toBe(true);
+		expect(ms).toBeGreaterThan(3_000);
+		expect(ms).toBeLessThanOrEqual(5_000);
 	});
 });
 
@@ -352,7 +414,7 @@ describe("systemJobs", () => {
 		expect(await store.systemJobs.remove(idle)).toBe(true);
 	});
 
-	it("listByName, nextDueAt and now", async () => {
+	it("listByName, nextDueInMs and now", async () => {
 		const name = `custom-${Date.now()}`;
 		await store.systemJobs.upsert({ jobId: `${name}-2`, name, delayMs: 20_000 });
 		await store.systemJobs.upsert({ jobId: `${name}-1`, name, delayMs: 10_000 });
@@ -360,10 +422,10 @@ describe("systemJobs", () => {
 		expect(listed.map(j => j.jobId).sort()).toEqual([`${name}-1`, `${name}-2`]);
 		const dbNow = await store.systemJobs.now();
 		expect(Math.abs(dbNow.getTime() - Date.now())).toBeLessThan(5_000);
-		const next = await store.systemJobs.nextDueAt();
-		if (next === null) throw new Error("expected a next due time");
-		expect(next.getTime()).toBeGreaterThan(dbNow.getTime());
-		expect(next.getTime() - dbNow.getTime()).toBeLessThanOrEqual(10_500);
+		const ms = await store.systemJobs.nextDueInMs();
+		if (ms === null) throw new Error("expected a next due delay");
+		expect(ms).toBeGreaterThan(0);
+		expect(ms).toBeLessThanOrEqual(10_000);
 	});
 });
 
