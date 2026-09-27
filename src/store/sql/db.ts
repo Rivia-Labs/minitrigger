@@ -84,22 +84,55 @@ export async function checkOut(
 }
 
 /**
- * Runs `fn` atomically. On a pool executor it opens BEGIN/COMMIT on a dedicated client and
- * destroys the client on failure; on a tx executor it runs inside the caller's transaction.
- * Never hold one of these open while user code runs (SPEC §6).
+ * An error the server reported (a `pg` `DatabaseError`: SQLSTATE `code` + `severity`), as opposed
+ * to a socket/protocol failure. Checked structurally, so a `pg` copy other than ours (an injected
+ * pool) still counts.
+ */
+function isServerError(err: unknown): boolean {
+	if (typeof err !== "object" || err === null) return false;
+	const { code, severity } = err as { code?: unknown; severity?: unknown };
+	return typeof code === "string" && typeof severity === "string" && severity !== "FATAL";
+}
+
+/**
+ * After a failed transaction: a client whose ROLLBACK succeeded after a server-reported statement
+ * error (a statement timeout, a constraint, a division by zero...) is in sync and goes back to the
+ * pool; destroying it only churned connections under contention (review 5, A7). A failed ROLLBACK,
+ * a FATAL or a non-server error destroys it.
+ */
+export function releaseAfterRollback(
+	release: (err?: Error) => void,
+	err: unknown,
+	rolledBack: boolean
+): void {
+	if (rolledBack && isServerError(err)) release();
+	else release(err instanceof Error ? err : new Error(String(err)));
+}
+
+/**
+ * Runs `fn` atomically. On a pool executor it opens BEGIN/COMMIT on a dedicated client (released
+ * per {@link releaseAfterRollback} on failure); on a tx executor it runs inside the caller's
+ * transaction. Never hold one of these open while user code runs (SPEC §6).
  */
 export async function atomic<T>(exec: SqlExecutor, fn: (db: Db) => Promise<T>): Promise<T> {
 	if (exec.kind === "tx") return fn(wrap(exec.client));
 	const { client, release } = await checkOut(exec.pool);
+	let begun = false;
 	try {
 		await client.query("BEGIN");
+		begun = true;
 		const result = await fn(wrap(client));
 		await client.query("COMMIT");
 		release();
 		return result;
 	} catch (err) {
-		await client.query("ROLLBACK").catch(() => {});
-		release(err instanceof Error ? err : new Error(String(err)));
+		const rolledBack = begun
+			? await client.query("ROLLBACK").then(
+					() => true,
+					() => false
+				)
+			: false;
+		releaseAfterRollback(release, err, rolledBack);
 		throw err;
 	}
 }

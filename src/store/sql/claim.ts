@@ -9,7 +9,15 @@
 import type { Pool } from "pg";
 import { MinitriggerError } from "../../errors.js";
 import type { ClaimRunsInput, RunClaimStore, RunRecord } from "../types.js";
-import { checkOut, type Db, direct, type SqlContext, type SqlExecutor, wrap } from "./db.js";
+import {
+	checkOut,
+	type Db,
+	direct,
+	releaseAfterRollback,
+	type SqlContext,
+	type SqlExecutor,
+	wrap,
+} from "./db.js";
 import { DELAY_UNTIL_MIN_RUN_AFTER, mapRun, qualifiedRunColumns, type RunRow } from "./resolve.js";
 
 /**
@@ -96,7 +104,8 @@ export async function boundedClaim<T>(
 			else release(new Error("ROLLBACK failed"));
 			return undefined;
 		}
-		release(err instanceof Error ? err : new Error(String(err)));
+		// A statement timeout (57014) rolled back cleanly keeps its connection (review 5, A7).
+		releaseAfterRollback(release, err, begun && rolledBack);
 		throw err;
 	}
 }
