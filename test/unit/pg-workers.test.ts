@@ -526,6 +526,27 @@ describe("queue worker", () => {
 		worker.stopClaiming();
 	});
 
+	it("a claim bounded by the global limit sleeps intervalMs, not the next due delay (A2)", async () => {
+		const c = fakeClaim();
+		c.claim.claimRuns.mockImplementation(async (input: ClaimRunsInput) => {
+			c.calls.push(input);
+			input.onGlobalLimit?.();
+			return [];
+		});
+		c.setNextDue(5);
+		const p = controlledProcess();
+		const { worker } = queueWorker(c.claim, p.process, { globalConcurrency: 1 });
+		worker.start();
+		await flush();
+		expect(c.calls).toHaveLength(1);
+		expect(c.claim.nextDueInMs).not.toHaveBeenCalled();
+		await vi.advanceTimersByTimeAsync(999);
+		expect(c.calls).toHaveLength(1);
+		await vi.advanceTimersByTimeAsync(1);
+		expect(c.calls).toHaveLength(2);
+		worker.stopClaiming();
+	});
+
 	it("a process() rejection is logged and frees the slot", async () => {
 		const c = fakeClaim();
 		c.backlog.push(run("r1"));

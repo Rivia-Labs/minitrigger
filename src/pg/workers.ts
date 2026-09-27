@@ -123,6 +123,11 @@ interface LoopSpec<T> {
 	claim(limit: number, remainingMs: () => number | undefined): Promise<T[]>;
 	/** Delay until the next future row, computed on the DB clock (decision 17); null = none. */
 	nextDueInMs(): Promise<number | null>;
+	/**
+	 * True when the last claim was bounded by a limit shared with other processes (the queue's
+	 * `globalConcurrency`): due rows it could not take are not a reason to wake up early.
+	 */
+	atCap?(): boolean;
 	process(item: T): Promise<void>;
 	onProcessError(item: T, error: unknown): void;
 	onFinished?(): void;
@@ -176,6 +181,12 @@ function createClaimLoop<T>(spec: LoopSpec<T>): ClaimWorker<T> {
 				for (const item of items) launch(item);
 				if (stopped) return;
 				if (items.length < free) {
+					if (spec.atCap?.()) {
+						// A freed slot wakes us (onSlotFreed / the end of a local run).
+						schedule(spec.polling.intervalMs);
+						if (!again) return;
+						continue;
+					}
 					const dueInMs = await spec.nextDueInMs();
 					if (stopped) return;
 					// Never a zero sleep after an empty pass, even with `jitterMs: 0`: a row due "now"
@@ -308,17 +319,28 @@ function clockOf(o: ClockInjection): Required<ClockInjection> {
 
 export function createQueueWorker(o: QueueWorkerOptions): QueueWorker {
 	const withGlobal = o.globalConcurrency !== undefined;
+	let atGlobalCap = false;
 	return createClaimLoop<RunRecord>({
 		label: { queue: o.queue },
 		concurrency: o.concurrency,
-		claim: (limit, remainingMs) =>
-			o.claim.claimRuns({
+		claim: (limit, remainingMs) => {
+			atGlobalCap = false;
+			return o.claim.claimRuns({
 				queue: o.queue,
 				limit,
-				...(o.globalConcurrency !== undefined ? { globalConcurrency: o.globalConcurrency } : {}),
+				...(o.globalConcurrency !== undefined
+					? {
+							globalConcurrency: o.globalConcurrency,
+							onGlobalLimit: () => {
+								atGlobalCap = true;
+							},
+						}
+					: {}),
 				remainingMs,
-			}),
+			});
+		},
 		nextDueInMs: () => o.claim.nextDueInMs(o.queue),
+		atCap: () => atGlobalCap,
 		process: run => o.process(run),
 		onProcessError: (run, err) =>
 			o.logger.error({ queue: o.queue, runId: run.id, err }, "run processing failed unexpectedly"),

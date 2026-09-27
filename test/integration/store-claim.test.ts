@@ -345,6 +345,41 @@ describe("claimRuns", () => {
 		expect(ms).toBeGreaterThan(3_000);
 		expect(ms).toBeLessThanOrEqual(5_000);
 	});
+
+	it("nextDueInMs of a paused queue is null (review 5, A2: no wake-up per due run)", async () => {
+		const q = uniqueQueue("np");
+		await newRun(q, { delayMs: 5_000 });
+		await store.queues.setPaused(q, true);
+		expect(await store.claim.nextDueInMs(q)).toBeNull();
+		await store.queues.setPaused(q, false);
+		expect(await store.claim.nextDueInMs(q)).not.toBeNull();
+	});
+
+	it("onGlobalLimit fires only when the global limit bounded the claim (review 5, A2)", async () => {
+		const q = uniqueQueue("gl");
+		for (let i = 0; i < 3; i++) await newRun(q);
+		const hits: number[] = [];
+		const claimWith = (limit: number, globalConcurrency: number) =>
+			store.claim.claimRuns({
+				queue: q,
+				limit,
+				globalConcurrency,
+				onGlobalLimit: () => hits.push(limit),
+			});
+		// 10 global slots, 3 due runs: not bounded by the global limit.
+		expect((await claimWith(5, 10)).length).toBe(3);
+		expect(hits).toEqual([]);
+		for (let i = 0; i < 3; i++) await newRun(q);
+		// 3 running + 3 due, cap 4: one claimed, then the queue is at its cap.
+		expect((await claimWith(5, 4)).length).toBe(1);
+		expect(hits).toEqual([5]);
+		// At the cap: nothing claimed, bounded again.
+		expect((await claimWith(3, 4)).length).toBe(0);
+		expect(hits).toEqual([5, 3]);
+		// No global limit: never fires.
+		await store.claim.claimRuns({ queue: q, limit: 5, onGlobalLimit: () => hits.push(-1) });
+		expect(hits).toEqual([5, 3]);
+	});
 });
 
 describe("systemJobs", () => {

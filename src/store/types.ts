@@ -1217,6 +1217,12 @@ export interface ClaimRunsInput {
 	 * -- after the connection checkout, before each statement, and before `COMMIT` (rolled back).
 	 */
 	remainingMs?: () => number | undefined;
+	/**
+	 * With `globalConcurrency`: called when the global limit bounded this claim (the queue is at
+	 * its global cap once the claim commits). The worker then sleeps `polling.intervalMs` instead
+	 * of waking at every due run it could not claim anyway; a freed slot wakes it (`onSlotFreed`).
+	 */
+	onGlobalLimit?: () => void;
 }
 
 /**
