@@ -40,6 +40,13 @@ export const MIN_IDLE_SLEEP_MS = 5;
  * BullMQ path bounds the equivalent in-flight `acquire` the same way (`IN_FLIGHT_DRAIN_MS`).
  */
 export const CLAIM_DRAIN_TIMEOUT_MS = 5_000;
+/**
+ * Shortest time between the start of a claim and a pass triggered by `wake()`. The wake channel
+ * is untrusted (decision 28(b)): without this, a flood of NOTIFYs in separate transactions became
+ * one claim per notification per queue (review 5, A5). Wakes inside the window collapse into one
+ * pass at its end; passes caused by the loop itself (a freed slot, a full batch) are not delayed.
+ */
+export const MIN_WAKE_INTERVAL_MS = 15;
 
 export interface WorkerPolling {
 	/** Longest sleep between two claims when nothing is due sooner. */
@@ -150,6 +157,12 @@ function createClaimLoop<T>(spec: LoopSpec<T>): ClaimWorker<T> {
 	let failures = 0;
 	let lastWarnAt: number | undefined;
 	let timer: ReturnType<typeof setTimeout> | undefined;
+	/** When `timer` fires (clock of `now()`). */
+	let timerAt: number | undefined;
+	/** Start of the last claim (for {@link MIN_WAKE_INTERVAL_MS}). */
+	let lastClaimAt = Number.NEGATIVE_INFINITY;
+	/** A `wake()` arrived while a pass was in progress. */
+	let wakePending = false;
 	let current: Promise<void> | undefined;
 	/** Set by `drain()`: the claim in flight must be over by then (its drain bound). */
 	let claimDeadline: number | undefined;
@@ -177,8 +190,28 @@ function createClaimLoop<T>(spec: LoopSpec<T>): ClaimWorker<T> {
 		}
 		current = loop().finally(() => {
 			current = undefined;
-			if (again && !stopped) pass();
+			if (stopped) return;
+			if (again) pass();
+			else if (wakePending && failures === 0) {
+				wakePending = false;
+				wakeSoon();
+			}
 		});
+	}
+
+	/** A wake-triggered pass: now, or at the end of the minimum interval since the last claim. */
+	function wakeSoon(): void {
+		const wait = lastClaimAt + MIN_WAKE_INTERVAL_MS - now();
+		if (wait <= 0) {
+			clearTimeout(timer);
+			timer = undefined;
+			timerAt = undefined;
+			pass();
+			return;
+		}
+		// A timer that fires sooner already covers this wake.
+		if (timer !== undefined && timerAt !== undefined && timerAt <= now() + wait) return;
+		setTimer(wait);
 	}
 
 	async function loop(): Promise<void> {
@@ -189,6 +222,8 @@ function createClaimLoop<T>(spec: LoopSpec<T>): ClaimWorker<T> {
 				again = false;
 				const free = concurrency - inFlight;
 				if (free <= 0) return; // the end of an execution calls pass()
+				lastClaimAt = now();
+				wakePending = false;
 				const items = await spec.claim(free, remainingMs);
 				failures = 0;
 				// Launched even after stopClaiming(): the executor hands them back (isShuttingDown).
@@ -223,6 +258,7 @@ function createClaimLoop<T>(spec: LoopSpec<T>): ClaimWorker<T> {
 			failures++;
 			// A wake that arrived during the failing claim does not bypass the backoff.
 			again = false;
+			wakePending = false;
 			const backoffMs = Math.min(
 				CLAIM_BACKOFF_MAX_MS,
 				CLAIM_BACKOFF_MIN_MS * 2 ** Math.min(failures - 1, 6)
@@ -267,13 +303,19 @@ function createClaimLoop<T>(spec: LoopSpec<T>): ClaimWorker<T> {
 	}
 
 	function schedule(ms: number): void {
+		const jitter = spec.polling.jitterMs > 0 ? Math.floor(random() * spec.polling.jitterMs) : 0;
+		setTimer(ms + jitter);
+	}
+
+	function setTimer(ms: number): void {
 		if (stopped) return;
 		clearTimeout(timer);
-		const jitter = spec.polling.jitterMs > 0 ? Math.floor(random() * spec.polling.jitterMs) : 0;
+		timerAt = now() + ms;
 		timer = setTimeoutFn(() => {
 			timer = undefined;
+			timerAt = undefined;
 			pass();
-		}, ms + jitter);
+		}, ms);
 		timer.unref?.();
 	}
 
@@ -285,11 +327,11 @@ function createClaimLoop<T>(spec: LoopSpec<T>): ClaimWorker<T> {
 		wake() {
 			if (!started || stopped || failures > 0) return; // backing off: the timer retries
 			if (concurrency - inFlight <= 0) return; // full: no query (an ending run calls pass())
-			if (!current) {
-				clearTimeout(timer);
-				timer = undefined;
+			if (current) {
+				wakePending = true; // collapsed into one pass after this one
+				return;
 			}
-			pass();
+			wakeSoon();
 		},
 		setConcurrency(n) {
 			concurrency = n;
@@ -305,6 +347,7 @@ function createClaimLoop<T>(spec: LoopSpec<T>): ClaimWorker<T> {
 			stopped = true;
 			clearTimeout(timer);
 			timer = undefined;
+			timerAt = undefined;
 		},
 		async drain(timeoutMs) {
 			const deadline = now() + timeoutMs;

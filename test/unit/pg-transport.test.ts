@@ -3,6 +3,7 @@ import { ConfigError, MinitriggerError } from "../../src/errors.js";
 import { channelName } from "../../src/pg/listener.js";
 import type { NotifyBatcher } from "../../src/pg/notify-batcher.js";
 import { createPgTransport, type PgTransportOptions } from "../../src/pg/transport.js";
+import { MIN_WAKE_INTERVAL_MS } from "../../src/pg/workers.js";
 import type { SqlStore } from "../../src/store/sql/index.js";
 import type {
 	ClaimRunsInput,
@@ -327,7 +328,7 @@ describe("createPgTransport", () => {
 		const callsBefore = before.mock.calls.length;
 
 		await transport.enqueueSystem("retention", { window: 1 }, { jobId: "retention-1" });
-		await flush();
+		await vi.advanceTimersByTimeAsync(MIN_WAKE_INTERVAL_MS);
 		expect(before.mock.calls.length).toBeGreaterThan(callsBefore);
 
 		await transport.closeWorkers({ timeoutMs: 100 });
@@ -440,17 +441,17 @@ describe("createPgTransport", () => {
 
 		// A hit against a started queue wakes just that one.
 		capturedHandler?.("q1");
-		await flush();
+		await vi.advanceTimersByTimeAsync(MIN_WAKE_INTERVAL_MS);
 		expect(claim.calls.filter(c => c.queue === "q1").length).toBe(2);
 
 		// An unknown/untrusted queue name wakes every queue this process runs.
 		capturedHandler?.("some-other-queue");
-		await flush();
+		await vi.advanceTimersByTimeAsync(MIN_WAKE_INTERVAL_MS);
 		expect(claim.calls.filter(c => c.queue === "q1").length).toBe(3);
 
 		// `undefined` (e.g. a fresh listener reconnect) wakes everyone too.
 		capturedHandler?.(undefined);
-		await flush();
+		await vi.advanceTimersByTimeAsync(MIN_WAKE_INTERVAL_MS);
 		expect(claim.calls.filter(c => c.queue === "q1").length).toBe(4);
 
 		await transport.closeWorkers({ timeoutMs: 100 });

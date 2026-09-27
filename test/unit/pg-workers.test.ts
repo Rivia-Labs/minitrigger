@@ -7,6 +7,7 @@ import {
 	createQueueWorker,
 	createSystemWorker,
 	MIN_IDLE_SLEEP_MS,
+	MIN_WAKE_INTERVAL_MS,
 	type PgSystemJob,
 	type QueueWorkerOptions,
 	type SystemWorkerOptions,
@@ -263,10 +264,39 @@ describe("queue worker", () => {
 		c.holdClaims(undefined);
 		gate.resolve();
 		await flush();
+		// Not before MIN_WAKE_INTERVAL_MS after the previous claim started (review 5, A5).
+		expect(c.calls).toHaveLength(1);
+		await vi.advanceTimersByTimeAsync(MIN_WAKE_INTERVAL_MS);
 		expect(c.calls).toHaveLength(2);
 		// ...and then it sleeps normally (no busy loop).
 		await vi.advanceTimersByTimeAsync(999);
 		expect(c.calls).toHaveLength(2);
+		worker.stopClaiming();
+	});
+
+	it("a wake flood is spaced by MIN_WAKE_INTERVAL_MS; a wake after it claims at once (A5)", async () => {
+		const c = fakeClaim();
+		const p = controlledProcess();
+		const { worker } = queueWorker(c.claim, p.process, {
+			polling: { intervalMs: 60_000, jitterMs: 0 },
+		});
+		worker.start();
+		await flush();
+		expect(c.calls).toHaveLength(1);
+		// 1000 wakes over 100 ms.
+		for (let i = 0; i < 1000; i++) {
+			worker.wake();
+			if (i % 10 === 9) await vi.advanceTimersByTimeAsync(1);
+		}
+		await vi.advanceTimersByTimeAsync(MIN_WAKE_INTERVAL_MS);
+		expect(c.calls.length).toBeLessThanOrEqual(1 + Math.ceil(115 / MIN_WAKE_INTERVAL_MS));
+		expect(c.calls.length).toBeGreaterThan(1);
+		// Quiet for longer than the interval: the next wake claims right away.
+		await vi.advanceTimersByTimeAsync(1_000);
+		const before = c.calls.length;
+		worker.wake();
+		await flush();
+		expect(c.calls).toHaveLength(before + 1);
 		worker.stopClaiming();
 	});
 
@@ -276,6 +306,7 @@ describe("queue worker", () => {
 		const { worker } = queueWorker(c.claim, p.process);
 		worker.start();
 		await flush();
+		await vi.advanceTimersByTimeAsync(MIN_WAKE_INTERVAL_MS);
 		worker.wake();
 		await flush();
 		expect(c.calls).toHaveLength(2);
@@ -323,7 +354,7 @@ describe("queue worker", () => {
 		// Healthy again: the next wake claims normally.
 		c.backlog.push(run("r1"));
 		worker.wake();
-		await flush();
+		await vi.advanceTimersByTimeAsync(MIN_WAKE_INTERVAL_MS);
 		expect(p.process).toHaveBeenCalledWith(expect.objectContaining({ id: "r1" }));
 		worker.stopClaiming();
 	});
@@ -948,7 +979,7 @@ describe("system worker", () => {
 		expect(logger.calls.find(l => l.level === "warn")?.fields).toMatchObject({ jobId: "a" });
 		backlog.push(sysRecord({ jobId: "b" }));
 		worker.wake();
-		await flush();
+		await vi.advanceTimersByTimeAsync(MIN_WAKE_INTERVAL_MS);
 		expect(store.complete).toHaveBeenLastCalledWith("b", "lock-1");
 		worker.stopClaiming();
 	});
