@@ -65,6 +65,9 @@ export function createRunClaimStore(exec: SqlExecutor, ctx: SqlContext): RunClai
 		// a transaction (statement_timeout, advisory lock), and `now()` is frozen at its BEGIN, so a
 		// run that came due between the BEGIN and this statement would be skipped, and one inserted
 		// or re-queued in that window would get an `updated_at` older than the one it already had.
+		// The pause check compares with `$1`, never `r.queue`: uncorrelated, it is a one-time
+		// InitPlan filter and the scan walks `idx_runs_claim` in order up to the LIMIT; correlated,
+		// the planner picks an anti join and sorts the whole due backlog first (review 5, A1).
 		const { rows } = await db.query<RunRow>(
 			`WITH picked AS (
 			   SELECT r.id FROM ${runs} r
@@ -72,7 +75,7 @@ export function createRunClaimStore(exec: SqlExecutor, ctx: SqlContext): RunClai
 			     AND r.status IN ('queued', 'waiting')
 			     AND r.run_after <= statement_timestamp()
 			     AND NOT r.outbox_pending
-			     AND NOT EXISTS (SELECT 1 FROM ${queueState} q WHERE q.queue = r.queue AND q.paused)
+			     AND NOT EXISTS (SELECT 1 FROM ${queueState} q WHERE q.queue = $1 AND q.paused)
 			   ORDER BY r.run_after, r.created_at, r.id
 			   LIMIT $2::int
 			   FOR UPDATE OF r SKIP LOCKED
