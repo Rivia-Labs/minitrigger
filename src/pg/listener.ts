@@ -60,6 +60,12 @@ export interface PgListener {
 	/** True while the dedicated client is connected and `LISTEN`ing on every channel. */
 	isListening(): boolean;
 	/**
+	 * Skips the reconnect backoff: when started, not closed and not connected or connecting,
+	 * clears the pending retry, resets the attempt count and connects right away (a failure
+	 * warns and backs off again from the minimum delay). A no-op otherwise.
+	 */
+	reconnectNow(): void;
+	/**
 	 * Registers `handler` for the notifications of `channels` (a subset of the channels given at
 	 * construction: this never adds a `LISTEN`). Returns the unsubscribe. Works before `start()`
 	 * and across reconnects; a throwing handler is logged (throttled) like `onNotification`.
@@ -264,6 +270,13 @@ export function createPgListener(options: PgListenerOptions): PgListener {
 			await connect();
 		},
 		isListening: () => listening,
+		reconnectNow() {
+			if (!started || closed || client) return;
+			clearTimeout(reconnectTimer);
+			reconnectTimer = undefined;
+			reconnectAttempt = 0;
+			connect().catch(error => warnConnectFailure(error));
+		},
 		subscribe(subscribed, handler) {
 			const entries = [...new Set(subscribed)];
 			for (const channel of entries) {

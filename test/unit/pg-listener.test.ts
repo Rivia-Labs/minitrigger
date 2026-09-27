@@ -171,6 +171,46 @@ describe("createPgListener", () => {
 		await listener.close();
 	});
 
+	it("reconnectNow() skips the backoff: connects right away and resets the attempt count", async () => {
+		vi.useFakeTimers();
+		let failures = 1;
+		const { factory, clients } = fakeClientFactory(() => ({
+			connect: async () => {
+				if (failures > 0) {
+					failures--;
+					throw new Error("refused");
+				}
+			},
+		}));
+		const listener = createPgListener({
+			clientConfig: {},
+			channels: ["a"],
+			logger: silent,
+			reconnectMinMs: 30_000,
+			reconnectMaxMs: 30_000,
+			createClient: factory,
+		});
+		await listener.start(); // fails; the next attempt is 30 s away
+		expect(listener.isListening()).toBe(false);
+		expect(clients).toHaveLength(1);
+
+		listener.reconnectNow();
+		await vi.advanceTimersByTimeAsync(0);
+		expect(clients).toHaveLength(2);
+		expect(listener.isListening()).toBe(true);
+		// The pending backoff timer was cleared: no third client later.
+		await vi.advanceTimersByTimeAsync(60_000);
+		expect(clients).toHaveLength(2);
+		// Already listening (or connecting): a no-op.
+		listener.reconnectNow();
+		await vi.advanceTimersByTimeAsync(0);
+		expect(clients).toHaveLength(2);
+		await listener.close();
+		listener.reconnectNow(); // after close(): never reconnects
+		await vi.advanceTimersByTimeAsync(0);
+		expect(clients).toHaveLength(2);
+	});
+
 	it("no reconnect after close(); close() is bounded", async () => {
 		const { factory, clients } = fakeClientFactory(() => ({
 			end: () => new Promise<void>(() => {}), // never resolves

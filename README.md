@@ -1923,9 +1923,9 @@ keeps it from bloating between the database-wide autovacuum thresholds.
   timed out), the listener client keeps trying to reconnect in the background regardless — call
   `await engine.stop()` to shut it down cleanly before discarding the engine, or before retrying
   `start()` on the same instance (also supported).
-- **A retried `start()` may wait on the listener's own reconnect backoff.** Calling `start()` again
-  right after a failed one doesn't force an immediate reconnect attempt — it can wait out wherever
-  the listener's backoff (0.5–30 s) currently sits before `LISTEN` is ready again.
+- **A retried `start()` reconnects the listener right away.** Calling `start()` again after a
+  failed one skips the listener's reconnect backoff (0.5–30 s) and tries to connect at once; it
+  still waits at most 5 s for `LISTEN` to be ready.
 
 ## Benchmark
 

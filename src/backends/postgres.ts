@@ -203,11 +203,14 @@ export function createPostgresBackend(ctx: BackendContext): BackendRuntime {
 	 * Spec §3.8: the `LISTEN` connection (bounded, a timeout is a `MinitriggerError` -- transient
 	 * infrastructure, never `ConfigError`), then the `NOTIFY` self-test (bounded, warn only), both
 	 * before the workers. On a timeout the listener keeps reconnecting in the background (it may
-	 * already serve `runs.subscribe` iterations of this engine); a later `start()` waits for it
-	 * again, and `stop()` closes it.
+	 * already serve `runs.subscribe` iterations of this engine); a later `start()` skips its
+	 * reconnect backoff (`reconnectNow`) and waits for it again, and `stop()` closes it.
 	 */
 	async function awaitSubscriberReady(): Promise<void> {
 		startListener();
+		// A start() after a failed one: the listener may sit in its reconnect backoff (up to 30 s)
+		// while this start() waits at most LISTEN_READY_TIMEOUT_MS, so try right away instead.
+		if (!listener.isListening()) listener.reconnectNow();
 		if (!(await waitListening(LISTEN_READY_TIMEOUT_MS))) {
 			throw new MinitriggerError(
 				`the Postgres LISTEN connection (wake/status/cancel notifications) was not ready within ` +

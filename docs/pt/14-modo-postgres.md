@@ -201,7 +201,6 @@ padrão de autovacuum do banco.
   `LISTEN` deu timeout), o client do listener continua tentando reconectar em segundo plano de
   qualquer forma — chame `await engine.stop()` para desligá-lo direito antes de descartar o engine,
   ou antes de tentar `start()` de novo na mesma instância (também suportado).
-- **Um `start()` retentado pode esperar o próprio backoff de reconexão do listener.** Chamar
-  `start()` de novo logo depois de um que falhou não força uma tentativa de reconexão imediata —
-  pode esperar o que quer que seja o ponto atual do backoff do listener (0,5–30 s) antes do
-  `LISTEN` ficar pronto de novo.
+- **Um `start()` retentado reconecta o listener na hora.** Chamar `start()` de novo depois de um
+  que falhou pula o backoff de reconexão do listener (0,5–30 s) e tenta conectar imediatamente;
+  continua esperando no máximo 5 s o `LISTEN` ficar pronto.
