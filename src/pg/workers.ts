@@ -119,7 +119,8 @@ export interface PgSystemJob {
 interface LoopSpec<T> {
 	label: Record<string, unknown>;
 	concurrency: number;
-	claim(limit: number): Promise<T[]>;
+	/** `remainingMs`: time left before the claim's deadline (set by `drain()`), else undefined. */
+	claim(limit: number, remainingMs: () => number | undefined): Promise<T[]>;
 	/** Delay until the next future row, computed on the DB clock (decision 17); null = none. */
 	nextDueInMs(): Promise<number | null>;
 	process(item: T): Promise<void>;
@@ -145,6 +146,10 @@ function createClaimLoop<T>(spec: LoopSpec<T>): ClaimWorker<T> {
 	let lastWarnAt: number | undefined;
 	let timer: ReturnType<typeof setTimeout> | undefined;
 	let current: Promise<void> | undefined;
+	/** Set by `drain()`: the claim in flight must be over by then (its drain bound). */
+	let claimDeadline: number | undefined;
+	const remainingMs = (): number | undefined =>
+		claimDeadline === undefined ? undefined : claimDeadline - now();
 	const active = new Set<{ item: T; done: Promise<void> }>();
 
 	function pass(): void {
@@ -165,7 +170,7 @@ function createClaimLoop<T>(spec: LoopSpec<T>): ClaimWorker<T> {
 				again = false;
 				const free = concurrency - inFlight;
 				if (free <= 0) return; // the end of an execution calls pass()
-				const items = await spec.claim(free);
+				const items = await spec.claim(free, remainingMs);
 				failures = 0;
 				// Launched even after stopClaiming(): the executor hands them back (isShuttingDown).
 				for (const item of items) launch(item);
@@ -281,8 +286,10 @@ function createClaimLoop<T>(spec: LoopSpec<T>): ClaimWorker<T> {
 				}
 			};
 			// The claim in flight, and the launch of what it brings: its own bound, so the runs it
-			// claimed are launched (and handed back by the executor) before stop() moves on.
-			if (current) await bounded(current, Math.max(deadline, now() + CLAIM_DRAIN_TIMEOUT_MS));
+			// claimed are launched (and handed back by the executor) before stop() moves on. The
+			// claim reads the same bound (`remainingMs`): it never commits after this gives up.
+			claimDeadline = Math.max(deadline, now() + CLAIM_DRAIN_TIMEOUT_MS);
+			if (current) await bounded(current, claimDeadline);
 			if (active.size > 0) {
 				await bounded(Promise.allSettled([...active].map(a => a.done)), deadline);
 			}
@@ -304,11 +311,12 @@ export function createQueueWorker(o: QueueWorkerOptions): QueueWorker {
 	return createClaimLoop<RunRecord>({
 		label: { queue: o.queue },
 		concurrency: o.concurrency,
-		claim: limit =>
+		claim: (limit, remainingMs) =>
 			o.claim.claimRuns({
 				queue: o.queue,
 				limit,
 				...(o.globalConcurrency !== undefined ? { globalConcurrency: o.globalConcurrency } : {}),
+				remainingMs,
 			}),
 		nextDueInMs: () => o.claim.nextDueInMs(o.queue),
 		process: run => o.process(run),
@@ -463,6 +471,8 @@ export function createSystemWorker(o: SystemWorkerOptions): SystemWorker {
 	return createClaimLoop<SystemJobRecord>({
 		label: { queue: "-system" },
 		concurrency: o.concurrency,
+		// No deadline: a `-system` row claimed after the drain gave up is only locked until
+		// `lockMs`; another worker then retries it (fencing by `locked_by`).
 		claim: limit => systemJobs.claim(limit, o.lockMs),
 		nextDueInMs: () => systemJobs.nextDueInMs(),
 		process: processRecord,

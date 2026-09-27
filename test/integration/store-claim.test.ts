@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { escapeIdentifier } from "pg";
+import { escapeIdentifier, Pool } from "pg";
 import { beforeAll, describe, expect, it } from "vitest";
 import { migrate } from "../../src/migrations/migrate.js";
 import { CLAIM_DRAIN_TIMEOUT_MS } from "../../src/pg/workers.js";
@@ -210,6 +210,88 @@ describe("claimRuns", () => {
 		expect(run.updatedAt.getTime()).toBeGreaterThanOrEqual(created.updatedAt.getTime());
 		expect(run.startedAt?.getTime()).toBeGreaterThanOrEqual(created.updatedAt.getTime());
 		expect(run.heartbeatAt?.getTime()).toBeGreaterThanOrEqual(created.updatedAt.getTime());
+	});
+
+	it.each([
+		["plain", undefined],
+		["globalConcurrency", 5],
+	])(
+		"%s: a claim whose deadline passed during a slow checkout claims nothing",
+		async (_label, gc) => {
+			const q = uniqueQueue(`dl${gc ?? ""}`);
+			const run = await newRun(q);
+			const small = new Pool({ connectionString: ns.databaseUrl, max: 1 });
+			try {
+				const smallStore = createSqlStore(small, ns.schema);
+				const held = await small.connect(); // saturates the pool: the claim waits for a checkout
+				let deadline: number | undefined;
+				const claiming = smallStore.claim.claimRuns({
+					queue: q,
+					limit: 5,
+					...(gc === undefined ? {} : { globalConcurrency: gc }),
+					remainingMs: () => (deadline === undefined ? undefined : deadline - Date.now()),
+				});
+				await new Promise(resolve => setTimeout(resolve, 50));
+				deadline = Date.now() + 100; // stop() began; its drain gives up in 100 ms
+				await new Promise(resolve => setTimeout(resolve, 200));
+				held.release();
+				expect(await claiming).toEqual([]);
+				expect((await store.runs.get(run.id))?.status).toBe("queued");
+				// The connection is healthy and the run still claimable.
+				expect((await smallStore.claim.claimRuns({ queue: q, limit: 5 })).map(r => r.id)).toEqual([
+					run.id,
+				]);
+			} finally {
+				await small.end();
+			}
+		}
+	);
+
+	it("a claim whose deadline passes during its statement rolls back instead of committing", async () => {
+		const q = uniqueQueue("dlc");
+		const run = await newRun(q);
+		const holder = await ns.pool.connect();
+		let remaining: number | undefined;
+		try {
+			await holder.query("BEGIN");
+			await holder.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 1))", [
+				`${s}:${q}:global`,
+			]);
+			const claiming = store.claim.claimRuns({
+				queue: q,
+				limit: 5,
+				globalConcurrency: 5,
+				remainingMs: () => remaining,
+			});
+			await new Promise(resolve => setTimeout(resolve, 100));
+			// The claim now waits on the lock; by the time it gets it, its deadline is over.
+			remaining = 0;
+			await holder.query("ROLLBACK");
+			expect(await claiming).toEqual([]);
+		} finally {
+			holder.release();
+		}
+		expect((await store.runs.get(run.id))?.status).toBe("queued");
+	});
+
+	it("the statement timeout is capped by the time left before the deadline", async () => {
+		const q = uniqueQueue("dlt");
+		const run = await newRun(q);
+		const holder = await ns.pool.connect();
+		try {
+			await holder.query("BEGIN");
+			await holder.query(`LOCK TABLE ${s}.queue_state IN ACCESS EXCLUSIVE MODE`);
+			const deadline = Date.now() + 300;
+			const started = performance.now();
+			await expect(
+				store.claim.claimRuns({ queue: q, limit: 5, remainingMs: () => deadline - Date.now() })
+			).rejects.toMatchObject({ code: "57014" });
+			expect(performance.now() - started).toBeLessThan(CLAIM_STATEMENT_TIMEOUT_MS - 500);
+			await holder.query("ROLLBACK");
+		} finally {
+			holder.release();
+		}
+		expect((await store.runs.get(run.id))?.status).toBe("queued");
 	});
 
 	it("CLAIM_STATEMENT_TIMEOUT_MS x 3 (globalConcurrency worst case) stays under the drain bound", () => {

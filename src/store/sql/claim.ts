@@ -5,8 +5,10 @@
  * parent -> run -> descendants lock order. With `globalConcurrency`, a transaction-scoped
  * advisory lock per queue serializes the claims so the `running` count is exact.
  */
+
+import { MinitriggerError } from "../../errors.js";
 import type { ClaimRunsInput, RunClaimStore, RunRecord } from "../types.js";
-import { atomic, type Db, direct, type SqlContext, type SqlExecutor } from "./db.js";
+import { checkOut, type Db, direct, type SqlContext, type SqlExecutor, wrap } from "./db.js";
 import { DELAY_UNTIL_MIN_RUN_AFTER, mapRun, qualifiedRunColumns, type RunRow } from "./resolve.js";
 
 /**
@@ -15,9 +17,30 @@ import { DELAY_UNTIL_MIN_RUN_AFTER, mapRun, qualifiedRunColumns, type RunRow } f
  * claim must not commit after that (the engine may have ended the pool, leaving the claimed runs
  * `running` with nobody to run or hand them back). The globalConcurrency path runs three bounded
  * statements (lock, count, claim), so its worst case is 3 x this, still under the drain bound. A
- * timeout is a failed claim: rolled back, and the worker backs off.
+ * timeout is a failed claim: rolled back, and the worker backs off. Once `drain()` set the claim's
+ * deadline (`ClaimRunsInput.remainingMs`), the connection checkout, BEGIN and COMMIT are bounded
+ * too: past the deadline nothing is claimed (no BEGIN after a slow checkout, ROLLBACK instead of
+ * COMMIT), and each statement's timeout is capped by the time left.
  */
 export const CLAIM_STATEMENT_TIMEOUT_MS = 1_500;
+/**
+ * Shortest statement timeout a claim runs with once `stop()` set its deadline: with less time left
+ * than this, the claim gives up (claims nothing) instead of racing the drain bound.
+ */
+export const MIN_CLAIM_STATEMENT_TIMEOUT_MS = 50;
+
+/** Internal: the claim's deadline passed; rolled back, nothing claimed. */
+class ClaimDeadlinePassed extends Error {}
+
+/**
+ * The statement timeout for the next claim statement given the time left (`undefined` = no
+ * deadline), or `undefined` when the deadline is (about to be) over. Always a safe integer.
+ */
+function statementTimeoutMs(remaining: number | undefined): number | undefined {
+	if (remaining === undefined) return CLAIM_STATEMENT_TIMEOUT_MS;
+	if (!Number.isFinite(remaining) || remaining < MIN_CLAIM_STATEMENT_TIMEOUT_MS) return undefined;
+	return Math.min(CLAIM_STATEMENT_TIMEOUT_MS, Math.floor(remaining));
+}
 
 function time(date: Date | null): number {
 	return date === null ? Number.NEGATIVE_INFINITY : date.getTime();
@@ -70,32 +93,88 @@ export function createRunClaimStore(exec: SqlExecutor, ctx: SqlContext): RunClai
 	}
 
 	return {
-		async claimRuns({ queue, limit, globalConcurrency }: ClaimRunsInput): Promise<RunRecord[]> {
+		async claimRuns({
+			queue,
+			limit,
+			globalConcurrency,
+			remainingMs,
+		}: ClaimRunsInput): Promise<RunRecord[]> {
 			if (limit <= 0) return [];
 			if (exec.kind === "tx") {
-				throw new Error("claimRuns must not run inside a StoreTx (SET LOCAL would leak)");
-			}
-			return atomic(exec, async db => {
-				// SET cannot take bind parameters; the value is a constant integer. Transaction-scoped
-				// only (never a session SET on a pooled client).
-				await db.query(`SET LOCAL statement_timeout = ${CLAIM_STATEMENT_TIMEOUT_MS}`);
-				if (globalConcurrency === undefined) return claim(db, queue, limit);
-				// Decision 28(e): serializes the queue's claims; the count below sees every committed
-				// `running` (READ COMMITTED: fresh snapshot per statement). One bigint key, outside
-				// `(hashtext(schema), 1|2)` (decision 16). Seed 1, not 0: the decision 25 lock hashes
-				// `schema:queue:<user key>` with seed 0, so a user `concurrencyKey` of "global" would
-				// otherwise produce this very key; with its own seed no user key can (short of a
-				// 64-bit hash collision).
-				await db.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 1))", [
-					`${ctx.schema}:${queue}:global`,
-				]);
-				const { rows } = await db.query<{ n: number }>(
-					`SELECT count(*)::int AS n FROM ${runs} WHERE queue = $1 AND status = 'running'`,
-					[queue]
+				throw new MinitriggerError(
+					"claimRuns must not run inside a StoreTx (SET LOCAL would leak)"
 				);
-				const free = Math.min(limit, globalConcurrency - (rows[0]?.n ?? 0));
-				return free > 0 ? claim(db, queue, free) : [];
-			});
+			}
+			const { client, release } = await checkOut(exec.pool);
+			const db = wrap(client);
+			/** The statement timeout in force in this transaction (none before the first SET). */
+			let applied: number | undefined;
+			/**
+			 * Before each statement: past the deadline, nothing is claimed; else the statement is
+			 * bounded by `min(CLAIM_STATEMENT_TIMEOUT_MS, time left)`. Without a deadline this is the
+			 * single `SET LOCAL` of the transaction (no extra round trip in normal operation).
+			 */
+			const bound = async (): Promise<void> => {
+				const ms = statementTimeoutMs(remainingMs?.());
+				if (ms === undefined) throw new ClaimDeadlinePassed();
+				if (applied !== undefined && applied <= ms) return;
+				// SET cannot take bind parameters; `ms` is a validated integer. Transaction-scoped
+				// only (never a session SET on a pooled client).
+				await db.query(`SET LOCAL statement_timeout = ${ms}`);
+				applied = ms;
+			};
+			let begun = false;
+			try {
+				// A slow checkout (a saturated pool) may have outlived the deadline: no BEGIN at all.
+				if (statementTimeoutMs(remainingMs?.()) === undefined) throw new ClaimDeadlinePassed();
+				await client.query("BEGIN");
+				begun = true;
+				let claimed: RunRecord[];
+				await bound();
+				if (globalConcurrency === undefined) {
+					claimed = await claim(db, queue, limit);
+				} else {
+					// Decision 28(e): serializes the queue's claims; the count below sees every
+					// committed `running` (READ COMMITTED: fresh snapshot per statement). One bigint key,
+					// outside `(hashtext(schema), 1|2)` (decision 16). Seed 1, not 0: the decision 25
+					// lock hashes `schema:queue:<user key>` with seed 0, so a user `concurrencyKey` of
+					// "global" would otherwise produce this very key; with its own seed no user key can
+					// (short of a 64-bit hash collision).
+					await db.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 1))", [
+						`${ctx.schema}:${queue}:global`,
+					]);
+					await bound();
+					const { rows } = await db.query<{ n: number }>(
+						`SELECT count(*)::int AS n FROM ${runs} WHERE queue = $1 AND status = 'running'`,
+						[queue]
+					);
+					const free = Math.min(limit, globalConcurrency - (rows[0]?.n ?? 0));
+					if (free > 0) await bound();
+					claimed = free > 0 ? await claim(db, queue, free) : [];
+				}
+				// Never COMMIT past the deadline: `stop()` stopped waiting, nobody would run or hand
+				// back what this brings.
+				if (claimed.length > 0 && statementTimeoutMs(remainingMs?.()) === undefined) {
+					throw new ClaimDeadlinePassed();
+				}
+				await client.query("COMMIT");
+				release();
+				return claimed;
+			} catch (err) {
+				const rolledBack = begun
+					? await client.query("ROLLBACK").then(
+							() => true,
+							() => false
+						)
+					: true;
+				if (err instanceof ClaimDeadlinePassed) {
+					if (rolledBack) release();
+					else release(new Error("ROLLBACK failed"));
+					return [];
+				}
+				release(err instanceof Error ? err : new Error(String(err)));
+				throw err;
+			}
 		},
 
 		async nextDueInMs(queue: string): Promise<number | null> {

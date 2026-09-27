@@ -46,7 +46,8 @@ export interface Db {
 	): Promise<{ rows: R[]; rowCount: number }>;
 }
 
-function wrap(client: SqlQueryable): Db {
+/** A {@link Db} over one client (a transaction's, or a checked-out pool client). */
+export function wrap(client: SqlQueryable): Db {
 	return {
 		async query<R extends QueryResultRow>(text: string, values?: unknown[]) {
 			const res = await client.query(text, values);

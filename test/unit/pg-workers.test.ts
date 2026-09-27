@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { EngineLogger } from "../../src/config.js";
 import { SystemJobDelayed } from "../../src/executor/system.js";
 import {
+	CLAIM_DRAIN_TIMEOUT_MS,
 	createQueueWorker,
 	createSystemWorker,
 	MIN_IDLE_SLEEP_MS,
@@ -163,13 +164,13 @@ describe("queue worker", () => {
 		const { worker } = queueWorker(c.claim, p.process);
 		worker.start();
 		await flush();
-		expect(c.calls).toEqual([{ queue: "q", limit: 2 }]);
+		expect(c.calls).toEqual([expect.objectContaining({ queue: "q", limit: 2 })]);
 		expect(p.process).toHaveBeenCalledTimes(2);
 		expect(worker.inFlight).toBe(2);
 
 		p.finish("r1");
 		await flush();
-		expect(c.calls[1]).toEqual({ queue: "q", limit: 1 });
+		expect(c.calls[1]).toMatchObject({ queue: "q", limit: 1 });
 		expect(p.process).toHaveBeenCalledTimes(3);
 		expect(worker.inFlight).toBe(2);
 		worker.stopClaiming();
@@ -471,6 +472,44 @@ describe("queue worker", () => {
 		expect(result).toEqual([]);
 	});
 
+	it("drain() hands the claim in flight its deadline: remainingMs counts down the claim drain bound", async () => {
+		const c = fakeClaim();
+		const p = controlledProcess();
+		const { worker } = queueWorker(c.claim, p.process);
+		const gate = deferred();
+		c.holdClaims(gate.promise);
+		worker.start();
+		await flush();
+		const input = c.calls[0];
+		expect(input?.remainingMs).toBeTypeOf("function");
+		// No deadline while the worker runs normally.
+		expect(input?.remainingMs?.()).toBeUndefined();
+
+		worker.stopClaiming();
+		void worker.drain(100);
+		expect(input?.remainingMs?.()).toBe(CLAIM_DRAIN_TIMEOUT_MS);
+		await vi.advanceTimersByTimeAsync(1_000);
+		expect(input?.remainingMs?.()).toBe(CLAIM_DRAIN_TIMEOUT_MS - 1_000);
+		await vi.advanceTimersByTimeAsync(4_500);
+		expect(input?.remainingMs?.()).toBeLessThan(0);
+		gate.resolve();
+		await flush();
+	});
+
+	it("a drain() budget longer than the claim bound is the claim's deadline too", async () => {
+		const c = fakeClaim();
+		const { worker } = queueWorker(c.claim, controlledProcess().process);
+		const gate = deferred();
+		c.holdClaims(gate.promise);
+		worker.start();
+		await flush();
+		worker.stopClaiming();
+		void worker.drain(20_000);
+		expect(c.calls[0]?.remainingMs?.()).toBe(20_000);
+		gate.resolve();
+		await flush();
+	});
+
 	it("globalConcurrency is passed to claimRuns and onSlotFreed fires when a run ends", async () => {
 		const c = fakeClaim();
 		c.backlog.push(run("r1"));
@@ -479,7 +518,7 @@ describe("queue worker", () => {
 		const { worker } = queueWorker(c.claim, p.process, { globalConcurrency: 3, onSlotFreed });
 		worker.start();
 		await flush();
-		expect(c.calls[0]).toEqual({ queue: "q", limit: 2, globalConcurrency: 3 });
+		expect(c.calls[0]).toMatchObject({ queue: "q", limit: 2, globalConcurrency: 3 });
 		expect(onSlotFreed).not.toHaveBeenCalled();
 		p.finish("r1");
 		await flush();
@@ -515,7 +554,7 @@ describe("queue worker", () => {
 		worker.setConcurrency(3);
 		expect(worker.concurrency).toBe(3);
 		await flush();
-		expect(c.calls.at(-1)).toEqual({ queue: "q", limit: 2 });
+		expect(c.calls.at(-1)).toMatchObject({ queue: "q", limit: 2 });
 		expect(worker.inFlight).toBe(2);
 		worker.stopClaiming();
 	});

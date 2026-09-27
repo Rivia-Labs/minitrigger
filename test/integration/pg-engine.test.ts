@@ -4,7 +4,7 @@
  * `polling.intervalMs` wherever a pass must prove the NOTIFY path (a poll would be too late).
  */
 import { randomUUID } from "node:crypto";
-import { Client, escapeIdentifier } from "pg";
+import { Client, escapeIdentifier, Pool } from "pg";
 import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import type { CommonConfig, EngineLogger, PostgresTransportConfig } from "../../src/config.js";
 import { createEngine, type Engine, type RunEvent } from "../../src/engine.js";
@@ -681,6 +681,45 @@ describe("engine with transport postgres", () => {
 		expect(report.skippedLostEnqueues).toBe(true);
 		for (const id of ids) expect((await engine.runs.get(id))?.status).toBe("queued");
 	});
+
+	it("a claim stuck on a saturated pool when stop() gives up never claims afterwards", async () => {
+		const pool = new Pool({ connectionString: ns.databaseUrl, max: 1 });
+		try {
+			const task = defineTask({
+				id: uniqueTaskId("saturated"),
+				queue: { name: uniqueQueue() },
+				run: async () => "done",
+			});
+			// Long poll and reconciler intervals: after start(), only the wake of the trigger below
+			// makes anything ask this pool for a connection, so the queue's claim is first in line.
+			const engine = makeEngine([task], {
+				postgres: { pool },
+				polling: { intervalMs: 60_000 },
+				reconciler: { intervalMs: 60_000 },
+			});
+			await engine.start();
+			await sleep(300); // the startup passes (first claims, first leader tick) are over
+			const held = await pool.connect();
+			const trigger = makeEngine([task]); // its own pool: the insert and wake are not blocked
+			const handle = await trigger.trigger(task, undefined);
+			await sleep(500); // the wake reached the listener; the claim waits for a checkout
+
+			await engine.stop(); // gives up on the claim after its drain bound
+			// The engine's pool is being ended (as for a pool the engine owns): the claim gets the
+			// connection back, and the hand-back of anything it claimed would find the pool gone.
+			held.release();
+			const ending = pool.end();
+			await sleep(1_000);
+			const { rows } = await ns.pool.query<{ status: string }>(
+				`SELECT status FROM ${t("runs")} WHERE id = $1`,
+				[handle.id]
+			);
+			expect(rows[0]?.status).toBe("queued");
+			await ending;
+		} finally {
+			if (!pool.ended) await pool.end().catch(() => {});
+		}
+	}, 30_000);
 
 	it("a claimed run whose concurrency re-check throws is released (no attempt spent) and then completes", async () => {
 		const task = defineTask({

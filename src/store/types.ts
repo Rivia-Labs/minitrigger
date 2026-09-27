@@ -1202,6 +1202,13 @@ export interface ClaimRunsInput {
 	limit: number;
 	/** `undefined` = no global limit. With a limit, claims are serialized per queue (exact). */
 	globalConcurrency?: number;
+	/**
+	 * Milliseconds left before this claim must be over, or `undefined` for no deadline. Read at
+	 * every step, because `stop()` sets the deadline (its claim drain bound) while a claim may
+	 * already be in flight: past it (or under the minimum statement timeout), nothing is claimed
+	 * -- after the connection checkout, before each statement, and before `COMMIT` (rolled back).
+	 */
+	remainingMs?: () => number | undefined;
 }
 
 /**
