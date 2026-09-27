@@ -185,6 +185,33 @@ describe("claimRuns", () => {
 		expect((await store.claim.claimRuns({ queue: q, limit: 5 })).map(r => r.id)).toEqual([run.id]);
 	});
 
+	it("a run created after the claim's BEGIN gets written times from the claim statement, not the BEGIN", async () => {
+		const q = uniqueQueue("ts");
+		const holder = await ns.pool.connect();
+		let claiming: Promise<Awaited<ReturnType<typeof store.claim.claimRuns>>>;
+		let created: Awaited<ReturnType<typeof newRun>>;
+		try {
+			await holder.query("BEGIN");
+			await holder.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 1))", [
+				`${s}:${q}:global`,
+			]);
+			// The claim BEGINs, then waits on the lock (now() is frozen at that BEGIN).
+			claiming = store.claim.claimRuns({ queue: q, limit: 5, globalConcurrency: 5 });
+			await new Promise(resolve => setTimeout(resolve, 150));
+			created = await newRun(q); // updated_at = now() of its own, later transaction
+			await new Promise(resolve => setTimeout(resolve, 50));
+			await holder.query("ROLLBACK");
+		} finally {
+			holder.release();
+		}
+		const claimed = await claiming;
+		expect(claimed.map(r => r.id)).toEqual([created.id]);
+		const run = first(claimed);
+		expect(run.updatedAt.getTime()).toBeGreaterThanOrEqual(created.updatedAt.getTime());
+		expect(run.startedAt?.getTime()).toBeGreaterThanOrEqual(created.updatedAt.getTime());
+		expect(run.heartbeatAt?.getTime()).toBeGreaterThanOrEqual(created.updatedAt.getTime());
+	});
+
 	it("CLAIM_STATEMENT_TIMEOUT_MS x 3 (globalConcurrency worst case) stays under the drain bound", () => {
 		expect(CLAIM_STATEMENT_TIMEOUT_MS * 3).toBeLessThan(CLAIM_DRAIN_TIMEOUT_MS);
 	});

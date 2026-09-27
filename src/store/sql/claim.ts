@@ -38,9 +38,10 @@ export function createRunClaimStore(exec: SqlExecutor, ctx: SqlContext): RunClai
 	const returning = qualifiedRunColumns("r");
 
 	async function claim(db: Db, queue: string, limit: number): Promise<RunRecord[]> {
-		// Due-ness uses `statement_timestamp()`, not `now()`: the claim runs in a transaction
-		// (statement_timeout, advisory lock), and `now()` is frozen at its BEGIN, so a run that came
-		// due between the BEGIN and this statement would be skipped. Written times keep `now()`.
+		// `statement_timestamp()`, not `now()`, for due-ness AND the written times: the claim runs in
+		// a transaction (statement_timeout, advisory lock), and `now()` is frozen at its BEGIN, so a
+		// run that came due between the BEGIN and this statement would be skipped, and one inserted
+		// or re-queued in that window would get an `updated_at` older than the one it already had.
 		const { rows } = await db.query<RunRow>(
 			`WITH picked AS (
 			   SELECT r.id FROM ${runs} r
@@ -54,10 +55,12 @@ export function createRunClaimStore(exec: SqlExecutor, ctx: SqlContext): RunClai
 			   FOR UPDATE OF r SKIP LOCKED
 			 )
 			 UPDATE ${runs} r
-			 SET status = 'running', execution_id = gen_random_uuid(), heartbeat_at = now(),
+			 SET status = 'running', execution_id = gen_random_uuid(),
+			     heartbeat_at = statement_timestamp(),
 			     started_at = CASE WHEN r.concurrency_key IS NULL
-			                       THEN coalesce(r.started_at, now()) ELSE r.started_at END,
-			     debounce_key = NULL, updated_at = now()
+			                       THEN coalesce(r.started_at, statement_timestamp())
+			                       ELSE r.started_at END,
+			     debounce_key = NULL, updated_at = statement_timestamp()
 			 FROM picked WHERE r.id = picked.id
 			 RETURNING ${returning}`,
 			[queue, limit]
