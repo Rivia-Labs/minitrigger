@@ -1277,8 +1277,15 @@ export interface SystemJobStore {
 		data: ScheduleTickData;
 		runAt: Date;
 	}): Promise<"created" | "updated" | "unchanged">;
-	/** Claims due jobs: `locked_until = now() + lockMs`, fresh `locked_by`. */
-	claim(limit: number, lockMs: number): Promise<SystemJobRecord[]>;
+	/**
+	 * Claims due jobs: `locked_until = now() + lockMs`, fresh `locked_by`. `remainingMs` bounds
+	 * the claim like {@link ClaimRunsInput.remainingMs}: past it, nothing is claimed.
+	 */
+	claim(
+		limit: number,
+		lockMs: number,
+		remainingMs?: () => number | undefined
+	): Promise<SystemJobRecord[]>;
 	/** Every write below matches `job_id` AND `locked_by`; `false`/`"lost"` = lock lost. */
 	complete(jobId: string, lockedBy: string): Promise<boolean>;
 	delay(jobId: string, lockedBy: string, delayMs: number): Promise<boolean>;

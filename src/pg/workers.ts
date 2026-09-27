@@ -560,9 +560,9 @@ export function createSystemWorker(o: SystemWorkerOptions): SystemWorker {
 	return createClaimLoop<SystemJobRecord>({
 		label: { queue: "-system" },
 		concurrency: o.concurrency,
-		// No deadline: a `-system` row claimed after the drain gave up is only locked until
-		// `lockMs`; another worker then retries it (fencing by `locked_by`).
-		claim: limit => systemJobs.claim(limit, o.lockMs),
+		// The drain's deadline, as for runs (review 5, A6): a row claimed after the drain gave up
+		// would be processed after `stop()` resolved, or stay locked for `lockMs`.
+		claim: (limit, remainingMs) => systemJobs.claim(limit, o.lockMs, remainingMs),
 		nextDueInMs: () => systemJobs.nextDueInMs(),
 		process: processRecord,
 		// Only bookkeeping writes reach here (handler errors are handled above): the lock expires

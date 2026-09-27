@@ -6,6 +6,7 @@
  * advisory lock per queue serializes the claims so the `running` count is exact.
  */
 
+import type { Pool } from "pg";
 import { MinitriggerError } from "../../errors.js";
 import type { ClaimRunsInput, RunClaimStore, RunRecord } from "../types.js";
 import { checkOut, type Db, direct, type SqlContext, type SqlExecutor, wrap } from "./db.js";
@@ -40,6 +41,64 @@ function statementTimeoutMs(remaining: number | undefined): number | undefined {
 	if (remaining === undefined) return CLAIM_STATEMENT_TIMEOUT_MS;
 	if (!Number.isFinite(remaining) || remaining < MIN_CLAIM_STATEMENT_TIMEOUT_MS) return undefined;
 	return Math.min(CLAIM_STATEMENT_TIMEOUT_MS, Math.floor(remaining));
+}
+
+/**
+ * The transaction of a claim (runs or `system_jobs`) bounded by a deadline (`remainingMs`, set by
+ * the worker's `drain()`; `undefined` = none): past it nothing is claimed -- no BEGIN after a slow
+ * checkout, a rollback instead of a COMMIT that would bring rows nobody runs or hands back. `body`
+ * calls `bound()` before each statement: it throws past the deadline and otherwise caps the
+ * statement at `min(CLAIM_STATEMENT_TIMEOUT_MS, time left)` (without a deadline, the single
+ * `SET LOCAL` of the transaction). Resolves `undefined` when the deadline passed (rolled back).
+ */
+export async function boundedClaim<T>(
+	pool: Pool,
+	remainingMs: (() => number | undefined) | undefined,
+	body: (db: Db, bound: () => Promise<void>) => Promise<T[]>
+): Promise<T[] | undefined> {
+	const { client, release } = await checkOut(pool);
+	const db = wrap(client);
+	/** The statement timeout in force in this transaction (none before the first SET). */
+	let applied: number | undefined;
+	const bound = async (): Promise<void> => {
+		const ms = statementTimeoutMs(remainingMs?.());
+		if (ms === undefined) throw new ClaimDeadlinePassed();
+		if (applied !== undefined && applied <= ms) return;
+		// SET cannot take bind parameters; `ms` is a validated integer. Transaction-scoped only
+		// (never a session SET on a pooled client).
+		await db.query(`SET LOCAL statement_timeout = ${ms}`);
+		applied = ms;
+	};
+	let begun = false;
+	try {
+		// A slow checkout (a saturated pool) may have outlived the deadline: no BEGIN at all.
+		if (statementTimeoutMs(remainingMs?.()) === undefined) throw new ClaimDeadlinePassed();
+		await client.query("BEGIN");
+		begun = true;
+		const claimed = await body(db, bound);
+		// Never COMMIT past the deadline: `stop()` stopped waiting, nobody would run or hand back
+		// what this brings.
+		if (claimed.length > 0 && statementTimeoutMs(remainingMs?.()) === undefined) {
+			throw new ClaimDeadlinePassed();
+		}
+		await client.query("COMMIT");
+		release();
+		return claimed;
+	} catch (err) {
+		const rolledBack = begun
+			? await client.query("ROLLBACK").then(
+					() => true,
+					() => false
+				)
+			: true;
+		if (err instanceof ClaimDeadlinePassed) {
+			if (rolledBack) release();
+			else release(new Error("ROLLBACK failed"));
+			return undefined;
+		}
+		release(err instanceof Error ? err : new Error(String(err)));
+		throw err;
+	}
 }
 
 function time(date: Date | null): number {
@@ -109,81 +168,34 @@ export function createRunClaimStore(exec: SqlExecutor, ctx: SqlContext): RunClai
 					"claimRuns must not run inside a StoreTx (SET LOCAL would leak)"
 				);
 			}
-			const { client, release } = await checkOut(exec.pool);
-			const db = wrap(client);
-			/** The statement timeout in force in this transaction (none before the first SET). */
-			let applied: number | undefined;
-			/**
-			 * Before each statement: past the deadline, nothing is claimed; else the statement is
-			 * bounded by `min(CLAIM_STATEMENT_TIMEOUT_MS, time left)`. Without a deadline this is the
-			 * single `SET LOCAL` of the transaction (no extra round trip in normal operation).
-			 */
-			const bound = async (): Promise<void> => {
-				const ms = statementTimeoutMs(remainingMs?.());
-				if (ms === undefined) throw new ClaimDeadlinePassed();
-				if (applied !== undefined && applied <= ms) return;
-				// SET cannot take bind parameters; `ms` is a validated integer. Transaction-scoped
-				// only (never a session SET on a pooled client).
-				await db.query(`SET LOCAL statement_timeout = ${ms}`);
-				applied = ms;
-			};
-			let begun = false;
-			try {
-				// A slow checkout (a saturated pool) may have outlived the deadline: no BEGIN at all.
-				if (statementTimeoutMs(remainingMs?.()) === undefined) throw new ClaimDeadlinePassed();
-				await client.query("BEGIN");
-				begun = true;
-				let claimed: RunRecord[];
-				let atGlobalCap = false;
+			let atGlobalCap = false;
+			const claimed = await boundedClaim(exec.pool, remainingMs, async (db, bound) => {
 				await bound();
-				if (globalConcurrency === undefined) {
-					claimed = await claim(db, queue, limit);
-				} else {
-					// Decision 28(e): serializes the queue's claims; the count below sees every
-					// committed `running` (READ COMMITTED: fresh snapshot per statement). One bigint key,
-					// outside `(hashtext(schema), 1|2)` (decision 16). Seed 1, not 0: the decision 25
-					// lock hashes `schema:queue:<user key>` with seed 0, so a user `concurrencyKey` of
-					// "global" would otherwise produce this very key; with its own seed no user key can
-					// (short of a 64-bit hash collision).
-					await db.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 1))", [
-						`${ctx.schema}:${queue}:global`,
-					]);
-					await bound();
-					const { rows } = await db.query<{ n: number }>(
-						`SELECT count(*)::int AS n FROM ${runs} WHERE queue = $1 AND status = 'running'`,
-						[queue]
-					);
-					const globalFree = globalConcurrency - (rows[0]?.n ?? 0);
-					const free = Math.min(limit, globalFree);
-					if (free > 0) await bound();
-					claimed = free > 0 ? await claim(db, queue, free) : [];
-					// The global cap, not the due backlog, bounded this claim: at the cap after COMMIT.
-					atGlobalCap = globalFree < limit && claimed.length >= Math.max(0, globalFree);
-				}
-				// Never COMMIT past the deadline: `stop()` stopped waiting, nobody would run or hand
-				// back what this brings.
-				if (claimed.length > 0 && statementTimeoutMs(remainingMs?.()) === undefined) {
-					throw new ClaimDeadlinePassed();
-				}
-				await client.query("COMMIT");
-				release();
-				if (atGlobalCap) onGlobalLimit?.();
-				return claimed;
-			} catch (err) {
-				const rolledBack = begun
-					? await client.query("ROLLBACK").then(
-							() => true,
-							() => false
-						)
-					: true;
-				if (err instanceof ClaimDeadlinePassed) {
-					if (rolledBack) release();
-					else release(new Error("ROLLBACK failed"));
-					return [];
-				}
-				release(err instanceof Error ? err : new Error(String(err)));
-				throw err;
-			}
+				if (globalConcurrency === undefined) return claim(db, queue, limit);
+				// Decision 28(e): serializes the queue's claims; the count below sees every
+				// committed `running` (READ COMMITTED: fresh snapshot per statement). One bigint key,
+				// outside `(hashtext(schema), 1|2)` (decision 16). Seed 1, not 0: the decision 25
+				// lock hashes `schema:queue:<user key>` with seed 0, so a user `concurrencyKey` of
+				// "global" would otherwise produce this very key; with its own seed no user key can
+				// (short of a 64-bit hash collision).
+				await db.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 1))", [
+					`${ctx.schema}:${queue}:global`,
+				]);
+				await bound();
+				const { rows } = await db.query<{ n: number }>(
+					`SELECT count(*)::int AS n FROM ${runs} WHERE queue = $1 AND status = 'running'`,
+					[queue]
+				);
+				const globalFree = globalConcurrency - (rows[0]?.n ?? 0);
+				const free = Math.min(limit, globalFree);
+				if (free > 0) await bound();
+				const picked = free > 0 ? await claim(db, queue, free) : [];
+				// The global cap, not the due backlog, bounded this claim: at the cap after COMMIT.
+				atGlobalCap = globalFree < limit && picked.length >= Math.max(0, globalFree);
+				return picked;
+			});
+			if (atGlobalCap && claimed !== undefined) onGlobalLimit?.();
+			return claimed ?? [];
 		},
 
 		async nextDueInMs(queue: string): Promise<number | null> {

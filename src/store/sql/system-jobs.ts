@@ -7,7 +7,8 @@
  */
 import { MinitriggerError } from "../../errors.js";
 import type { Json, ScheduleTickData, SystemJobRecord, SystemJobStore } from "../types.js";
-import { direct, type SqlContext, type SqlExecutor } from "./db.js";
+import { boundedClaim } from "./claim.js";
+import { type Db, direct, type SqlContext, type SqlExecutor, wrap } from "./db.js";
 import { DELAY_UNTIL_MIN_RUN_AFTER, jsonParam, nowPlusMs } from "./resolve.js";
 
 interface SystemJobRow {
@@ -101,10 +102,13 @@ export function createSystemJobStore(exec: SqlExecutor, ctx: SqlContext): System
 			return row.inserted ? "created" : "updated";
 		},
 
-		async claim(limit, lockMs) {
+		async claim(limit, lockMs, remainingMs) {
 			if (limit <= 0) return [];
-			const { rows } = await db().query<SystemJobRow>(
-				`WITH picked AS (
+			// Same bounded transaction as the run claim (review 5, A6): once `stop()` set the drain
+			// deadline, a claim never commits after the drain gave up on it.
+			const statement = (q: Db) =>
+				q.query<SystemJobRow>(
+					`WITH picked AS (
 				   SELECT job_id FROM ${table}
 				   WHERE run_after <= now() AND (locked_until IS NULL OR locked_until <= now())
 				   ORDER BY run_after
@@ -115,8 +119,15 @@ export function createSystemJobStore(exec: SqlExecutor, ctx: SqlContext): System
 				 SET locked_until = ${nowPlusMs("$2")}, locked_by = gen_random_uuid()
 				 FROM picked WHERE j.job_id = picked.job_id
 				 RETURNING ${QUALIFIED_COLUMNS}`,
-				[limit, lockMs]
-			);
+					[limit, lockMs]
+				);
+			const rows =
+				exec.kind === "tx"
+					? (await statement(wrap(exec.client))).rows
+					: ((await boundedClaim(exec.pool, remainingMs, async (q, bound) => {
+							await bound();
+							return (await statement(q)).rows;
+						})) ?? []);
 			// UPDATE ... RETURNING does not guarantee order: re-sort like the SELECT.
 			return rows.map(mapSystemJob).sort((a, b) => a.runAfter.getTime() - b.runAfter.getTime());
 		},

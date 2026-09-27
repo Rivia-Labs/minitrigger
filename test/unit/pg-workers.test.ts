@@ -713,7 +713,9 @@ function sysRecord(overrides: Partial<SystemJobRecord> = {}): SystemJobRecord {
 function fakeSystemJobs(dbNow: Date) {
 	const backlog: SystemJobRecord[] = [];
 	const store = {
-		claim: vi.fn(async (limit: number, _lockMs: number) => backlog.splice(0, limit)),
+		claim: vi.fn(async (limit: number, _lockMs: number, _remainingMs?: () => number | undefined) =>
+			backlog.splice(0, limit)
+		),
 		nextDueInMs: vi.fn(async () => null),
 		complete: vi.fn(async (_id: string, _lock: string) => true),
 		delay: vi.fn(async (_id: string, _lock: string, _ms: number) => true),
@@ -779,7 +781,7 @@ describe("system worker", () => {
 		});
 		worker.start();
 		await flush();
-		expect(store.claim).toHaveBeenCalledWith(2, 30_000);
+		expect(store.claim).toHaveBeenCalledWith(2, 30_000, expect.any(Function));
 		const job = seen[0];
 		expect(job).toMatchObject({
 			id: "wp-w1-expire",
@@ -967,6 +969,28 @@ describe("system worker", () => {
 		expect(debug.sort()).toEqual(["a", "b"]);
 		expect(logger.calls.filter(l => l.level === "warn" || l.level === "error")).toEqual([]);
 		worker.stopClaiming();
+	});
+
+	it("drain() hands the -system claim in flight its deadline too (review 5, A6)", async () => {
+		const { store } = fakeSystemJobs(new Date(T0));
+		const gate = deferred<SystemJobRecord[]>();
+		let remaining: (() => number | undefined) | undefined;
+		store.claim.mockImplementation(
+			async (_limit: number, _lockMs: number, remainingMs?: () => number | undefined) => {
+				remaining = remainingMs;
+				return gate.promise;
+			}
+		);
+		const { worker } = systemWorker(store, async () => {});
+		worker.start();
+		await flush();
+		expect(remaining).toBeTypeOf("function");
+		expect(remaining?.()).toBeUndefined();
+		worker.stopClaiming();
+		void worker.drain(100);
+		expect(remaining?.()).toBe(CLAIM_DRAIN_TIMEOUT_MS);
+		gate.resolve([]);
+		await flush();
 	});
 
 	it("a bookkeeping write that throws is logged and does not stop the loop", async () => {

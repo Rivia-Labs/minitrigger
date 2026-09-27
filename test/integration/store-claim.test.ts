@@ -389,6 +389,33 @@ describe("systemJobs", () => {
 		return (await store.systemJobs.claim(100, lockMs)).find(j => j.jobId === id);
 	}
 
+	it("a claim past its deadline claims nothing (review 5, A6)", async () => {
+		const id = `job-${Date.now()}-dl`;
+		await store.systemJobs.upsert({ jobId: id, name: "retention" });
+		expect(await store.systemJobs.claim(100, 5_000, () => 0)).toEqual([]);
+		expect(await take(id)).toBeDefined();
+	});
+
+	it("a claim whose deadline passes during its statement rolls back (review 5, A6)", async () => {
+		const id = `job-${Date.now()}-dlc`;
+		await store.systemJobs.upsert({ jobId: id, name: "retention" });
+		const holder = await ns.pool.connect();
+		let remaining: number | undefined;
+		try {
+			await holder.query("BEGIN");
+			await holder.query(`LOCK TABLE ${s}.system_jobs IN ACCESS EXCLUSIVE MODE`);
+			const claiming = store.systemJobs.claim(100, 5_000, () => remaining);
+			await new Promise(resolve => setTimeout(resolve, 100));
+			// The claim waits on the lock; by the time it gets it, its deadline is over.
+			remaining = 0;
+			await holder.query("ROLLBACK");
+			expect(await claiming).toEqual([]);
+		} finally {
+			holder.release();
+		}
+		expect(await take(id)).toBeDefined();
+	});
+
 	it("upsert keeps the existing row; claim locks with a token; complete is fenced", async () => {
 		const id = `job-${Date.now()}c`;
 		await store.systemJobs.upsert({ jobId: id, name: "retention", data: { a: 1 } });
