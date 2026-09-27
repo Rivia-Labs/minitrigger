@@ -215,21 +215,22 @@ describe("queue worker", () => {
 		worker.stopClaiming();
 	});
 
-	it("never spins: a 0 ms due delay with jitter 0 still sleeps MIN_IDLE_SLEEP_MS", async () => {
+	it("never spins: a 0 ms due delay re-claims once, then sleeps MIN_IDLE_SLEEP_MS", async () => {
 		const c = fakeClaim();
 		const p = controlledProcess();
 		const { worker } = queueWorker(c.claim, p.process);
 		c.setNextDue(0);
 		worker.start();
 		await flush();
-		expect(c.calls).toHaveLength(1);
-		await vi.advanceTimersByTimeAsync(MIN_IDLE_SLEEP_MS - 1);
-		expect(c.calls).toHaveLength(1);
-		await vi.advanceTimersByTimeAsync(1);
+		// Already due after the claim: one immediate re-claim (review 5, A3), never more.
 		expect(c.calls).toHaveLength(2);
-		// 100 ms later: at most one pass per MIN_IDLE_SLEEP_MS, not a hot loop.
+		await vi.advanceTimersByTimeAsync(MIN_IDLE_SLEEP_MS - 1);
+		expect(c.calls).toHaveLength(2);
+		await vi.advanceTimersByTimeAsync(1);
+		expect(c.calls).toHaveLength(4);
+		// 100 ms later: at most two claims per MIN_IDLE_SLEEP_MS, not a hot loop.
 		await vi.advanceTimersByTimeAsync(100);
-		expect(c.calls.length).toBeLessThanOrEqual(2 + 100 / MIN_IDLE_SLEEP_MS);
+		expect(c.calls.length).toBeLessThanOrEqual(4 + (2 * 100) / MIN_IDLE_SLEEP_MS);
 		worker.stopClaiming();
 	});
 

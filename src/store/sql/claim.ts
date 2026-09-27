@@ -188,11 +188,13 @@ export function createRunClaimStore(exec: SqlExecutor, ctx: SqlContext): RunClai
 
 		async nextDueInMs(queue: string): Promise<number | null> {
 			// The delay is computed in SQL (decision 17): the app clock may drift from the DB's.
+			// Rows already due count (0): one that came due after the claim statement read the
+			// queue is claimed right away, not a poll interval later (review 5, A3).
 			const { rows } = await direct(exec).query<{ ms: number | null }>(
 				// A paused queue has nothing to wake up for (resume notifies); uncorrelated like the
 				// claim's pause check (review 5, A1/A2).
 				`SELECT ${DELAY_UNTIL_MIN_RUN_AFTER} AS ms FROM ${runs}
-				 WHERE queue = $1 AND status IN ('queued', 'waiting') AND run_after > now()
+				 WHERE queue = $1 AND status IN ('queued', 'waiting') AND run_after IS NOT NULL
 				   AND NOT EXISTS (SELECT 1 FROM ${queueState} q WHERE q.queue = $1 AND q.paused)`,
 				[queue]
 			);

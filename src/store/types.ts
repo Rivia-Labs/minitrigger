@@ -1235,8 +1235,10 @@ export interface RunClaimStore {
 	/** Claimed runs ordered by `(run_after, created_at, id)`; `runAfter` is the pre-claim value. */
 	claimRuns(input: ClaimRunsInput): Promise<RunRecord[]>;
 	/**
-	 * Milliseconds until the queue's next future `run_after` (only `queued`/`waiting`), computed
-	 * against the database clock (decision 17), or null when nothing is scheduled.
+	 * Milliseconds until the queue's earliest `run_after` (only `queued`/`waiting`), computed
+	 * against the database clock (decision 17): 0 when a row is already due (it came due after
+	 * the claim read the queue, or another claim holds its lock), null when nothing is scheduled
+	 * or the queue is paused.
 	 */
 	nextDueInMs(queue: string): Promise<number | null>;
 }

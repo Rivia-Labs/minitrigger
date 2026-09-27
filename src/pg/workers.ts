@@ -170,6 +170,8 @@ function createClaimLoop<T>(spec: LoopSpec<T>): ClaimWorker<T> {
 	}
 
 	async function loop(): Promise<void> {
+		/** A row already due after the claim is claimed once more right away (review 5, A3). */
+		let reclaimed = false;
 		try {
 			while (!stopped) {
 				again = false;
@@ -189,6 +191,12 @@ function createClaimLoop<T>(spec: LoopSpec<T>): ClaimWorker<T> {
 					}
 					const dueInMs = await spec.nextDueInMs();
 					if (stopped) return;
+					if (dueInMs === 0 && !reclaimed) {
+						// Came due between the claim and this query: claim it now, once per pass
+						// (a row another claim holds stays due; that must not become a tight loop).
+						reclaimed = true;
+						continue;
+					}
 					// Never a zero sleep after an empty pass, even with `jitterMs: 0`: a row due "now"
 					// by the DB clock is claimed on the next pass, not in a tight loop.
 					const delay =

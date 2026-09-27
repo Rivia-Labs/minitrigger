@@ -83,3 +83,52 @@ describe("claim loop passes with an unclaimable backlog (A2)", () => {
 		expect(passes).toBeLessThanOrEqual(2);
 	});
 });
+
+describe("a run that comes due between the claim and nextDueInMs (A3)", () => {
+	it("is claimed right away, not after polling.intervalMs", async () => {
+		const q = `window_${randomUUID().slice(0, 8)}`;
+		const created = await store.runs.create({
+			id: randomUUID(),
+			taskId: "t",
+			queue: q,
+			payload: null,
+			maxAttempts: 1,
+			delayMs: 3_600_000,
+		});
+		if (created.kind !== "created") throw new Error(created.kind);
+		const runId = created.run.id;
+		let moved = false;
+		const claim: RunClaimStore = {
+			claimRuns: async input => {
+				const runs = await store.claim.claimRuns(input);
+				if (!moved) {
+					// The run comes due right after the claim statement read the queue.
+					moved = true;
+					await ns.pool.query(`UPDATE ${s}.runs SET run_after = now() WHERE id = $1`, [runId]);
+				}
+				return runs;
+			},
+			nextDueInMs: q2 => store.claim.nextDueInMs(q2),
+		};
+		const processed: string[] = [];
+		const startedAt = Date.now();
+		let processedAt = 0;
+		const worker = createQueueWorker({
+			queue: q,
+			concurrency: 2,
+			claim,
+			process: async r => {
+				processed.push(r.id);
+				processedAt = Date.now();
+			},
+			polling: { intervalMs: 2_000, jitterMs: 0 },
+			logger: silent,
+		});
+		worker.start();
+		await new Promise(resolve => setTimeout(resolve, 600));
+		worker.stopClaiming();
+		await worker.drain(1_000);
+		expect(processed).toEqual([runId]);
+		expect(processedAt - startedAt).toBeLessThan(500);
+	});
+});

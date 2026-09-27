@@ -333,17 +333,19 @@ describe("claimRuns", () => {
 		]);
 	});
 
-	it("nextDueInMs returns the delay until the earliest future run_after of the queue", async () => {
+	it("nextDueInMs returns the delay until the earliest run_after of the queue", async () => {
 		const q = uniqueQueue("n");
 		expect(await store.claim.nextDueInMs(q)).toBeNull();
 		await newRun(q, { delayMs: 30_000 });
 		await newRun(q, { delayMs: 5_000 });
-		await newRun(q); // already due: not "future"
 		const ms = await store.claim.nextDueInMs(q);
 		if (ms === null) throw new Error("expected a next due delay");
 		expect(Number.isInteger(ms)).toBe(true);
 		expect(ms).toBeGreaterThan(3_000);
 		expect(ms).toBeLessThanOrEqual(5_000);
+		// A row already due (it came due after the claim read the queue): 0 (review 5, A3).
+		await newRun(q);
+		expect(await store.claim.nextDueInMs(q)).toBe(0);
 	});
 
 	it("nextDueInMs of a paused queue is null (review 5, A2: no wake-up per due run)", async () => {
