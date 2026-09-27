@@ -460,6 +460,10 @@ export type FailRunResult =
 	| Lost;
 export type RetryRunResult = { kind: "retrying"; attempt: number; enqueue: EnqueueRequest } | Lost;
 export type ReleaseRunResult = { kind: "released"; enqueue: EnqueueRequest } | Lost;
+export interface ReleaseOptions {
+	/** See {@link RunStore.release}. */
+	backoff?: boolean;
+}
 export type SetProgressResult = { kind: "ok"; updatedAt: Date } | Lost;
 
 export type CancelRunResult =
@@ -688,8 +692,12 @@ export interface RunStore {
 	/**
 	 * Graceful-stop hand-back (decision 20). Guarded update: `queued`,
 	 * `execution_id = NULL`, `run_after = now()`, `enqueue_seq + 1`, attempt unchanged.
+	 * With `{ backoff: true }` (a Postgres-transport claim whose pre-start step failed, e.g. the
+	 * concurrency re-check threw): `run_after = now() + concurrencyLimitedDelayMs(concurrency_waits)`
+	 * (PRE-increment value) and `concurrency_waits + 1`, so a failure that repeats backs off like
+	 * a `limited` result instead of looping (reset by the next `ok` re-check or acquisition).
 	 */
-	release(owner: Ownership): Promise<ReleaseRunResult>;
+	release(owner: Ownership, options?: ReleaseOptions): Promise<ReleaseRunResult>;
 
 	/**
 	 * `ctx.progress.set` (decision 23). Guarded single-statement update, like {@link heartbeat}

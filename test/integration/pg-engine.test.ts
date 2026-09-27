@@ -756,19 +756,72 @@ describe("engine with transport postgres", () => {
 
 		const handle = await engine.trigger(task, undefined, { concurrencyKey: "k" });
 		// Well under stallTimeoutMs (5 s): without the release the run would stay `running` until
-		// stall recovery, which fails it (maxAttempts 1).
+		// stall recovery, which fails it (maxAttempts 1). The release backs off ~1 s.
 		const run = await waitForStatus(engine, handle.id, "completed", 4_000);
 		expect(injected).toBe(1);
 		expect(run.attempt).toBe(1);
 		expect(run.output).toBe("done");
-		expect(logs.some(l => l.message.startsWith("claimed run released after an error"))).toBe(true);
+		expect(logs.some(l => l.message.startsWith("claimed run released with backoff"))).toBe(true);
 		const mine = events.filter(e => e.runId === handle.id).map(e => [e.name, e.attempt]);
-		// trigger, then the release back to `queued` with the attempt unchanged, then the real run.
+		// The release publishes nothing (like a `limited` re-check: the run never started).
 		expect(mine).toEqual([
-			["run:queued", 1],
 			["run:queued", 1],
 			["run:started", 1],
 			["run:completed", 1],
 		]);
 	});
+
+	it("a concurrency re-check that always throws backs off (growing delay), never a hot claim loop", async () => {
+		const task = defineTask({
+			id: uniqueTaskId("recheck-always-throws"),
+			queue: { name: uniqueQueue(), concurrencyKey: { limit: 1 } },
+			retry: { maxAttempts: 1 },
+			run: async () => "done",
+		});
+		const failures: number[] = [];
+		let failing = true;
+		const originalQuery = Client.prototype.query;
+		vi.spyOn(Client.prototype, "query").mockImplementation(function (
+			this: Client,
+			...args: unknown[]
+		) {
+			const [text] = args;
+			if (
+				failing &&
+				typeof text === "string" &&
+				text.includes("SELECT queue, concurrency_key, concurrency_waits FROM")
+			) {
+				failures.push(performance.now());
+				return Promise.reject(new Error("boom: injected re-check failure"));
+			}
+			return (originalQuery as (...a: unknown[]) => unknown).apply(this, args);
+		} as typeof Client.prototype.query);
+		const engine = makeEngine([task], { polling: { intervalMs: 200 } });
+		await engine.start();
+		const handle = await engine.trigger(task, undefined, { concurrencyKey: "k" });
+
+		await sleep(3_600);
+		// Backoff 1 s, then 2 s (+ jitter < 250 ms): claims at ~0, ~1 s and ~3 s. Without it the
+		// run went claim -> error -> release (run_after = now(), immediate wake) in a tight loop.
+		expect(failures.length).toBeGreaterThanOrEqual(2);
+		expect(failures.length).toBeLessThanOrEqual(3);
+		const [a, b, c] = failures;
+		if (a === undefined || b === undefined) throw new Error("unreachable");
+		expect(b - a).toBeGreaterThanOrEqual(900);
+		if (c !== undefined) expect(c - b).toBeGreaterThan(b - a + 500);
+		const { rows } = await ns.pool.query<{ status: string; waits: number; attempt: number }>(
+			`SELECT status, concurrency_waits AS waits, attempt FROM ${t("runs")} WHERE id = $1`,
+			[handle.id]
+		);
+		expect(rows[0]).toEqual({ status: "queued", waits: failures.length, attempt: 1 });
+		// Logged as an error, throttled: one line for all these failures.
+		const errors = logs.filter(
+			l => l.level === "error" && l.fields.runId === handle.id && /re-check/.test(l.message)
+		);
+		expect(errors).toHaveLength(1);
+
+		failing = false;
+		const run = await waitForStatus(engine, handle.id, "completed", 12_000);
+		expect(run.attempt).toBe(1);
+	}, 30_000);
 });

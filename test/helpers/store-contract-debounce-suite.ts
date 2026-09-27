@@ -424,6 +424,41 @@ export function defineDebounceConcurrencyContractSuite(get: () => StoreHarness):
 			expect(rb2.kind).toBe("acquired");
 		});
 
+		it("release with backoff: growing run_after from concurrency_waits, seq+1, reset on acquire", async () => {
+			const a = await created({ concurrencyKey: "c1" });
+			const owner = async (seq: number): Promise<Ownership> => {
+				const executionId = randomUUID();
+				const r = await s().runs.acquireWithConcurrencyLimit(a.run.id, executionId, seq, {
+					limit: 5,
+				});
+				if (r.kind !== "acquired") throw new Error(`expected acquired, got ${r.kind}`);
+				return { runId: a.run.id, executionId };
+			};
+			// A plain release (hand-back) is due right away and leaves concurrency_waits alone.
+			const plain = await s().runs.release(await owner(1));
+			if (plain.kind !== "released") throw new Error("expected released");
+			expect(plain.enqueue.delayMs).toBe(0);
+
+			const first = await s().runs.release(await owner(2), { backoff: true });
+			if (first.kind !== "released") throw new Error("expected released");
+			expect(first.enqueue).toMatchObject({ seq: 3, status: "queued" });
+			expect(first.enqueue.delayMs).toBeGreaterThan(1_000 - SLACK_MS);
+			expect(first.enqueue.delayMs).toBeLessThanOrEqual(1_250);
+			expect(await s().runs.get(a.run.id)).toMatchObject({
+				status: "queued",
+				attempt: 1,
+				executionId: null,
+			});
+			// An acquisition resets the waits: the next backoff starts over at the base delay (the
+			// Postgres claim does not reset them, so there it grows: test/integration/pg-engine).
+			const o = await owner(3);
+			const sec = await s().runs.release(o, { backoff: true });
+			if (sec.kind !== "released") throw new Error("expected released");
+			expect(sec.enqueue.delayMs).toBeLessThanOrEqual(1_250);
+			// Not owned any more: lost.
+			expect((await s().runs.release(o, { backoff: true })).kind).toBe("lost");
+		});
+
 		it("limit 2 allows two; a waiting run of the key does not hold a slot", async () => {
 			const two = { limit: 2 };
 			const runs = [];

@@ -566,14 +566,17 @@ export function createRunStore(exec: Exec): RunStore {
 			});
 		},
 
-		release(owner) {
+		release(owner, options) {
 			return exec.run(tx => {
 				const row = owned(tx, uuid(owner.runId), uuid(owner.executionId));
 				if (!row) return { kind: "lost" };
 				const next = updateRun(tx, row, {
 					status: "queued",
 					executionId: null,
-					runAfter: tx.now,
+					runAfter: options?.backoff
+						? tx.now + concurrencyLimitedDelayMs(row.concurrencyWaits)
+						: tx.now,
+					...(options?.backoff ? { concurrencyWaits: row.concurrencyWaits + 1 } : {}),
 					enqueueSeq: row.enqueueSeq + 1,
 					updatedAt: tx.now,
 				});

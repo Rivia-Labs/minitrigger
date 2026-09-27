@@ -11,6 +11,7 @@ import type {
 	NewRunDebounce,
 	Ownership,
 	RecheckConcurrencyLimitResult,
+	ReleaseRunResult,
 	RunStatus,
 	RunStore,
 	SerializedError,
@@ -722,7 +723,31 @@ export function createRunStore(exec: SqlExecutor, ctx: SqlContext): RunStore {
 			return { kind: "retrying", attempt: row.attempt, enqueue: mapEnqueue(row) };
 		},
 
-		async release(owner) {
+		async release(owner, options) {
+			if (options?.backoff) {
+				return atomic(exec, async (db): Promise<ReleaseRunResult> => {
+					const { rows: locked } = await db.query<{ concurrency_waits: number }>(
+						`SELECT concurrency_waits FROM ${runs} WHERE ${OWNED} FOR UPDATE`,
+						[owner.runId, owner.executionId]
+					);
+					const target = locked[0];
+					if (!target) return { kind: "lost" };
+					// Same growing delay as a `limited` re-check, from the PRE-increment waits (time
+					// itself from the DB, decision 17).
+					const { rows } = await db.query<EnqueueRow>(
+						`UPDATE ${runs}
+						 SET status = 'queued', execution_id = NULL, run_after = ${nowPlusMs("$2")},
+						     concurrency_waits = concurrency_waits + 1,
+						     enqueue_seq = enqueue_seq + 1, updated_at = now()
+						 WHERE id = $1
+						 RETURNING ${ENQUEUE_RETURNING}`,
+						[owner.runId, concurrencyLimitedDelayMs(target.concurrency_waits)]
+					);
+					const row = rows[0];
+					if (!row) throw new MinitriggerError("release: locked run disappeared");
+					return { kind: "released", enqueue: mapEnqueue(row) };
+				});
+			}
 			const { rows } = await direct(exec).query<EnqueueRow>(
 				`UPDATE ${runs}
 				 SET status = 'queued', execution_id = NULL, run_after = now(),

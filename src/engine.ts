@@ -26,8 +26,10 @@ import { ConfigError, MinitriggerError, SerializationError } from "./errors.js";
 import {
 	ActiveExecutions,
 	afterResolution,
+	CLAIM_FAILURE_LOG_INTERVAL_MS,
 	cancelLocally,
 	childTaskSpec,
+	createLogThrottle,
 	createSystemDispatcher,
 	type ExecutorDeps,
 	enqueue,
@@ -834,6 +836,7 @@ export function createEngineCore(
 		isShuttingDown: lifecycle.isShuttingDown,
 		notify: notifier,
 		streams: backend.streams,
+		claimFailureLog: createLogThrottle(CLAIM_FAILURE_LOG_INTERVAL_MS),
 	};
 
 	/**
