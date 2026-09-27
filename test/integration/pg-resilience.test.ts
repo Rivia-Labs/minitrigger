@@ -12,7 +12,7 @@
  */
 import { randomUUID } from "node:crypto";
 import { Client, type ClientConfig, escapeIdentifier, Pool } from "pg";
-import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import type { CommonConfig, EngineLogger, PostgresTransportConfig } from "../../src/config.js";
 import { createEngine, type Engine, type RunEvent } from "../../src/engine.js";
 import { channelName } from "../../src/pg/listener.js";
@@ -128,6 +128,7 @@ beforeAll(async () => {
 });
 
 afterEach(async () => {
+	vi.restoreAllMocks();
 	await Promise.all(engines.splice(0).map(e => e.stop()));
 	await Promise.all(extraPools.splice(0).map(p => p.end()));
 	logs.length = 0;
@@ -464,12 +465,37 @@ describe("postgres transport: resilience and cross-process concurrency", () => {
 		await engine.start();
 		const cancelChannel = channelName("cancel", ns.schema);
 
+		// Counts the engine's cancel re-read (`store.runs.get`, a pool query by id) of one run: the
+		// proof that the forged NOTIFY was received and processed, not merely sent.
+		let rereads = 0;
+		let watchedId: string | undefined;
+		const originalQuery = Pool.prototype.query;
+		vi.spyOn(Pool.prototype, "query").mockImplementation(function (this: Pool, ...args: unknown[]) {
+			const [text, values] = args;
+			if (
+				this !== ns.pool &&
+				watchedId !== undefined &&
+				typeof text === "string" &&
+				/FROM\s+\S*runs\S*\s+WHERE id = \$1\s*$/.test(text) &&
+				Array.isArray(values) &&
+				values[0] === watchedId
+			) {
+				rereads++;
+			}
+			return (originalQuery as (...a: unknown[]) => unknown).apply(this, args);
+		} as typeof Pool.prototype.query);
+
 		// Forged: a raw NOTIFY with the id of a run really executing here.
 		let forgedId: string | undefined;
 		const forgedStarted = eventAt(engine, "run:started", () => forgedId);
-		forgedId = (await engine.trigger(task, { ms: 1_000 })).id;
+		forgedId = (await engine.trigger(task, { ms: 3_000 })).id;
 		await forgedStarted;
+		watchedId = forgedId;
 		await ns.pool.query("SELECT pg_notify($1::text, $2::text)", [cancelChannel, forgedId]);
+		// The re-read happened while the run was still executing, and it did not abort it.
+		await waitFor(() => rereads > 0, { timeoutMs: 2_000, intervalMs: 10 });
+		expect((await runRow(forgedId)).status).toBe("running");
+		expect(aborted).toEqual([]);
 		const forged = await waitForStatus(forgedId, "completed");
 		expect(forged).toMatchObject({ attempt: 1, output: "done" });
 		expect(aborted).toEqual([]);
