@@ -1,5 +1,9 @@
 # 11. Produção
 
+> Este guia descreve `transport: "bullmq"` (o padrão). Para os equivalentes em `transport:
+> "postgres"` (conexões, PgBouncer, líder/reconciler, visibilidade de `NOTIFY`, autovacuum de
+> `system_jobs`), ver [14. Modo Postgres](14-modo-postgres.md).
+
 ## Checagens de ambiente no `start()`
 
 `engine.start()` roda `checkEnvironment()` antes de iniciar qualquer worker: versão do servidor
@@ -154,6 +158,79 @@ da linha (a fonte para `engine.runs.subscribe`).
 **O Redis pode ser apagado.** Depois de um `FLUSHALL` (ou qualquer job perdido), o reconciliador
 reenfileira toda run a partir de Postgres dentro de aproximadamente
 `reconciler.graceMs + reconciler.intervalMs`.
+
+## Upgrade 0.3.0 para 0.4.0
+
+- **Novo: `transport: "postgres"`** (decisão 28) — opt-in; `transport: "bullmq"` continua o padrão e
+  não exige nenhuma mudança. Ver [14. Modo Postgres](14-modo-postgres.md).
+- **Migration `009_postgres_transport`** adiciona duas tabelas novas, sempre vazias e instantâneas
+  de criar (`system_jobs`, `schema_meta`), e dois índices em `runs`, ambos `CREATE INDEX IF NOT
+  EXISTS` simples (mesmo trade-off de sempre da decisão 16: um lock `SHARE` em `runs` pelo tempo do
+  build). Só importam se você for rodar `transport: "postgres"` — um engine `"bullmq"` nunca
+  reivindica por eles —, mas `engine.migrate()` os constrói de qualquer forma (schema é código
+  compartilhado). Numa tabela `runs` grande, pré-construa os dois índices `CONCURRENTLY` sob os
+  mesmos nomes primeiro, fora de uma transação, contra o schema alvo, antes de `engine.migrate()`:
+
+  ```sql
+  SET search_path TO "<schema>";
+  CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_runs_claim ON runs (queue, run_after)
+    WHERE status IN ('queued', 'waiting');
+  CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_runs_running_queue ON runs (queue)
+    WHERE status = 'running';
+
+  -- Precisa devolver indisvalid = t para os dois; se f (build interrompido), DROP INDEX
+  -- CONCURRENTLY e reconstrua antes de rodar engine.migrate().
+  SELECT indexrelid::regclass::text AS index_name, indisvalid FROM pg_index
+  WHERE indexrelid IN (
+    '"<schema>".idx_runs_claim'::regclass,
+    '"<schema>".idx_runs_running_queue'::regclass
+  );
+  ```
+
+  `engine.migrate()` depois vê os dois índices já existentes e só cria `system_jobs`/`schema_meta`
+  e registra a versão 9.
+- **`bullmq` e `ioredis` agora são peers opcionais.** Nada muda para um deployment
+  `transport: "bullmq"` existente — continue instalando os dois como antes. O que mudou por baixo:
+  a entrada principal e `/testing` não importam mais nenhum dos dois estaticamente no carregamento
+  do módulo; o backend BullMQ carrega sob demanda (`import()` dinâmico) na primeira vez que um
+  engine realmente precisa dele. Se não estiverem instalados, esse primeiro uso (não o
+  `createEngine()` em si) lança `ConfigError` nomeando o pacote faltando e como instalá-lo.
+- **Cron agora é validado pelo próprio `cron-parser`**, não uma regex própria, em
+  `defineTask({ schedule })` e `engine.schedules.upsert()`, nos dois transportes. `cron-parser`
+  reconhece 5 ou 6 campos separados por espaço (um campo de segundos opcional no começo); **um
+  padrão de 7 campos que a regex antiga deixava passar agora falha na validação com
+  `ConfigError`** em vez de só falhar depois, em silêncio, dentro do scheduler do próprio BullMQ
+  (o BullMQ usa a mesma biblioteca internamente, então um padrão de 7 campos nunca rodou de fato —
+  isso só antecipa o erro, com mensagem clara).
+- **`EngineConfig` virou uma união discriminada** por `transport`
+  (`{ transport?: "bullmq"; redis; prefix?; outbox? } | { transport: "postgres"; polling? }`), então
+  o compilador agora pega `redis`/`prefix`/`outbox` junto com `transport: "postgres"` (ou `polling`
+  sem ele) — antes eram campos opcionais soltos, checados só em runtime. Se você monta a config aos
+  poucos com spread (ex.: `{ ...base, transport: "postgres" }`), o TypeScript alarga o literal de
+  volta para `"bullmq" | "postgres"` a menos que você o fixe — escreva
+  `{ ...base, transport: "postgres" as const }` (ou dê a `base` um tipo mais estreito) para o
+  resultado continuar casando exatamente com um membro da união.
+- **O Redis conecta sob demanda com `transport: "bullmq"`.** O engine não abre mais nenhuma conexão
+  Redis no `createEngine()`: a primeira conexão abre no primeiro uso (tipicamente `engine.start()`,
+  ou um `trigger()`/`runs.subscribe()` mais cedo, num engine só de disparo que nunca chama
+  `start()`). Uma string de conexão malformada ou um Redis inacessível agora aparece como erro
+  dessa primeira chamada, não do `createEngine()` em si.
+- **Debounce: uma run pendente já vencida deixa de absorver triggers**, nos dois transportes — ver
+  [07. Filas](07-filas.md#debounce). Mudança de comportamento em relação a 0.3.x e anteriores: antes, uma run debounced continuava
+  colapsável até um worker de fato adquiri-la, não importa quanto tempo depois do próprio prazo
+  `delay`/`maxDelay` isso levasse.
+- **Guarda de transporte misto, e mover um schema entre transportes** — ver
+  [14. Modo Postgres](14-modo-postgres.md#guarda-de-modo-misto-e-mover-um-schema-entre-transportes).
+  Resumo: `schema_meta` (nova nesta migration) passa a gravar qual transporte um schema usa, e um
+  `start()` com o outro transporte no mesmo schema é `ConfigError`. Engines em 0.3.x e anteriores
+  nunca gravaram esse marcador, então mover um schema existente para `transport: "postgres"` exige
+  atualizar todo engine dele para 0.4.0+ primeiro (procedimento completo na seção linkada).
+- **Checar tipos com `skipLibCheck: false` pode exigir `@types/node`.** O próprio `.d.ts` do `pg`
+  (já necessário via o peer opcional `@types/pg`) referencia tipos do Node; com `skipLibCheck:
+  false` eles também são checados, não só ignorados. O próprio `scripts/check-pack.mjs`, na sua
+  checagem com `skipLibCheck: false`, instala `@types/pg` e `@types/node` por esse motivo — faça o
+  mesmo se seu build usa `skipLibCheck: false` e você não estava puxando `@types/node`
+  transitivamente antes.
 
 ## Upgrade 0.2.0 para 0.3.0
 

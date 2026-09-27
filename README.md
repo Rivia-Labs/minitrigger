@@ -16,9 +16,10 @@ own codebase.
 - Subtasks (`step.trigger`, `step.triggerAndWait`, `step.batchTriggerAndWait`).
 - Cron schedules, idempotency, cancellation, per-attempt timeouts, run logs and status queries.
 
-**Postgres is the source of truth** for every run, step, waitpoint, idempotency key and log; BullMQ
-is only used as transport (delivery, delay, concurrency, rate limiting). If Redis is wiped, no run
-is lost — see [Operation](#operation).
+**Postgres is the source of truth** for every run, step, waitpoint, idempotency key and log; by
+default BullMQ is used as transport (delivery, delay, concurrency, rate limiting) — if Redis is
+wiped, no run is lost, see [Operation](#operation). Since 0.4.0, `transport: "postgres"` runs the
+whole engine on Postgres alone, no Redis at all — see [Postgres-only mode](#postgres-only-mode).
 
 Documentação em português: [docs/pt/](docs/pt/README.md)
 
@@ -123,13 +124,20 @@ update it whenever you bump to a newer commit/tag. Full reproduction and reasoni
 
 | Package | Range |
 |---|---|
-| `bullmq` | `^6.3.0` |
-| `ioredis` | `^5.11.1` (not 6.x — BullMQ 6.3.x is tested against 5.11.1; the 6.x RESP3 default isn't handled by its adapter) |
+| `bullmq` | `^6.3.0` (optional peer — only needed with `transport: "bullmq"`, the default; see below) |
+| `ioredis` | `^5.11.1` (not 6.x — BullMQ 6.3.x is tested against 5.11.1; the 6.x RESP3 default isn't handled by its adapter; optional peer, same condition as `bullmq`) |
 | `pg` | `^8.13.0` |
 | `@types/pg` | `^8.11.0` (optional peer — only needed because the public types reference `pg.Pool`) |
 
+**`bullmq`/`ioredis` are optional peers**, needed only with `transport: "bullmq"` (the default) —
+skip them entirely for `transport: "postgres"` (see [Postgres-only mode](#postgres-only-mode)). The
+package never imports either at module load; with `transport: "bullmq"` and either missing, the
+first operation that needs it (not `createEngine()` itself) throws `ConfigError` naming what to
+install.
+
 Also requires **Node >= 22**, **Postgres >= 13** (checked by `checkEnvironment`/`engine.start()`),
-and **Redis with `maxmemory-policy noeviction`** — see [Infrastructure](#infrastructure) below.
+and, with `transport: "bullmq"`, **Redis with `maxmemory-policy noeviction`** — see
+[Infrastructure](#infrastructure) below.
 
 ## Infrastructure
 
@@ -157,7 +165,8 @@ services:
 `step.sleep`/retry backoff/scheduled runs rely on) as ordinary Redis keys. Any other eviction
 policy lets Redis silently drop that state under memory pressure; `minitrigger` checks this at
 `engine.start()` and warns (or throws, if it can confirm the policy is wrong — see decision 22 in
-`docs/SPEC.md`) if it isn't set.
+`docs/SPEC.md`) if it isn't set. None of this applies to `transport: "postgres"` — Redis isn't part
+of the picture at all in that mode, see [Postgres-only mode](#postgres-only-mode).
 
 ## Quick start
 
@@ -274,7 +283,14 @@ partial index), so it holds across processes and survives a Redis `FLUSHALL`.
   `__` prefix reserved). `debounce` cannot be combined with `idempotencyKey` or `delay`.
 - A collapsed trigger doesn't change the run's status, so it emits no event and no
   `runs.subscribe` update. A run that already started and went back to `queued` (retry, resume
-  from a sleep, graceful hand-back) never absorbs triggers.
+  from a sleep, graceful hand-back) never absorbs triggers. Neither does a still-pending run whose
+  own `run_after` has already come due (its `delay`/`maxDelay` deadline was reached but no worker
+  has acquired it yet): the next trigger for that key releases its debounce key instead (the due
+  run's payload/`run_after`/attempt count are untouched — it still runs exactly as it would have)
+  and opens a **new** pending run for the key. Without this, a key triggered faster than a worker
+  could acquire it would keep absorbing forever — breaking the "runs periodically" guarantee above,
+  and in `transport: "postgres"` specifically starving the row of its `SKIP LOCKED` claim for as
+  long as the burst lasted (see [Postgres-only mode](#postgres-only-mode)).
 - A collapsed trigger also doesn't change the pending run's `concurrencyKey`, `maxDelay` deadline
   or `maxAttempts` — only its `payload` (per the `payload` option) and `run_after` move; those
   other fields are fixed by whichever trigger created the pending run (first trigger wins).
@@ -688,7 +704,8 @@ Names already covered by their own subsection above/below link there instead of 
 |---|---|
 | `createEngine(config)` | Builds an [`Engine`](#createengineconfig). |
 | `Engine`, `EngineClient` | `Engine` is the full client (also `migrate`/`start`/`stop`); `EngineClient` is the `Pick<Engine, "trigger" \| "runs" \| "tokens" \| "schedules" \| "events">` subset both `Engine` and `TestEngine` satisfy. |
-| `EngineConfig`, `EngineLimits`, `EngineLogger`, `EngineLogFn` | `createEngine`'s config shape; payload/output size limits ([config table](#config-options)); the pino/console-compatible logger shape and its per-level function type. |
+| `EngineConfig`, `EngineLimits`, `EngineLogger`, `EngineLogFn` | `createEngine`'s config shape (a discriminated union on `transport`, see [Postgres-only mode](#postgres-only-mode)); payload/output size limits ([config table](#config-options)); the pino/console-compatible logger shape and its per-level function type. |
+| `BullmqTransportConfig`, `PostgresTransportConfig`, `RedisLike` | The two members of the `EngineConfig` union (`transport: "bullmq"` \| `"postgres"`); `RedisLike` is the minimal structural shape an injected `redis.connection` must satisfy (no `ioredis` import in public types). |
 | `StartOptions` | `engine.start(options)`'s options (e.g. `{ queues }` to start only some). |
 | `TriggerOptions`, `DebounceOptions`, `TransactionClient` | `engine.trigger`'s third argument (idempotency, delay, [debounce](#debounce)/[concurrency keys](#concurrency-keys)/[`tx`](#transactional-trigger-outbox)); `DebounceOptions` is its `debounce` field; `TransactionClient` is the `tx` client shape. |
 | `Run`, `RunList`, `ListRunsOptions`, `RunStep`, `RunLogEntry`, `RunLogPage`, `RunLogsOptions` | Shapes returned by `runs.get`/`list`/`steps`/`logs` — see [Run introspection](#run-introspection-events-and-streams). |
@@ -1109,11 +1126,14 @@ interface StepApi {
 | Option | Default | Notes |
 |---|---|---|
 | `postgres` | — | Connection string, or `{ pool }` with an existing `pg.Pool` (never closed by the engine). |
-| `redis` | — | Connection string, or `{ connection }` with an existing `ioredis` instance (only used for non-blocking producers; workers/subscribers always get a `duplicate()`). |
+| `transport` | `"bullmq"` | `"bullmq"` (Redis + BullMQ, unchanged) or `"postgres"` (no Redis at all, decision 28) — see [Postgres-only mode](#postgres-only-mode). A discriminated union: `redis`/`prefix`/`outbox` only exist with `"bullmq"`; `polling` only with `"postgres"`. |
+| `redis` | — | **`transport: "bullmq"` only.** Connection string, or `{ connection }` with an existing `ioredis` instance (only used for non-blocking producers; workers/subscribers always get a `duplicate()`). Required with `"bullmq"`; a `ConfigError` if present with `"postgres"`. |
+| `polling.intervalMs` | `1 000` | **`transport: "postgres"` only.** Cap on the adaptive poll fallback for a missed `NOTIFY` (wake, status, cancel). Minimum 100. |
+| `polling.jitterMs` | `50` | **`transport: "postgres"` only.** Jitter added to the poll above, to spread out a `NOTIFY`-driven thundering herd. Minimum 0. |
 | `schema` | `"minitrigger"` | Postgres schema. Must match `^[a-z_][a-z0-9_]{0,62}$`. |
-| `prefix` | `"minitrigger"` | BullMQ key prefix. Same pattern as `schema`. |
+| `prefix` | `"minitrigger"` | **`transport: "bullmq"` only.** BullMQ key prefix. Same pattern as `schema`. A `ConfigError` with `transport: "postgres"` (NOTIFY channels derive from `schema` instead). |
 | `tasks` | — | Array of tasks from `defineTask`. |
-| `pool.max` | total task-queue `concurrency` + 5 (at least 10) | Only used when the engine creates its own pool (string `postgres`). `start()` warns when it is below that for the started queues. See [pool sizing](#pool-sizing). |
+| `pool.max` | total task-queue `concurrency` + 5 (at least 10; + `systemConcurrency` too with `transport: "postgres"`, whose `-system` worker runs against the pool) | Only used when the engine creates its own pool (string `postgres`). `start()` warns when it is below that for the started queues. See [pool sizing](#pool-sizing). |
 | `pool.connectionTimeoutMs` | `10 000` | `connectionTimeoutMillis` of the engine's own pool: a query waiting longer for a free connection fails (a failed heartbeat only warns). |
 | `heartbeatIntervalMs` | `10 000` | How often a running execution updates `heartbeat_at`. Must be smaller than `stallTimeoutMs`. |
 | `heartbeatTimeoutMs` | `2 000` | `SET LOCAL statement_timeout` applied to each heartbeat query/transaction. |
@@ -1127,10 +1147,10 @@ interface StepApi {
 | `reconciler.intervalMs` | `15 000` | Leader-election + reconciler tick. Also the worst-case latency to recover a lost enqueue (plus `graceMs`). |
 | `reconciler.graceMs` | `30 000` | How long a `queued`/`waiting` run may sit past its `run_after` before the reconciler re-enqueues it. |
 | `reconciler.batchSize` | `100` | Rows handled per reconciler case per tick. |
-| `outbox.pollIntervalMs` | `2 000` | How often every started engine sweeps for committed `trigger(..., { tx })` runs even without a `NOTIFY`. Range 100–2³¹-1. |
-| `outbox.batchSize` | `500` | Rows claimed per `claimOutbox` statement. Range 1–10 000. |
-| `outbox.reconnectMaxMs` | `30 000` | Upper bound of the dedicated LISTEN client's reconnect backoff. Range 500–2³¹-1 (the backoff starts at 500 ms). |
-| `outbox.notify` | `true` | `false` skips the commit-time `pg_notify` in `trigger(..., { tx })` (dispatch then relies only on `outbox.pollIntervalMs`). See [Transactional trigger](#transactional-trigger-outbox). |
+| `outbox.pollIntervalMs` | `2 000` | **`transport: "bullmq"` only** (a `ConfigError` with `"postgres"` — there's no separate outbox to sweep, see [Postgres-only mode](#postgres-only-mode)). How often every started engine sweeps for committed `trigger(..., { tx })` runs even without a `NOTIFY`. Range 100–2³¹-1. |
+| `outbox.batchSize` | `500` | **`transport: "bullmq"` only.** Rows claimed per `claimOutbox` statement. Range 1–10 000. |
+| `outbox.reconnectMaxMs` | `30 000` | **`transport: "bullmq"` only.** Upper bound of the dedicated LISTEN client's reconnect backoff. Range 500–2³¹-1 (the backoff starts at 500 ms). |
+| `outbox.notify` | `true` | **`transport: "bullmq"` only.** `false` skips the commit-time `pg_notify` in `trigger(..., { tx })` (dispatch then relies only on `outbox.pollIntervalMs`). See [Transactional trigger](#transactional-trigger-outbox). |
 | `limits.maxPayloadBytes` | `1 MB` | Trigger payloads, token outputs, task outputs. |
 | `limits.maxStepOutputBytes` | `256 KB` | `step.run` outputs. |
 | `limits.maxLogEntryBytes` | `16 KB` | One `ctx.logger` entry's `data`. |
@@ -1138,7 +1158,7 @@ interface StepApi {
 | `logging.minLevel` | `"info"` | `ctx.logger` entries below this level are neither stored nor mirrored. |
 | `logging.mirror` | `true` | Also send `ctx.logger` entries to `logger` (with `runId`, `taskId`, `attempt`). |
 | `limits.maxInlineStepOutputBytes` | `16 MB` | Threshold above which a run's step outputs are loaded lazily in batches instead of in the single startup query. |
-| `systemConcurrency` | `5` | Concurrency of the internal `${prefix}-system` worker (ticks, expirations, retention). |
+| `systemConcurrency` | `5` | Concurrency of the internal `${prefix}-system` worker (ticks, expirations, retention). With `transport: "postgres"`, this worker claims rows of the `system_jobs` table against the same pool instead of a separate BullMQ queue — see [Postgres-only mode](#postgres-only-mode). |
 | `logger` | console, warn/error only | `{ debug, info, warn, error }`, each `(fields, message) => void` (pino- and console-call-compatible). |
 
 `Duration` fields accept either a number of milliseconds or a string like `"5m"`, `"2d"`, `"1.5h"`
@@ -1309,6 +1329,83 @@ it("approves when the token resolves truthy", async () => {
 - **What this does *not* test:** replay, memoization across attempts, suspension, non-determinism
   detection, real waitpoint timeouts, or anything else that depends on durability. Use
   `createTestEngine` for that; use `runTask` for the logic a task computes given its inputs.
+
+## Upgrading to 0.4.0
+
+- **New: `transport: "postgres"`** (decision 28) — opt-in; `transport: "bullmq"` stays the default
+  and needs no changes at all. See [Postgres-only mode](#postgres-only-mode).
+- **Migration `009_postgres_transport`** adds two new tables, always empty and instant to create
+  (`system_jobs`, `schema_meta`), and two indexes on `runs`, both plain `CREATE INDEX IF NOT
+  EXISTS` (decision 16's usual trade-off: a `SHARE` lock on `runs` for however long the build
+  takes). They only matter once you run `transport: "postgres"` — a `"bullmq"` engine never claims
+  through them — but `engine.migrate()` builds them for every schema regardless (schema is shared
+  code, not per-transport). On a large `runs` table, pre-build the two indexes `CONCURRENTLY` under
+  the same names first, outside a transaction, against the target schema, before
+  `engine.migrate()`:
+
+  ```sql
+  SET search_path TO "<schema>";
+  CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_runs_claim ON runs (queue, run_after)
+    WHERE status IN ('queued', 'waiting');
+  CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_runs_running_queue ON runs (queue)
+    WHERE status = 'running';
+
+  -- Must return indisvalid = t for both; if f (interrupted build), DROP INDEX CONCURRENTLY and
+  -- rebuild that one before running engine.migrate() (its IF NOT EXISTS would otherwise keep an
+  -- invalid index forever).
+  SELECT indexrelid::regclass::text AS index_name, indisvalid FROM pg_index
+  WHERE indexrelid IN (
+    '"<schema>".idx_runs_claim'::regclass,
+    '"<schema>".idx_runs_running_queue'::regclass
+  );
+  ```
+
+  `engine.migrate()` then sees both indexes already exist and only creates `system_jobs`/
+  `schema_meta` and records version 9 — no lock contention with your existing traffic either way,
+  since those two tables start (and, for a `"bullmq"` deployment, stay) empty.
+- **`bullmq` and `ioredis` are now optional peers.** Nothing changes for an existing
+  `transport: "bullmq"` deployment — keep installing them exactly as before (see the
+  [peer dependencies table](#peer-dependencies--requirements)). What changed under the hood: the
+  main entry and `/testing` no longer statically import either package; the BullMQ backend loads
+  lazily (a dynamic `import()`) the first time an engine actually needs it. If they aren't
+  installed, that first use (not `createEngine()` itself) throws `ConfigError` naming which
+  package is missing and how to install it.
+- **Cron patterns are now validated by `cron-parser` itself**, not a hand-rolled regex, in both
+  `defineTask({ schedule })` and `engine.schedules.upsert()`, in both transports. `cron-parser`
+  recognizes 5 or 6 whitespace-separated fields (an optional leading seconds field); **a 7-field
+  pattern the old regex let through now fails at validation time with `ConfigError`** instead of
+  only failing later, silently, inside BullMQ's own scheduler (BullMQ uses the same library
+  internally, so a 7-field pattern never actually ran on a schedule — this just surfaces the
+  failure immediately, with a clear message, instead of a schedule that's silently never ticked).
+- **`EngineConfig` is now a discriminated union** on `transport`
+  (`{ transport?: "bullmq"; redis; prefix?; outbox? } | { transport: "postgres"; polling? }`), so
+  the compiler now catches `redis`/`prefix`/`outbox` paired with `transport: "postgres"` (or
+  `polling` without it) — these were plain optional fields before, checked only at runtime. If you
+  build the config object incrementally with a spread (e.g. `{ ...base, transport: "postgres" }`),
+  TypeScript widens a bare string literal assigned earlier back to `"bullmq" | "postgres"` unless
+  you pin it — write `{ ...base, transport: "postgres" as const }` (or give `base` itself a
+  narrower type) so the result still matches one union member exactly instead of failing to
+  type-check as `EngineConfig`.
+- **Redis connects lazily with `transport: "bullmq"`.** The engine no longer opens any Redis
+  connection at `createEngine()` time — the first connection opens on first use (typically
+  `engine.start()`, or an earlier `trigger()`/`runs.subscribe()` call on a trigger-only engine that
+  never calls `start()`). A malformed `redis` connection string or an unreachable Redis now
+  surfaces as an error from that first call, not from `createEngine()` itself.
+- **Debounce: a pending run already past its own due time no longer absorbs triggers**, in both
+  transports — see the note at the end of [Debounce](#debounce). This is a behavior change from
+  0.3.x and earlier: previously, a debounced run stayed collapsible until a worker actually
+  acquired it, however far past its own `delay`/`maxDelay` deadline that took.
+- **Mixed-transport guard, and moving a schema between transports** — see
+  [Postgres-only mode](#postgres-only-mode). In short: `schema_meta` (new in this migration) now
+  records which transport a schema is used with, and a `start()` with the other transport on the
+  same schema is `ConfigError`. Engines on 0.3.x and earlier never wrote that marker, so moving an
+  existing schema to `transport: "postgres"` requires upgrading every engine on it to 0.4.0+
+  first (see the linked section for the full procedure).
+- **Type-checking with `skipLibCheck: false` may need `@types/node`.** `pg`'s own `.d.ts` (already
+  needed via the optional `@types/pg` peer) references Node core types; with `skipLibCheck: false`
+  those get checked too, not just skimmed. `scripts/check-pack.mjs`'s own `skipLibCheck: false`
+  check installs both `@types/pg` and `@types/node` for exactly this reason — do the same if your
+  build sets `skipLibCheck: false` and you weren't already pulling `@types/node` in transitively.
 
 ## Upgrading to 0.3.0
 
@@ -1626,16 +1723,222 @@ opens one more `duplicate()` **per currently-open reader**, closed when that ite
 - **Redis can be wiped.** After a `FLUSHALL` (or any lost job), the reconciler re-enqueues every
   run from Postgres within about `reconciler.graceMs + reconciler.intervalMs`.
 
+(Everything above this point in [Operation](#operation) is specific to `transport: "bullmq"`; read
+on for the Postgres-only equivalents.)
+
+## Postgres-only mode
+
+```ts
+import { createEngine, defineTask } from "@rivia-labs/minitrigger";
+
+const engine = createEngine({
+	postgres: process.env.DATABASE_URL!,
+	transport: "postgres",
+	tasks: [myTask],
+});
+
+await engine.migrate();
+await engine.start();
+```
+
+Since 0.4.0, `transport: "postgres"` (decision 28 in `docs/SPEC.md`) runs the whole engine — queue,
+delay, wake-up, the internal `-system` queue, and pub/sub — directly on Postgres: no Redis, no
+BullMQ, and `bullmq`/`ioredis` don't need to be installed at all. `transport: "bullmq"` (the
+default, entirely unchanged) is still the better fit once you already run Redis, or need Redis
+Streams (`ctx.stream`) or a rate limit; reach for `"postgres"` when you'd rather not stand up Redis
+in the first place, or already run enough Postgres capacity that a second moving part is pure
+overhead. Outside what's listed below, the two transports are equivalent: same `defineTask`, same
+`ctx.step.*`, same replay/memoization, same store contract, same `docs/store-contract.md`.
+
+### When to use it
+
+- You want durable tasks without adding Redis as an operational dependency.
+- Your Postgres already has the connection headroom for another `pool.max` worth of connections per
+  process (see [Connections per engine](#connections-per-engine) below) and can tolerate the
+  extra claim/poll query traffic against `runs`.
+- You don't need `ctx.stream`/`runs.readStream`, `queue.rateLimit`, or a Redis-backed
+  `globalConcurrency` that's approximate under heavy racing (this transport's is exact instead, see
+  below) — none of those exist in this mode.
+
+### What's not available
+
+| Field / call | Result |
+|---|---|
+| `redis`, `prefix` | `ConfigError` at `createEngine()` — no Redis in this mode; NOTIFY channels derive from `schema` instead. |
+| `outbox.*` | `ConfigError` at `createEngine()` — `trigger(..., { tx })` already writes straight into the row the claim reads (decision 28(j)); there's no separate outbox to tune. |
+| `queue.rateLimit` | `ConfigError` at `createEngine()` — not implemented for this transport (no SQL rate limiter yet). |
+| `ctx.stream(name, source)` | `ConfigError` thrown to the task when called. |
+| `runs.readStream(run, name)` | `ConfigError` thrown when called. |
+
+### How it works
+
+- **The queue is the `runs` table itself.** A `queued`/`waiting` row with `run_after <= now()` is a
+  due job; a worker claims a batch with `UPDATE ... FROM (SELECT ... FOR UPDATE SKIP LOCKED)` in
+  one statement, writing the same fields the BullMQ mode's `acquire` does (`status = 'running'`, a
+  fresh `execution_id`, `heartbeat_at`, `started_at` if unset). `trigger()` becomes one atomic
+  write: nothing can be lost between "the run exists" and "the run is queued" (there's no separate
+  enqueue step to drop). The reconciler's lost-enqueue cases (BullMQ mode's cases 1/2) don't run
+  under this transport as a result — a run sitting past its `run_after` is ordinary backlog, not a
+  sign anything was lost.
+- **Wake-up is `NOTIFY`, with an adaptive poll as the safety net.** Every enqueue (insert, resume,
+  retry, hand-back, stall recovery, a debounce collapse) also fires a `pg_notify` naming the queue;
+  every started engine `LISTEN`s on one dedicated connection and wakes just that queue's claim loop
+  (an unrecognized or forged payload wakes every registered queue instead — the payload is always a
+  hint, never trusted, since any role with `CONNECT` can `NOTIFY` these channels). If the
+  notification is lost (a reconnecting listener, a pooler in front of it that breaks `LISTEN`, no
+  engine started yet), every worker that didn't fill its batch also polls: it reads the queue's
+  earliest `run_after` and sleeps until then, capped at `polling.intervalMs` (default 1 000 ms,
+  minimum 100) plus up to `polling.jitterMs` of jitter (default 50 ms, spreading out the thundering
+  herd a burst of `NOTIFY`s would otherwise cause). So worst-case wake-up latency without `NOTIFY`
+  is bounded by `polling.intervalMs`, never indefinite.
+- **`globalConcurrency` is exact.** With a limit, the claim runs inside a short transaction that
+  first takes a per-queue advisory lock, then counts the queue's `running` rows once — concurrent
+  claims of the same queue serialize on that lock, so the `running` count across every process
+  never exceeds the limit. No approximation, unlike relying on Redis-side counting under racing
+  claims.
+- **The internal `-system` queue is a table, not a BullMQ queue.** `system_jobs` (migration 009)
+  holds waitpoint expirations, retention sweeps, cron ticks and reconciler runs, claimed the same
+  way (`SKIP LOCKED`) with a fencing token (`locked_by`): a worker whose lock expired can never
+  complete, delay or reschedule a row another worker has since reclaimed.
+- **Cron ticks never disappear on failure.** Instead of a BullMQ job scheduler, a schedule is one
+  row (`schedule-tick:<id>`) that's *rewritten in place* to its next occurrence when the tick
+  succeeds or exhausts its retries — never deleted and recreated — so there's no window where the
+  schedule doesn't exist. Missed ticks (no process running) are still not backfilled, same as
+  BullMQ mode; a tick that has to retry (backoff) delays its own following ticks, since there's
+  never more than one in flight for a given schedule.
+
+### Latencies
+
+- **Wake-up:** milliseconds via `NOTIFY` when it arrives; bounded by `polling.intervalMs` when it
+  doesn't (see above).
+- **`globalConcurrency`:** exact, with only the advisory lock's own (typically sub-millisecond)
+  contention as extra latency.
+- See [Benchmark](#benchmark) (and the fuller table in `CLAUDE.md`) for both transports measured
+  side by side on the same machine: the Postgres transport met the design's acceptance bar
+  (throughput within ±20% of BullMQ, sleep-resume p99 ≤ 150 ms) with zero extra tuning — in
+  practice it came out ahead on both throughput and sleep-resume latency, since a `NOTIFY`-driven
+  resume skips Redis's own delayed-job polling.
+
+### Connections per engine
+
+`pool.max`, when the engine creates its own pool, is derived as `max(10, sum of task-queue
+concurrency + systemConcurrency + 5)` in this mode: the `-system` worker runs against the pool too
+(there's no separate Redis-backed `-system` worker to hold its own connection), unlike `"bullmq"`
+mode, where the formula doesn't add `systemConcurrency` (see [Pool sizing](#pool-sizing)). On top of
+the pool, a **started** engine holds **up to two** dedicated connections outside it: the `LISTEN`
+connection (wake/status/cancel notifications) and the leader-election client — fewer while either
+is still connecting or backing off after a dropped connection. Size `max_connections` for
+`processes × (pool.max + 2)`, the same shape as the BullMQ-mode outbox note in
+[Transactional trigger](#transactional-trigger-outbox). If you inject your own `pg.Pool`, size it
+the same way and set a `connectionTimeoutMillis` — `start()` warns otherwise, same as in BullMQ
+mode.
+
+### PgBouncer
+
+A transaction-mode pooler breaks both dedicated connections this mode needs held open across
+statements: the `LISTEN` connection (a transaction-mode connection doesn't keep `LISTEN` state
+across transactions) and the leader's session-level advisory lock. `start()` runs a self-test right
+after connecting — a `NOTIFY` on the wake channel that must echo back to its own `LISTEN` within
+1 s — and only `warn`s if it doesn't ("notifications do not arrive... wake-up latency falls back to
+the poll"), so a pooler in front of these two connections doesn't fail `start()`; it just silently
+drops to poll-only wake-ups (and no leader, hence no reconciler/retention — see
+[No leader](#no-leader) below). Point the engine's `postgres` at a session-mode pool, or directly at
+Postgres, for millisecond wake-ups and a working leader election; ordinary claim/heartbeat/
+completion queries through the main pool work fine behind a transaction-mode pooler either way
+(they're all single statements).
+
+### `NOTIFY` visibility
+
+`pg_notify`/`LISTEN` only need `CONNECT` on the database — no extra grant for the application role.
+That also means **any role with `CONNECT` can `LISTEN`** on this mode's channels and see the
+`runId`s flowing through them (never payloads, outputs, or progress — every message on these
+channels carries only a bare id, and every subscriber re-reads Postgres before acting on one). If
+which run ids exist is itself sensitive in your setting, use a database dedicated to this engine
+rather than one shared with other roles/teams.
+
+### No leader
+
+Without a leader (every engine's advisory-lock attempt losing, or no engine started at all), the
+reconciler and retention sweeps don't run — but ordinary run execution, cron ticks (any `-system`
+worker of any started engine claims `schedule-tick` rows; no leadership check gates it) and the
+claim/wake/poll loops all keep going unaffected. The practical effect of no leader for a while: a
+stalled run isn't recovered, a lost enqueue (rare in this mode to begin with, see above) isn't
+reconciled, and finished runs pile up without being deleted — all bounded and self-healing once some
+engine successfully becomes leader again.
+
+### Mixed-mode guard, and moving a schema between transports
+
+A schema only ever has one transport at a time: the first `start()` (either mode) records it in
+`schema_meta` (`key = 'transport'`), and any later `start()` on the same schema with the *other*
+transport gets `ConfigError` — a BullMQ engine and a Postgres engine sharing one schema would be two
+independent sources of `-system` jobs (racing to run the same cron tick, expire the same waitpoint,
+and so on).
+
+**Engines on 0.3.x and earlier never write that marker** (it's new in migration 009). To move an
+existing schema from `"bullmq"` to `transport: "postgres"`:
+
+1. Upgrade every engine on that schema to 0.4.0+ first (they can keep running `transport: "bullmq"`
+   meanwhile — upgrading the package version alone doesn't switch transports; an 0.4+ engine still
+   defaulting to `"bullmq"` writes the marker as `"bullmq"` on its next `start()`, same as before).
+2. Stop every engine on that schema.
+3. Make sure `system_jobs` is empty and that BullMQ has no pending jobs left in the old
+   `${prefix}-system` queue (waitpoint expirations, schedule ticks, a queued retention sweep) — the
+   Postgres transport's `-system` never looks at BullMQ, so anything still sitting there is silently
+   abandoned once you switch.
+4. `UPDATE "<schema>".schema_meta SET value = 'postgres' WHERE key = 'transport';` (or delete that
+   row and let the next `start()` with `transport: "postgres"` write it fresh).
+5. Start the engines with `transport: "postgres"`.
+
+There's no separate data migration for in-flight runs/waitpoints/schedules across the switch — they
+were always Postgres rows (Postgres is the source of truth in both modes); only which side reads and
+writes the `-system` jobs changes.
+
+### `system_jobs` autovacuum
+
+Rows are deleted as soon as a job completes (waitpoint expirations, most cron ticks — schedule
+ticks are the exception, rewritten in place, see above) or exhausts its retries, so this table
+churns heavily relative to its size: expect a steady stream of dead tuples. Give it the same
+attention you'd give any other high-churn table — a lower `autovacuum_vacuum_scale_factor` (a
+per-table `ALTER TABLE system_jobs SET (autovacuum_vacuum_scale_factor = ...)` in the target schema)
+keeps it from bloating between the database-wide autovacuum thresholds.
+
+### Mode differences worth knowing
+
+- **`trigger(..., { tx })` emits no `run:queued`.** In BullMQ mode, the dedicated outbox listener
+  observes the caller's commit and publishes `queued` when it dispatches the run. In Postgres mode
+  there's no separate outbox dispatcher — the insert already wrote the row a claim can pick up, and
+  the engine never separately observes "the caller's transaction committed" as its own moment — so
+  the first event/status a `{ tx }` trigger's run produces is `run:started`, once some worker claims
+  it. Key off `run:started` (or poll `runs.get`) instead of `run:queued` for transactional triggers
+  under this transport.
+- **`runs.subscribe` may coalesce closely spaced intermediate statuses.** Status changes are grouped
+  into batched `NOTIFY`s, and the subscriber re-reads the current row rather than replaying every
+  individual message, so two statuses published within the same short window can collapse into only
+  the later one being delivered. The **terminal** status (`completed`/`failed`/`canceled`) is always
+  delivered. If you need every intermediate status, subscribe to `engine.events` in the same process
+  instead — that's a direct in-process emit, no round trip through Postgres to coalesce against.
+- **No streams, no rate limit** — see [What's not available](#whats-not-available) above.
+- **Call `stop()` after a failed `start()`.** If `start()` throws (e.g. the `LISTEN` connection
+  timed out), the listener client keeps trying to reconnect in the background regardless — call
+  `await engine.stop()` to shut it down cleanly before discarding the engine, or before retrying
+  `start()` on the same instance (also supported).
+- **A retried `start()` may wait on the listener's own reconnect backoff.** Calling `start()` again
+  right after a failed one doesn't force an immediate reconnect attempt — it can wait out wherever
+  the listener's backoff (0.5–30 s) currently sits before `LISTEN` is ready again.
+
 ## Benchmark
 
-`pnpm bench` (`bench/run.ts`) runs against a disposable Postgres schema/Redis prefix and measures
+`pnpm bench` (`bench/run.ts`) runs against a disposable Postgres schema/Redis prefix (or, with
+`pnpm bench -- --transport postgres`, a disposable Postgres schema alone, no Redis) and measures
 end-to-end throughput (1,000 runs of a 3-step task) and resume latency (sleep, token). Order of
-magnitude on a recent laptop: ~1.3k-1.4k runs/s throughput, ~50-100 ms sleep-resume p50, ~3-5 ms
-token-resume p50 — treat these as ballpark, not an SLA; see `CLAUDE.md` ("Benchmark") for the full
-methodology, machine and result table. `pnpm check:pack` builds, `pnpm pack`s and installs the
-resulting `.tgz` in a clean temp directory, confirming ESM `import`, CJS `require`, and a `tsc
---strict` check against the shipped `.d.ts` all work — the same path a [GitHub Releases
-install](#install) exercises.
+magnitude on a recent laptop: ~1.3k-1.5k runs/s throughput, ~15-100 ms sleep-resume p50, ~3-10 ms
+token-resume p50 for either transport — treat these as ballpark, not an SLA; see `CLAUDE.md`
+("Benchmark") for the full methodology, machine and result tables (BullMQ and Postgres transports
+measured side by side). `pnpm check:pack` builds, `pnpm pack`s and installs the resulting `.tgz` in
+a clean temp directory, confirming ESM `import`, CJS `require`, a `tsc --strict` check against the
+shipped `.d.ts`, and (against the docker Postgres, `pnpm infra:up` — no Redis needed for this part)
+that `transport: "postgres"` works with neither `bullmq` nor `ioredis` installed all work — the
+same path a [GitHub Releases install](#install) exercises.
 
 ## Known limitations
 
@@ -1671,7 +1974,10 @@ needs the docker infra (`pnpm infra:up`) and includes the isolated `FLUSHALL` pr
 Redis only). `prepublishOnly` deliberately runs only `pnpm typecheck && pnpm lint &&
 pnpm test:unit` (no infra, never a `FLUSHALL` on whatever Redis the publishing machine points
 at), and `prepare` builds `dist/`. So **run the full `pnpm test` against the local infra, plus
-`pnpm check:pack`, before `pnpm publish`** — publishing does not do it for you.
+`pnpm check:pack`, before `pnpm publish`** — publishing does not do it for you. `pnpm check:pack`
+needs the docker **Postgres** (`pnpm infra:up`) for its `transport: "postgres"` smoke run — Redis is
+deliberately *not* required (it proves the package works with neither `bullmq` nor `ioredis`
+installed).
 
 ## Golden rules
 
