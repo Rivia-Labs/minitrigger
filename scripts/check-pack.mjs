@@ -22,6 +22,12 @@
  *   6. the ORM adapter subpaths (`/typeorm`, `/knex`, `/drizzle`, `/prisma`, decision 26) load in
  *      ESM and CJS with no ORM installed, import no module outside the package (only the shared
  *      error chunk), and throw `ConfigError`s that are `instanceof` the main entry's class.
+ *   7. a SECOND throwaway directory with the tarball + `pg` + `cron-parser` only (no `bullmq`, no
+ *      `ioredis`: they are optional peers, decision 28): every entry loads in ESM and CJS and no
+ *      loaded file statically imports them; the Postgres-transport config type-checks; the
+ *      default BullMQ transport's `start()` rejects with the install-hint `ConfigError`; a real
+ *      Postgres-mode run completes against the docker Postgres; and `createTestEngine` runs a
+ *      task with `step.sleep` (see {@link checkWithoutRedis}).
  *   4. (best-effort) a one-file `tsc --strict --module NodeNext --moduleResolution NodeNext`
  *      check against the installed `.d.ts` resolves `createEngine`/`defineTask`'s types — this
  *      step is skipped with a warning (not a failure) if this repo's own `typescript` isn't
@@ -31,7 +37,7 @@
  * toolchain — no new dependency.
  */
 import { execFileSync, execSync } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -151,6 +157,9 @@ async function main() {
 
 		console.log("\n--- type resolution under moduleResolution node10 (typesVersions) ---");
 		ok = checkTypesNode10(installDir) && ok;
+
+		console.log('\n=== second install dir: no bullmq/ioredis (transport: "postgres") ===');
+		ok = checkWithoutRedis(tarball) && ok;
 	} catch (err) {
 		ok = false;
 		console.error("\ncheck:pack FAILED:", err.message ?? err);
@@ -432,6 +441,307 @@ function checkAdapters(installDir) {
 		run("node", [`adapter-${subpath}.mjs`], { cwd: installDir });
 		run("node", [`adapter-${subpath}.cjs`], { cwd: installDir });
 	}
+}
+
+/** The docker Postgres from `docker-compose.yml` (same default as `test/helpers/env.ts`). */
+const DATABASE_URL =
+	process.env.TEST_DATABASE_URL ?? "postgres://minitrigger:minitrigger@localhost:54329/minitrigger";
+
+/** Every shell step of the no-Redis check is bounded, so a hang fails instead of stalling. */
+const NO_REDIS_STEP_TIMEOUT_MS = 60_000;
+
+/**
+ * The no-Redis consumer (decision 28): `bullmq`/`ioredis` are optional peers, so a consumer on
+ * `transport: "postgres"` installs only the tarball, `pg` and `cron-parser`. Each sub-check prints
+ * its own PASS/FAIL; one failing does not skip the others. The directory is always removed.
+ */
+function checkWithoutRedis(tarball) {
+	const dir = mkdtempSync(join(tmpdir(), "minitrigger-noredis-"));
+	console.log(`no-redis install dir: ${dir}\n`);
+	let ok = true;
+	const check = (name, fn) => {
+		console.log(`\n--- [no-redis] ${name} ---`);
+		try {
+			fn();
+			console.log(`[no-redis] ${name}: PASS`);
+		} catch (err) {
+			ok = false;
+			console.error(`[no-redis] ${name}: FAIL\n${err.message ?? err}`);
+		}
+	};
+	const node = (file, env = {}) =>
+		run("node", [file], {
+			cwd: dir,
+			timeout: NO_REDIS_STEP_TIMEOUT_MS,
+			env: { ...process.env, ...env },
+		});
+	try {
+		writeFileSync(
+			join(dir, "package.json"),
+			`${JSON.stringify(
+				{
+					name: "minitrigger-check-pack-noredis",
+					version: "0.0.0",
+					private: true,
+					type: "module",
+					dependencies: { [PKG_NAME]: tarball, pg: PEER_VERSIONS.pg, "cron-parser": "^5.10.1" },
+					// What any TypeScript consumer on Node has (`@types/pg` is the documented optional
+					// peer); used only by the `tsc` check, never by the runtime checks.
+					devDependencies: { "@types/node": "^22.0.0", "@types/pg": "^8.11.0" },
+				},
+				null,
+				2
+			)}\n`
+		);
+		run("npm", ["install", "--no-audit", "--no-fund"], { cwd: dir, timeout: 180_000 });
+		for (const peer of ["bullmq", "ioredis"]) {
+			if (existsSync(join(dir, "node_modules", peer))) {
+				throw new Error(`${peer} got installed in the no-redis dir: the check would prove nothing`);
+			}
+		}
+
+		check("entries load (ESM + CJS) and no loaded file imports bullmq/ioredis", () =>
+			checkNoRedisLoads(dir, node)
+		);
+		check("tsc: transport postgres config under NodeNext, skipLibCheck false", () =>
+			checkNoRedisTypes(dir)
+		);
+		check('default transport start() rejects with ConfigError "bullmq ioredis" (ESM + CJS)', () => {
+			writeFileSync(join(dir, "missing-peer.mjs"), missingPeerSource("esm"));
+			writeFileSync(join(dir, "missing-peer.cjs"), missingPeerSource("cjs"));
+			node("missing-peer.mjs");
+			node("missing-peer.cjs");
+		});
+		check("real Postgres-mode run (migrate + start + trigger + stop)", () => {
+			writeFileSync(join(dir, "pg-run.mjs"), pgRunSource());
+			const schema = `mt_checkpack_${Date.now()}${Math.floor(Math.random() * 1e6)}`;
+			node("pg-run.mjs", { MT_DATABASE_URL: DATABASE_URL, MT_SCHEMA: schema });
+		});
+		check("/testing: createTestEngine + runInline with step.sleep (ESM + CJS)", () => {
+			writeFileSync(join(dir, "test-engine.mjs"), testEngineSource("esm"));
+			writeFileSync(join(dir, "test-engine.cjs"), testEngineSource("cjs"));
+			node("test-engine.mjs");
+			node("test-engine.cjs");
+		});
+	} catch (err) {
+		ok = false;
+		console.error(`[no-redis] setup FAILED: ${err.message ?? err}`);
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+	console.log(`\n=== no-redis dir: ${ok ? "PASS" : "FAIL"} ===`);
+	return ok;
+}
+
+/** Every static import/require specifier in a built file (`import("...")` is dynamic: not matched). */
+const STATIC_SPEC_RE = /(?:\bfrom\s*|\brequire\(\s*|^import\s*)['"]([^'"]+)['"]/gm;
+
+/**
+ * Loads the main entry, `/testing` and every adapter subpath in ESM and CJS (with neither
+ * `bullmq` nor `ioredis` installed, so a static import of either would throw here), then walks
+ * every file each entry loads statically and asserts none names `bullmq`/`ioredis`: only the
+ * BullMQ backend chunk does, and it is reached through a dynamic `import()` alone.
+ */
+function checkNoRedisLoads(dir, node) {
+	const subpaths = ["", "/testing", ...Object.keys(ADAPTERS).map(a => `/${a}`)];
+	const specs = subpaths.map(sub => `${PKG_NAME}${sub}`);
+	writeFileSync(
+		join(dir, "load.mjs"),
+		[
+			...specs.map((spec, i) => `import * as m${i} from "${spec}";`),
+			...specs.map(
+				(spec, i) =>
+					`if (Object.keys(m${i}).length === 0) throw new Error("${spec} exported nothing (ESM)");`
+			),
+			`console.log("ESM OK: ${specs.length} entries loaded without bullmq/ioredis");`,
+		].join("\n")
+	);
+	writeFileSync(
+		join(dir, "load.cjs"),
+		[
+			...specs.map(
+				spec =>
+					`if (Object.keys(require("${spec}")).length === 0) throw new Error("${spec} exported nothing (CJS)");`
+			),
+			`console.log("CJS OK: ${specs.length} entries loaded without bullmq/ioredis");`,
+		].join("\n")
+	);
+	node("load.mjs");
+	node("load.cjs");
+
+	const pkgDir = join(dir, "node_modules", ...PKG_NAME.split("/"));
+	for (const sub of subpaths) {
+		const base = sub === "" ? "dist" : `dist${sub}`;
+		for (const entry of [`${base}/index.js`, `${base}/index.cjs`]) {
+			const seen = new Set();
+			const pending = [entry];
+			while (pending.length > 0) {
+				const file = pending.pop();
+				if (seen.has(file)) continue;
+				seen.add(file);
+				const source = readFileSync(join(pkgDir, file), "utf8");
+				for (const [, spec] of source.matchAll(STATIC_SPEC_RE)) {
+					if (/^(bullmq|ioredis)(\/|$)/.test(spec)) {
+						throw new Error(`${file} (loaded by ${entry}) statically imports "${spec}"`);
+					}
+					if (spec.startsWith(".")) pending.push(join(dirname(file), spec));
+				}
+			}
+			const backend = [...seen].find(f => /(^|\/)bullmq-[^/]*\.c?js$/.test(f));
+			if (backend) throw new Error(`${entry} statically loads the BullMQ backend chunk ${backend}`);
+			console.log(`${entry}: ${seen.size} file(s) walked, no static bullmq/ioredis import`);
+		}
+	}
+}
+
+/** `tsc` with the consumer's own `.d.ts` checked too (`skipLibCheck: false`): no bullmq/ioredis types needed. */
+function checkNoRedisTypes(dir) {
+	writeFileSync(
+		join(dir, "type-check.ts"),
+		`import { createEngine } from "${PKG_NAME}";\ncreateEngine({ transport: "postgres", postgres: "x", schema: "s", tasks: [] });\n`
+	);
+	try {
+		execFileSync(
+			"node",
+			[
+				join(REPO_ROOT, "node_modules/typescript/bin/tsc"),
+				"--noEmit",
+				"--strict",
+				"--target",
+				"ES2024",
+				"--lib",
+				"ES2024",
+				"--module",
+				"NodeNext",
+				"--moduleResolution",
+				"NodeNext",
+				"--skipLibCheck",
+				"false",
+				"--types",
+				"node",
+				"type-check.ts",
+			],
+			{ cwd: dir, stdio: "pipe", encoding: "utf8", timeout: NO_REDIS_STEP_TIMEOUT_MS }
+		);
+	} catch (err) {
+		throw new Error(`tsc failed:\n${err.stdout ?? ""}${err.stderr ?? ""}${err.message ?? ""}`);
+	}
+	console.log('tsc OK: createEngine({ transport: "postgres" }) type-checks without bullmq/ioredis');
+}
+
+function missingPeerSource(format) {
+	const imports =
+		format === "esm"
+			? `import { createEngine, ConfigError } from "${PKG_NAME}";`
+			: `const { createEngine, ConfigError } = require("${PKG_NAME}");`;
+	return [
+		imports,
+		"(async () => {",
+		"\tconst engine = createEngine({",
+		'\t\tredis: "redis://127.0.0.1:1",',
+		'\t\tpostgres: process.env.MT_DATABASE_URL_UNUSED ?? "postgres://x:x@127.0.0.1:1/x",',
+		'\t\tschema: "mt_checkpack_unused",',
+		"\t\ttasks: [],",
+		"\t});",
+		"\tlet error;",
+		"\ttry {",
+		"\t\tawait engine.start();",
+		"\t} catch (e) {",
+		"\t\terror = e;",
+		"\t}",
+		"\tawait engine.stop().catch(() => {});",
+		'\tif (!error) throw new Error("start() resolved without bullmq/ioredis installed");',
+		'\tif (!(error instanceof ConfigError)) throw new Error("start() rejected with a non-ConfigError: " + (error?.stack ?? error));',
+		'\tif (!error.message.includes("bullmq ioredis")) throw new Error("ConfigError message lacks the install hint: " + error.message);',
+		`\tconsole.log("${format.toUpperCase()} OK: start() -> ConfigError: " + error.message);`,
+		"})().catch((e) => {",
+		"\tconsole.error(e);",
+		"\tprocess.exit(1);",
+		"});",
+	].join("\n");
+}
+
+/**
+ * A real run on `transport: "postgres"` against the docker Postgres, in a fresh schema that is
+ * dropped afterwards (also on failure). Nothing here can reach Redis: it is not installed.
+ */
+function pgRunSource() {
+	return `import pg from "pg";
+import { createEngine, defineTask } from "${PKG_NAME}";
+
+const url = process.env.MT_DATABASE_URL;
+const schema = process.env.MT_SCHEMA;
+const task = defineTask({
+	id: "check-pack-pg",
+	run: async (payload, ctx) => {
+		const doubled = await ctx.step.run("double", async () => payload.n * 2);
+		return { doubled };
+	},
+});
+const engine = createEngine({ transport: "postgres", postgres: url, schema, tasks: [task] });
+try {
+	await engine.migrate();
+	await engine.start();
+	const handle = await engine.trigger(task, { n: 21 });
+	const deadline = Date.now() + 20_000;
+	let run = null;
+	while (Date.now() < deadline) {
+		run = await engine.runs.get(handle);
+		if (run && ["completed", "failed", "canceled"].includes(run.status)) break;
+		await new Promise((resolve) => setTimeout(resolve, 50));
+	}
+	if (run?.status !== "completed" || run.output?.doubled !== 42) {
+		throw new Error("run did not complete with { doubled: 42 }: " + JSON.stringify(run));
+	}
+	const steps = await engine.runs.steps(handle);
+	if (!steps.some((s) => s.name === "double" && s.status === "completed")) {
+		throw new Error("step 'double' was not recorded: " + JSON.stringify(steps));
+	}
+	console.log("ESM OK: postgres-transport run " + handle.id + " completed with output " + JSON.stringify(run.output));
+} finally {
+	await engine.stop();
+	const client = new pg.Client({ connectionString: url });
+	await client.connect();
+	try {
+		await client.query("DROP SCHEMA IF EXISTS " + client.escapeIdentifier(schema) + " CASCADE");
+	} finally {
+		await client.end();
+	}
+}
+`;
+}
+
+/** `createTestEngine` (in-memory backend) runs a sleeping task with no bullmq installed. */
+function testEngineSource(format) {
+	const imports =
+		format === "esm"
+			? `import { defineTask } from "${PKG_NAME}";\nimport { createTestEngine } from "${PKG_NAME}/testing";`
+			: `const { defineTask } = require("${PKG_NAME}");\nconst { createTestEngine } = require("${PKG_NAME}/testing");`;
+	return `${imports}
+
+const task = defineTask({
+	id: "check-pack-sleep",
+	run: async (payload, ctx) => {
+		await ctx.step.sleep("nap", "1s");
+		return await ctx.step.run("after", async () => payload.n + 1);
+	},
+});
+(async () => {
+	const engine = createTestEngine({ tasks: [task] });
+	try {
+		const result = await engine.runInline(task, { n: 41 });
+		if (result.status !== "completed" || result.output !== 42) {
+			throw new Error("runInline did not complete with 42: " + JSON.stringify(result));
+		}
+		console.log("${format.toUpperCase()} OK: runInline slept and completed with " + result.output);
+	} finally {
+		await engine.stop();
+	}
+})().catch((e) => {
+	console.error(e);
+	process.exit(1);
+});
+`;
 }
 
 main();
