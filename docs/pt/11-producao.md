@@ -194,7 +194,7 @@ reenfileira toda run a partir de Postgres dentro de aproximadamente
   a entrada principal e `/testing` não importam mais nenhum dos dois estaticamente no carregamento
   do módulo; o backend BullMQ carrega sob demanda (`import()` dinâmico) na primeira vez que um
   engine realmente precisa dele. Se não estiverem instalados, esse primeiro uso (não o
-  `createEngine()` em si) lança `ConfigError` nomeando o pacote faltando e como instalá-lo.
+  `createEngine()` em si) lança `ConfigError` mandando instalar `bullmq` e `ioredis`.
 - **Cron agora é validado pelo próprio `cron-parser`**, não uma regex própria, em
   `defineTask({ schedule })` e `engine.schedules.upsert()`, nos dois transportes. `cron-parser`
   reconhece 5 ou 6 campos separados por espaço (um campo de segundos opcional no começo); **um

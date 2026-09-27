@@ -23,8 +23,8 @@ publicado.)
 **`bullmq`/`ioredis` são peers opcionais**, necessários só com `transport: "bullmq"` — pule os dois
 para `transport: "postgres"` (ver [14. Modo Postgres](14-modo-postgres.md)). O pacote nunca importa
 nenhum dos dois no carregamento do módulo; com `transport: "bullmq"` e algum faltando, a primeira
-operação que precisa dele (não o `createEngine()` em si) lança `ConfigError` nomeando o que
-instalar.
+operação que precisa dele (não o `createEngine()` em si) lança `ConfigError` mandando instalar
+`bullmq` e `ioredis`.
 
 Requisitos adicionais: **Node.js >= 22** e **Postgres >= 13** (checados por `checkEnvironment()` /
 `engine.start()`), além de, com `transport: "bullmq"`, **Redis com `maxmemory-policy noeviction`**

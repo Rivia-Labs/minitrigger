@@ -132,8 +132,8 @@ update it whenever you bump to a newer commit/tag. Full reproduction and reasoni
 **`bullmq`/`ioredis` are optional peers**, needed only with `transport: "bullmq"` (the default) —
 skip them entirely for `transport: "postgres"` (see [Postgres-only mode](#postgres-only-mode)). The
 package never imports either at module load; with `transport: "bullmq"` and either missing, the
-first operation that needs it (not `createEngine()` itself) throws `ConfigError` naming what to
-install.
+first operation that needs it (not `createEngine()` itself) throws `ConfigError` telling you to
+install `bullmq` and `ioredis`.
 
 Also requires **Node >= 22**, **Postgres >= 13** (checked by `checkEnvironment`/`engine.start()`),
 and, with `transport: "bullmq"`, **Redis with `maxmemory-policy noeviction`** — see
@@ -980,7 +980,8 @@ still owns the run), but any log entries still buffered at that point are droppe
 await engine.schedules.upsert({
 	id: "daily",
 	task: myTask,
-	cron: "0 9 * * *",      // 5-7 whitespace-separated fields; a 6th "seconds" field is allowed
+	cron: "0 9 * * *",      // 5 or 6 whitespace-separated fields (a leading seconds field is
+	                        // optional; 7 fields are rejected since 0.4.0)
 	timezone: "America/Belem", // optional IANA zone; omitted = BullMQ's default (UTC-based)
 	payload: { url: "..." },   // required (typed as myTask's payload) unless myTask takes none
 });
@@ -1368,8 +1369,8 @@ it("approves when the token resolves truthy", async () => {
   [peer dependencies table](#peer-dependencies--requirements)). What changed under the hood: the
   main entry and `/testing` no longer statically import either package; the BullMQ backend loads
   lazily (a dynamic `import()`) the first time an engine actually needs it. If they aren't
-  installed, that first use (not `createEngine()` itself) throws `ConfigError` naming which
-  package is missing and how to install it.
+  installed, that first use (not `createEngine()` itself) throws `ConfigError` telling you to
+  install `bullmq` and `ioredis`.
 - **Cron patterns are now validated by `cron-parser` itself**, not a hand-rolled regex, in both
   `defineTask({ schedule })` and `engine.schedules.upsert()`, in both transports. `cron-parser`
   recognizes 5 or 6 whitespace-separated fields (an optional leading seconds field); **a 7-field
