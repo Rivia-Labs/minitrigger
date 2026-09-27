@@ -12,7 +12,7 @@
 --
 -- `schema_meta` holds per-schema facts such as the transport in use (mixed modes are refused).
 --
--- `idx_runs_claim` serves the run claim (src/store/sql/claim.ts) and `nextDueAt`;
+-- `idx_runs_claim` serves the run claim (src/store/sql/claim.ts) and `nextDueInMs`;
 -- `idx_runs_running_queue` serves the `globalConcurrency` count. No `CONCURRENTLY` (decision 16,
 -- like migrations 005/006/008); `IF NOT EXISTS` lets a large `runs` table pre-build both indexes
 -- with `CREATE INDEX CONCURRENTLY` under the same names before `engine.migrate()`.
