@@ -659,6 +659,46 @@ describe("queue worker", () => {
 		});
 	});
 
+	it("never arms a timer above 2^31-1 ms, even with intervalMs + jitter at the limit (A8)", async () => {
+		const c = fakeClaim();
+		const p = controlledProcess();
+		const delays: number[] = [];
+		const setTimeoutFn = ((fn: () => void, ms?: number) => {
+			delays.push(ms ?? 0);
+			return setTimeout(fn, ms);
+		}) as typeof setTimeout;
+		const { worker } = queueWorker(c.claim, p.process, {
+			polling: { intervalMs: 2_147_483_647, jitterMs: 2_147_483_647 },
+			random: () => 0.99,
+			setTimeoutFn,
+		});
+		worker.start();
+		await flush();
+		expect(delays.length).toBeGreaterThan(0);
+		for (const d of delays) expect(d).toBeLessThanOrEqual(2_147_483_647);
+		worker.stopClaiming();
+	});
+
+	it("a failing nextDueInMs backs off like a failing claim (500 ms, 1 s, 2 s) (A8)", async () => {
+		const c = fakeClaim();
+		const p = controlledProcess();
+		c.claim.nextDueInMs.mockRejectedValue(new Error("db down"));
+		const { worker } = queueWorker(c.claim, p.process, {
+			polling: { intervalMs: 60_000, jitterMs: 0 },
+		});
+		worker.start();
+		await flush();
+		expect(c.calls).toHaveLength(1);
+		for (const gap of [500, 1000, 2000]) {
+			const before = c.calls.length;
+			await vi.advanceTimersByTimeAsync(gap - 1);
+			expect(c.calls.length).toBe(before);
+			await vi.advanceTimersByTimeAsync(1);
+			expect(c.calls.length).toBe(before + 1);
+		}
+		worker.stopClaiming();
+	});
+
 	it("a process() rejection is logged and frees the slot", async () => {
 		const c = fakeClaim();
 		c.backlog.push(run("r1"));

@@ -12,7 +12,7 @@
  */
 
 import type { Job } from "bullmq";
-import type { EngineLogger } from "../config.js";
+import { type EngineLogger, MAX_TIMER_MS } from "../config.js";
 import { SystemJobDelayed } from "../executor/system.js";
 import type { ProcessSystemFn } from "../queue/transport.js";
 import type {
@@ -225,18 +225,22 @@ function createClaimLoop<T>(spec: LoopSpec<T>): ClaimWorker<T> {
 				lastClaimAt = now();
 				wakePending = false;
 				const items = await spec.claim(free, remainingMs);
-				failures = 0;
+				// The backoff resets only once the whole pass succeeded: a failing nextDueInMs
+				// after a good claim is a failure too (review 5, A8).
+				if (items.length >= free) failures = 0;
 				// Launched even after stopClaiming(): the executor hands them back (isShuttingDown).
 				for (const item of items) launch(item);
 				if (stopped) return;
 				if (items.length < free) {
 					if (spec.atCap?.()) {
+						failures = 0;
 						// A freed slot wakes us (onSlotFreed / the end of a local run).
 						schedule(spec.polling.intervalMs);
 						if (!again) return;
 						continue;
 					}
 					const dueInMs = await spec.nextDueInMs();
+					failures = 0;
 					if (stopped) return;
 					if (dueInMs === 0 && !reclaimed) {
 						// Came due between the claim and this query: claim it now, once per pass
@@ -307,8 +311,10 @@ function createClaimLoop<T>(spec: LoopSpec<T>): ClaimWorker<T> {
 		setTimer(ms + jitter);
 	}
 
-	function setTimer(ms: number): void {
+	function setTimer(requestedMs: number): void {
 		if (stopped) return;
+		// `intervalMs + jitter` can exceed the setTimeout limit; Node would fire after 1 ms.
+		const ms = Math.min(requestedMs, MAX_TIMER_MS);
 		clearTimeout(timer);
 		timerAt = now() + ms;
 		timer = setTimeoutFn(() => {
