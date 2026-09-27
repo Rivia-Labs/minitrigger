@@ -138,11 +138,14 @@ Postgres; nunca progresso), e o assinante relê `runs` antes de agir: para statu
 local se a run relida está `canceled` (um cancel forjado nunca derruba uma execução). As
 publicações de um processo são agrupadas numa janela curta (5 ms) e saem num único statement
 (`SELECT pg_notify(c, p) FROM unnest(...)`), para não pagar um commit com o lock global de
-`NOTIFY` por transição; (e) `globalConcurrency` é exato: com limite, o claim roda numa transação
-que primeiro toma `pg_advisory_xact_lock(hashtextextended('<schema>:<fila>:global', 0))` e conta
-os `running` da fila uma vez (índice parcial `(queue) WHERE status = 'running'`), então claims
-concorrentes da mesma fila se serializam e nunca passam do limite; sem limite, o claim é um
-statement sem lock. O worker que termina uma execução numa fila com limite emite o `NOTIFY` de
+`NOTIFY` por transição; (e) `globalConcurrency` é exato: com limite, o claim primeiro toma
+`pg_advisory_xact_lock(hashtextextended('<schema>:<fila>:global', 1))` (semente 1, para nunca
+colidir com a chave da decisão 25 quando `concurrencyKey === "global"`) e conta os `running` da
+fila uma vez (índice parcial `(queue) WHERE status = 'running'`), então claims concorrentes da
+mesma fila se serializam e nunca passam do limite; sem limite, não há lock. Nos dois caminhos o
+claim roda numa transação curta com `SET LOCAL statement_timeout` (limite no servidor, para um
+claim nunca terminar depois do limite de dreno do `stop()`), e o "vencido" é avaliado com
+`statement_timestamp()` (emenda aprovada pelo dono em 2026-09-26). O worker que termina uma execução numa fila com limite emite o `NOTIFY` de
 wake dela (a vaga liberada acorda outros processos). Pausa (decisão 27) é lida de `queue_state` no
 próprio claim; `scale` continua local; (f) `queue.rateLimit`, `ctx.stream` e `runs.readStream`
 são `ConfigError` neste modo; (g) `stop()`: os laços de claim param de reivindicar, esperam o
@@ -229,14 +232,17 @@ precedente das migrations 005/006/008); README "Upgrading" ensina a pré-criar o
 
 ### 3.3 Claim de runs (o statement central)
 
-Sem `globalConcurrency` (um statement, sem transação explícita):
+Sem `globalConcurrency` (transação curta: `SET LOCAL statement_timeout` + o statement abaixo;
+emenda aprovada pelo dono em 2026-09-26):
 
 ```sql
+BEGIN;
+SET LOCAL statement_timeout = <min(1500, tempo restante do dreno do stop())>;
 WITH picked AS (
   SELECT r.id FROM runs r
   WHERE r.queue = $1
     AND r.status IN ('queued', 'waiting')
-    AND r.run_after <= now()
+    AND r.run_after <= statement_timestamp()
     AND NOT r.outbox_pending
     AND NOT EXISTS (SELECT 1 FROM queue_state q WHERE q.queue = r.queue AND q.paused)
   ORDER BY r.run_after, r.created_at, r.id
@@ -244,16 +250,26 @@ WITH picked AS (
   FOR UPDATE OF r SKIP LOCKED
 )
 UPDATE runs r SET status = 'running', execution_id = gen_random_uuid(),
-  heartbeat_at = now(), started_at = <ver abaixo>, debounce_key = NULL, updated_at = now()
+  heartbeat_at = statement_timestamp(), started_at = <ver abaixo>, debounce_key = NULL,
+  updated_at = statement_timestamp()
 FROM picked WHERE r.id = picked.id
 RETURNING r.id, r.task_id, ...;   -- RUN_COLUMNS qualificadas com r. (picked também tem id)
+COMMIT;
 ```
 
-Com `globalConcurrency` (transação curta, serializada por fila):
+`statement_timestamp()`, não `now()` (congelado no `BEGIN`): uma run que venceu, foi inserida ou
+foi reenfileirada entre o `BEGIN` e o statement é vista como vencida, e o `updated_at`/`started_at`
+gravados nunca ficam antes do `updated_at` que ela já tinha. O `stop()` passa ao claim em
+andamento um prazo (o limite de dreno): se o prazo já passou quando a conexão sai do pool, nada é
+reivindicado; o `statement_timeout` usa o tempo restante; e, se o prazo passou antes do `COMMIT`,
+o claim faz `ROLLBACK`.
+
+Com `globalConcurrency` (a mesma transação curta, serializada por fila):
 
 ```sql
 BEGIN;
-SELECT pg_advisory_xact_lock(hashtextextended('<schema>:<fila>:global', 0));
+SET LOCAL statement_timeout = <idem>;
+SELECT pg_advisory_xact_lock(hashtextextended('<schema>:<fila>:global', 1));
 -- a mesma CTE acima com LIMIT least($2, $3 - (SELECT count(*) FROM runs
 --   WHERE queue = $1 AND status = 'running')), contado uma vez (não por linha candidata)
 COMMIT;
@@ -265,13 +281,14 @@ Observações:
   há job a invalidar; `release`/`retry`/`suspend` continuam incrementando como hoje) e
   `concurrency_waits` não é zerado (o backoff da decisão 25 cresce a partir dele; quem zera é a
   re-checagem abaixo, no caminho `ok`).
-- `started_at`: `CASE WHEN r.concurrency_key IS NULL THEN coalesce(r.started_at, now()) ELSE
-  r.started_at END`. Uma run com chave só "começa" depois da re-checagem `ok`, que grava
+- `started_at`: `CASE WHEN r.concurrency_key IS NULL THEN coalesce(r.started_at,
+  statement_timestamp()) ELSE r.started_at END`. Uma run com chave só "começa" depois da re-checagem `ok`, que grava
   `coalesce(started_at, now())`; uma run devolvida por `limited` não ganha `started_at`.
 - `globalConcurrency` é exato (o advisory lock serializa os claims da fila e o `count` roda com
   snapshot novo sob READ COMMITTED). O lock é de transação: nunca fica preso a uma conexão.
   Chave de um bigint, fora do espaço `(hashtext(schema), 1|2)` da decisão 16, como o lock da
-  decisão 25.
+  decisão 25; semente 1 (a decisão 25 usa semente 0), para uma `concurrencyKey` `"global"` nunca
+  produzir a mesma chave.
 - `concurrency_key` (decisão 25) continua no caminho do executor: o claim não checa a chave; logo
   depois do claim, `recheckConcurrencyLimit` (no mesmo `FOR UPDATE` + advisory lock de
   `acquireWithConcurrencyLimit`) conta os `running` da chave **excluindo a própria run**. Se
