@@ -27,6 +27,10 @@ detalhado tarefa a tarefa desta feature (13 tarefas, quatro revisões externas),
   `pnpm check:pack` (agora com a checagem sem Redis do transporte Postgres, ver "Transporte
   Postgres" no `CLAUDE.md`) verdes. `pnpm bench` e `pnpm bench -- --transport postgres` rodados uma
   vez cada nesta sessão — números somados à tabela do `CLAUDE.md` ("Benchmark").
+- **Verificação completa (2026-09-26, pendências pós-revisão final):** `pnpm typecheck && pnpm lint
+  && pnpm test && pnpm check:pack` verde — **1780 testes passando + 14 pulados** (106 arquivos) em
+  `unit`+`integration`, 3 no `flushall`; `pg-engine` e `pg-resilience` 3× seguidas verdes.
+  `pnpm bench -- --transport postgres`: 1360 runs/s, sleep p99 29 ms, token p99 10,1 ms.
 
 ### O que existe (resumo)
 
@@ -148,18 +152,16 @@ transporte nesta sessão (números na tabela do `CLAUDE.md`, consistentes com os
 - **Mesclar o branch e publicar como 0.4.0** (ou a versão que estiver em `package.json` na hora),
   depois de uma revisão final humana da branch inteira (13 tarefas de código + esta de docs) —
   ainda não mesclado nesta sessão.
-- Dois itens de código deixados como "minor (deferred)" no ledger da feature
-  (`.superpowers/sdd/2026-09-26-postgres-transport/progress.md`) valem a pena corrigir antes do
-  merge, não só documentar:
-  - **Task 9:** um erro de banco durante `recheckConcurrencyLimit` (a re-checagem de
-    `concurrencyKey` logo após o claim) deixa a run reivindicada presa em `running` — só a
-    recuperação de stall a resgata, custando uma tentativa à toa. Um `release()` best-effort no
-    `catch`, quando `job.claimed` está presente, evitaria esse custo.
-  - **Task 12:** o teste de cancel forjado (`test/integration/review3-io.test.ts` ou equivalente)
-    não prova que o `NOTIFY` forjado foi de fato processado (relido, ignorado) **antes** da run
-    real terminar — só que a run terminou normalmente. Reforçar o teste para sincronizar
-    explicitamente nesse ponto deixaria o Review Focus 6 ("cancel forjado não derruba uma execução
-    real") coberto com mais força.
+- **Pendências pós-revisão final resolvidas (2026-09-26):** os dois "minor (deferred)" das Tasks 9
+  e 12 (re-checagem que lança → `release`; teste do cancel forjado sincronizado) e as cinco
+  pendências da revisão final: claim grava `statement_timestamp()`; claim inteiro limitado pelo
+  prazo do dreno do `stop()` (checkout, `statement_timeout`, `ROLLBACK` em vez de `COMMIT`);
+  re-checagem que falha sempre devolve a run com backoff crescente, sem wake nem publicação, com
+  `error` throttled; `start()` repetido chama `reconnectNow()` do listener; `schedules.upsert`/
+  `delete` carregam o backend BullMQ antes de gravar. Emenda da decisão 28(e) (semente 1 do lock
+  do `globalConcurrency`, claim em transação curta com `statement_timeout`, `statement_timestamp()`)
+  aprovada pelo dono e aplicada na SPEC e no design spec. Detalhes no `CLAUDE.md` ("Transporte
+  Postgres").
 - Itens "minor (deferred)" restantes no mesmo ledger (dezenas, a maioria cosmética ou de robustez
   de teste, nenhum bloqueando o merge) — não repetidos aqui; ver o arquivo para a lista completa
   tarefa por tarefa.
