@@ -548,6 +548,86 @@ describe("queue worker", () => {
 		worker.stopClaiming();
 	});
 
+	describe("an injected logger that throws never stops the loop (review 5, A4)", () => {
+		const throwingLogger = (): EngineLogger => {
+			const boom = () => {
+				throw new Error("logger down");
+			};
+			return { debug: boom, info: boom, warn: boom, error: boom };
+		};
+		let unhandled: unknown[];
+		const onUnhandled = (reason: unknown) => unhandled.push(reason);
+		beforeEach(() => {
+			unhandled = [];
+			process.on("unhandledRejection", onUnhandled);
+		});
+		afterEach(() => {
+			process.off("unhandledRejection", onUnhandled);
+		});
+		const settleUnhandled = async () => {
+			vi.useRealTimers();
+			await new Promise(resolve => setTimeout(resolve, 20));
+		};
+
+		it("a claim failure still backs off and retries", async () => {
+			const c = fakeClaim();
+			const p = controlledProcess();
+			const { worker } = queueWorker(c.claim, p.process, { logger: throwingLogger() });
+			c.failClaims(1);
+			worker.start();
+			await flush();
+			expect(c.calls).toHaveLength(1);
+			c.backlog.push(run("r1"));
+			await vi.advanceTimersByTimeAsync(500);
+			expect(c.calls).toHaveLength(2);
+			expect(p.process).toHaveBeenCalledWith(expect.objectContaining({ id: "r1" }));
+			worker.stopClaiming();
+			await settleUnhandled();
+			expect(unhandled).toEqual([]);
+		});
+
+		it("a process() rejection frees the slot and claims again", async () => {
+			const c = fakeClaim();
+			c.backlog.push(run("r1"), run("r2"));
+			const process = vi.fn(async (r: RunRecord) => {
+				if (r.id === "r1") throw new Error("boom");
+			});
+			const { worker } = queueWorker(c.claim, process, {
+				concurrency: 1,
+				logger: throwingLogger(),
+			});
+			worker.start();
+			await flush();
+			await flush();
+			expect(process).toHaveBeenCalledTimes(2);
+			expect(worker.inFlight).toBe(0);
+			worker.stopClaiming();
+			await settleUnhandled();
+			expect(unhandled).toEqual([]);
+		});
+
+		it("a failing slot-freed hook still frees the slot and claims again", async () => {
+			const c = fakeClaim();
+			c.backlog.push(run("r1"), run("r2"));
+			const process = vi.fn(async () => {});
+			const { worker } = queueWorker(c.claim, process, {
+				concurrency: 1,
+				globalConcurrency: 5,
+				onSlotFreed: () => {
+					throw new Error("hook");
+				},
+				logger: throwingLogger(),
+			});
+			worker.start();
+			await flush();
+			await flush();
+			expect(process).toHaveBeenCalledTimes(2);
+			worker.stopClaiming();
+			await settleUnhandled();
+			expect(unhandled).toEqual([]);
+		});
+	});
+
 	it("a process() rejection is logged and frees the slot", async () => {
 		const c = fakeClaim();
 		c.backlog.push(run("r1"));

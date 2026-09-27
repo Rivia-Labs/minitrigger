@@ -157,6 +157,18 @@ function createClaimLoop<T>(spec: LoopSpec<T>): ClaimWorker<T> {
 		claimDeadline === undefined ? undefined : claimDeadline - now();
 	const active = new Set<{ item: T; done: Promise<void> }>();
 
+	/**
+	 * Every log call of the loop: an injected logger that throws must never stop claiming, skip a
+	 * backoff or leave an unhandled rejection (review 5, A4).
+	 */
+	function safely(fn: () => void): void {
+		try {
+			fn();
+		} catch {
+			// Nothing sensible left to report to.
+		}
+	}
+
 	function pass(): void {
 		if (!started || stopped) return;
 		if (current) {
@@ -215,12 +227,15 @@ function createClaimLoop<T>(spec: LoopSpec<T>): ClaimWorker<T> {
 				CLAIM_BACKOFF_MAX_MS,
 				CLAIM_BACKOFF_MIN_MS * 2 ** Math.min(failures - 1, 6)
 			);
+			// Scheduled before logging: the retry never depends on the logger.
+			schedule(backoffMs);
 			const at = now();
 			if (lastWarnAt === undefined || at - lastWarnAt >= CLAIM_WARN_INTERVAL_MS) {
 				lastWarnAt = at;
-				spec.logger.warn({ ...spec.label, err: error, backoffMs }, "claim failed; backing off");
+				safely(() =>
+					spec.logger.warn({ ...spec.label, err: error, backoffMs }, "claim failed; backing off")
+				);
 			}
-			schedule(backoffMs);
 		}
 	}
 
@@ -235,17 +250,18 @@ function createClaimLoop<T>(spec: LoopSpec<T>): ClaimWorker<T> {
 		const entry = {
 			item,
 			done: running
-				.catch(error => spec.onProcessError(item, error))
+				.catch(error => safely(() => spec.onProcessError(item, error)))
 				.finally(() => {
 					inFlight--;
 					active.delete(entry);
 					try {
 						spec.onFinished?.();
 					} catch (error) {
-						spec.logger.warn({ ...spec.label, err: error }, "slot-freed hook failed");
+						safely(() => spec.logger.warn({ ...spec.label, err: error }, "slot-freed hook failed"));
 					}
 					pass();
-				}),
+				})
+				.catch(() => {}),
 		};
 		active.add(entry);
 	}
