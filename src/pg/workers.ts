@@ -41,12 +41,16 @@ export const MIN_IDLE_SLEEP_MS = 5;
  */
 export const CLAIM_DRAIN_TIMEOUT_MS = 5_000;
 /**
- * Shortest time between the start of a claim and a pass triggered by `wake()`. The wake channel
- * is untrusted (decision 28(b)): without this, a flood of NOTIFYs in separate transactions became
- * one claim per notification per queue (review 5, A5). Wakes inside the window collapse into one
- * pass at its end; passes caused by the loop itself (a freed slot, a full batch) are not delayed.
+ * Sustained rate limit of passes triggered by `wake()`: one per this interval, after a burst of
+ * {@link WAKE_BURST} (GCRA). The wake channel is untrusted (decision 28(b)): without it, a flood
+ * of NOTIFYs in separate transactions became one claim per notification per queue (review 5, A5).
+ * Wakes over the limit collapse into one pass when it allows the next. The burst keeps legitimate
+ * wake-ups close together (a trigger, then the token or child that resumes the run a few ms
+ * later) undelayed; passes the loop runs itself (a freed slot, the poll timer) are not limited.
  */
 export const MIN_WAKE_INTERVAL_MS = 15;
+/** Wake-triggered passes allowed back to back before {@link MIN_WAKE_INTERVAL_MS} applies. */
+export const WAKE_BURST = 4;
 
 export interface WorkerPolling {
 	/** Longest sleep between two claims when nothing is due sooner. */
@@ -159,8 +163,8 @@ function createClaimLoop<T>(spec: LoopSpec<T>): ClaimWorker<T> {
 	let timer: ReturnType<typeof setTimeout> | undefined;
 	/** When `timer` fires (clock of `now()`). */
 	let timerAt: number | undefined;
-	/** Start of the last claim (for {@link MIN_WAKE_INTERVAL_MS}). */
-	let lastClaimAt = Number.NEGATIVE_INFINITY;
+	/** GCRA theoretical arrival time of the next wake-triggered pass. */
+	let wakeTat = Number.NEGATIVE_INFINITY;
 	/** A `wake()` arrived while a pass was in progress. */
 	let wakePending = false;
 	let current: Promise<void> | undefined;
@@ -199,9 +203,15 @@ function createClaimLoop<T>(spec: LoopSpec<T>): ClaimWorker<T> {
 		});
 	}
 
-	/** A wake-triggered pass: now, or at the end of the minimum interval since the last claim. */
+	/** A wake-triggered pass: now if the rate limit allows it, else as soon as it does. */
 	function wakeSoon(): void {
-		const wait = lastClaimAt + MIN_WAKE_INTERVAL_MS - now();
+		const at = now();
+		const allowedAt = wakeTat - (WAKE_BURST - 1) * MIN_WAKE_INTERVAL_MS;
+		const wait = allowedAt - at;
+		// A timer that fires sooner already covers this wake.
+		if (wait > 0 && timer !== undefined && timerAt !== undefined && timerAt <= at + wait) return;
+		const passAt = Math.max(at, allowedAt);
+		wakeTat = Math.max(wakeTat, passAt) + MIN_WAKE_INTERVAL_MS;
 		if (wait <= 0) {
 			clearTimeout(timer);
 			timer = undefined;
@@ -209,8 +219,6 @@ function createClaimLoop<T>(spec: LoopSpec<T>): ClaimWorker<T> {
 			pass();
 			return;
 		}
-		// A timer that fires sooner already covers this wake.
-		if (timer !== undefined && timerAt !== undefined && timerAt <= now() + wait) return;
 		setTimer(wait);
 	}
 
@@ -222,7 +230,6 @@ function createClaimLoop<T>(spec: LoopSpec<T>): ClaimWorker<T> {
 				again = false;
 				const free = concurrency - inFlight;
 				if (free <= 0) return; // the end of an execution calls pass()
-				lastClaimAt = now();
 				wakePending = false;
 				const items = await spec.claim(free, remainingMs);
 				// The backoff resets only once the whole pass succeeded: a failing nextDueInMs

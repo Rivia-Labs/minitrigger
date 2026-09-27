@@ -11,6 +11,7 @@ import {
 	type PgSystemJob,
 	type QueueWorkerOptions,
 	type SystemWorkerOptions,
+	WAKE_BURST,
 } from "../../src/pg/workers.js";
 import type {
 	ClaimRunsInput,
@@ -264,9 +265,6 @@ describe("queue worker", () => {
 		c.holdClaims(undefined);
 		gate.resolve();
 		await flush();
-		// Not before MIN_WAKE_INTERVAL_MS after the previous claim started (review 5, A5).
-		expect(c.calls).toHaveLength(1);
-		await vi.advanceTimersByTimeAsync(MIN_WAKE_INTERVAL_MS);
 		expect(c.calls).toHaveLength(2);
 		// ...and then it sleeps normally (no busy loop).
 		await vi.advanceTimersByTimeAsync(999);
@@ -274,7 +272,7 @@ describe("queue worker", () => {
 		worker.stopClaiming();
 	});
 
-	it("a wake flood is spaced by MIN_WAKE_INTERVAL_MS; a wake after it claims at once (A5)", async () => {
+	it("a wake flood is rate limited (burst, then MIN_WAKE_INTERVAL_MS); a later wake claims at once (A5)", async () => {
 		const c = fakeClaim();
 		const p = controlledProcess();
 		const { worker } = queueWorker(c.claim, p.process, {
@@ -289,7 +287,9 @@ describe("queue worker", () => {
 			if (i % 10 === 9) await vi.advanceTimersByTimeAsync(1);
 		}
 		await vi.advanceTimersByTimeAsync(MIN_WAKE_INTERVAL_MS);
-		expect(c.calls.length).toBeLessThanOrEqual(1 + Math.ceil(115 / MIN_WAKE_INTERVAL_MS));
+		expect(c.calls.length).toBeLessThanOrEqual(
+			1 + WAKE_BURST + Math.ceil(115 / MIN_WAKE_INTERVAL_MS)
+		);
 		expect(c.calls.length).toBeGreaterThan(1);
 		// Quiet for longer than the interval: the next wake claims right away.
 		await vi.advanceTimersByTimeAsync(1_000);
