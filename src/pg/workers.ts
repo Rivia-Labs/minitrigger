@@ -167,8 +167,11 @@ function createClaimLoop<T>(spec: LoopSpec<T>): ClaimWorker<T> {
 	let timerAt: number | undefined;
 	/** GCRA theoretical arrival time of the next fruitless wake-triggered pass. */
 	let wakeTat = Number.NEGATIVE_INFINITY;
-	/** The next pass is the one a `wake()` asked for (charged to `wakeTat` if it claims nothing). */
-	let wakeCaused = false;
+	/**
+	 * `timer` dispatches a wake (the rate-limit delay, or an earlier timer that covers it): its
+	 * pass is charged to `wakeTat` if it claims nothing. Reset whenever `timer` is replaced.
+	 */
+	let timerByWake = false;
 	/** A `wake()` arrived while a pass was in progress. */
 	let wakePending = false;
 	let current: Promise<void> | undefined;
@@ -190,13 +193,20 @@ function createClaimLoop<T>(spec: LoopSpec<T>): ClaimWorker<T> {
 		}
 	}
 
-	function pass(): void {
+	/**
+	 * `byWake`: this pass dispatches a `wake()` (the rate-limited path). Only such a pass, or one
+	 * that absorbs a wake that arrived while another pass ran, is charged when fruitless; passes
+	 * of a freed slot, the poll timer or an `again` re-run are not.
+	 */
+	function pass(byWake = false): void {
 		if (!started || stopped) return;
 		if (current) {
-			again = true;
+			// A wake dispatched during a pass becomes the trailing wake pass.
+			if (byWake) wakePending = true;
+			else again = true;
 			return;
 		}
-		current = loop().finally(() => {
+		current = loop(byWake).finally(() => {
 			current = undefined;
 			if (stopped) return;
 			if (again) pass();
@@ -215,29 +225,29 @@ function createClaimLoop<T>(spec: LoopSpec<T>): ClaimWorker<T> {
 		const at = now();
 		const allowedAt = wakeTat - (WAKE_BURST - 1) * MIN_WAKE_INTERVAL_MS;
 		const wait = allowedAt - at;
-		wakeCaused = true;
-		// A timer that fires sooner already covers this wake.
-		if (wait > 0 && timer !== undefined && timerAt !== undefined && timerAt <= at + wait) return;
-		if (wait <= 0) {
-			clearTimeout(timer);
-			timer = undefined;
-			timerAt = undefined;
-			pass();
+		// A timer that fires sooner already covers this wake: its pass now dispatches it.
+		if (wait > 0 && timer !== undefined && timerAt !== undefined && timerAt <= at + wait) {
+			timerByWake = true;
 			return;
 		}
-		setTimer(wait);
+		if (wait <= 0) {
+			clearTimer();
+			pass(true);
+			return;
+		}
+		setTimer(wait, true);
 	}
 
-	async function loop(): Promise<void> {
-		const byWake = wakeCaused;
-		wakeCaused = false;
+	async function loop(dispatchedByWake: boolean): Promise<void> {
+		let byWake = dispatchedByWake;
 		const startedAt = now();
 		let queried = false;
 		let claimed = 0;
 		try {
 			await claimPass(
-				() => {
+				absorbedWake => {
 					queried = true;
+					if (absorbedWake) byWake = true;
 				},
 				n => {
 					claimed += n;
@@ -251,7 +261,10 @@ function createClaimLoop<T>(spec: LoopSpec<T>): ClaimWorker<T> {
 		}
 	}
 
-	async function claimPass(onQuery: () => void, onClaimed: (n: number) => void): Promise<void> {
+	async function claimPass(
+		onQuery: (absorbedWake: boolean) => void,
+		onClaimed: (n: number) => void
+	): Promise<void> {
 		/** A row already due after the claim is claimed once more right away (review 5, A3). */
 		let reclaimed = false;
 		try {
@@ -259,8 +272,10 @@ function createClaimLoop<T>(spec: LoopSpec<T>): ClaimWorker<T> {
 				again = false;
 				const free = concurrency - inFlight;
 				if (free <= 0) return; // the end of an execution calls pass()
+				// This claim serves a wake that arrived during the pass: it is a wake pass now.
+				const absorbedWake = wakePending;
 				wakePending = false;
-				onQuery();
+				onQuery(absorbedWake);
 				const items = await spec.claim(free, remainingMs);
 				onClaimed(items.length);
 				// The backoff resets only once the whole pass succeeded: a failing nextDueInMs
@@ -315,7 +330,7 @@ function createClaimLoop<T>(spec: LoopSpec<T>): ClaimWorker<T> {
 				CLAIM_BACKOFF_MIN_MS * 2 ** Math.min(failures - 1, 6)
 			);
 			// Scheduled before logging: the retry never depends on the logger.
-			schedule(backoffMs);
+			schedule(backoffMs, true);
 			const at = now();
 			if (lastWarnAt === undefined || at - lastWarnAt >= CLAIM_WARN_INTERVAL_MS) {
 				lastWarnAt = at;
@@ -353,21 +368,42 @@ function createClaimLoop<T>(spec: LoopSpec<T>): ClaimWorker<T> {
 		active.add(entry);
 	}
 
-	function schedule(ms: number): void {
+	/**
+	 * The loop's own sleep. A pending wake timer that fires sooner is kept (its pass is the wake's
+	 * and schedules its own sleep); a later one is replaced and the new timer carries the wake.
+	 * `backoff` always replaces it and drops the wake: nothing bypasses a claim backoff.
+	 */
+	function schedule(ms: number, backoff = false): void {
 		const jitter = spec.polling.jitterMs > 0 ? Math.floor(random() * spec.polling.jitterMs) : 0;
-		setTimer(ms + jitter);
+		const delay = Math.min(ms + jitter, MAX_TIMER_MS);
+		if (!backoff && timer !== undefined && timerByWake) {
+			if (timerAt !== undefined && timerAt <= now() + delay) return;
+			setTimer(delay, true);
+			return;
+		}
+		setTimer(delay);
 	}
 
-	function setTimer(requestedMs: number): void {
+	function clearTimer(): void {
+		clearTimeout(timer);
+		timer = undefined;
+		timerAt = undefined;
+		timerByWake = false;
+	}
+
+	function setTimer(requestedMs: number, byWake = false): void {
 		if (stopped) return;
 		// `intervalMs + jitter` can exceed the setTimeout limit; Node would fire after 1 ms.
 		const ms = Math.min(requestedMs, MAX_TIMER_MS);
-		clearTimeout(timer);
+		clearTimer();
 		timerAt = now() + ms;
+		timerByWake = byWake;
 		timer = setTimeoutFn(() => {
+			const dispatchesWake = timerByWake;
 			timer = undefined;
 			timerAt = undefined;
-			pass();
+			timerByWake = false;
+			pass(dispatchesWake);
 		}, ms);
 		timer.unref?.();
 	}
@@ -402,9 +438,7 @@ function createClaimLoop<T>(spec: LoopSpec<T>): ClaimWorker<T> {
 		},
 		stopClaiming() {
 			stopped = true;
-			clearTimeout(timer);
-			timer = undefined;
-			timerAt = undefined;
+			clearTimer();
 		},
 		async drain(timeoutMs) {
 			const deadline = now() + timeoutMs;

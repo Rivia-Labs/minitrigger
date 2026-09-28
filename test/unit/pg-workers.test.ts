@@ -387,6 +387,48 @@ describe("queue worker", () => {
 		worker.stopClaiming();
 	});
 
+	it("only the wake-dispatched pass is charged, not a slot-freed pass that runs before it", async () => {
+		const c = fakeClaim();
+		c.backlog.push(run("r1"));
+		const p = controlledProcess();
+		const { worker } = queueWorker(c.claim, p.process, {
+			concurrency: 2,
+			polling: { intervalMs: 60_000, jitterMs: 0 },
+		});
+		worker.start();
+		await flush();
+		expect(worker.inFlight).toBe(1);
+		// t0: exhaust the burst with empty wake passes.
+		for (let i = 0; i < WAKE_BURST; i++) {
+			worker.wake();
+			await flush();
+		}
+		const exhausted = c.calls.length;
+		// A further wake is delayed by the rate limit: a timer is pending.
+		worker.wake();
+		await flush();
+		expect(c.calls).toHaveLength(exhausted);
+		// A run ends: its slot-freed pass claims (nothing) now. It is not the wake's pass.
+		p.finish("r1");
+		await flush();
+		expect(c.calls).toHaveLength(exhausted + 1);
+		// The wake's own pass still runs when the limit allows it (t0 + interval).
+		await vi.advanceTimersByTimeAsync(MIN_WAKE_INTERVAL_MS);
+		expect(c.calls).toHaveLength(exhausted + 2);
+		// t0 + 2 intervals: had the slot-freed pass been charged, this wake would wait.
+		await vi.advanceTimersByTimeAsync(MIN_WAKE_INTERVAL_MS);
+		worker.wake();
+		await flush();
+		expect(c.calls).toHaveLength(exhausted + 3);
+		// ...and the fruitless timer pass was charged: the next wake right now waits.
+		worker.wake();
+		await flush();
+		expect(c.calls).toHaveLength(exhausted + 3);
+		await vi.advanceTimersByTimeAsync(MIN_WAKE_INTERVAL_MS);
+		expect(c.calls).toHaveLength(exhausted + 4);
+		worker.stopClaiming();
+	});
+
 	it("wake() while sleeping claims right away and cancels the pending sleep", async () => {
 		const c = fakeClaim();
 		const p = controlledProcess();
