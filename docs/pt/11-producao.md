@@ -30,6 +30,20 @@ configuração — quem trata `ConfigError` como fatal ainda deve tentar `start(
 causa provável (checar `maxclients`/`CLIENT LIST` ou a rede) em vez de travar; corrija e chame
 `start()` de novo.
 
+Logo depois do `PING`, o Postgres recebe a mesma checagem (nos dois transportes): um banco
+inacessível rejeita com `MinitriggerError` ("cannot reach Postgres", com o erro do driver em
+`cause`) dentro de `pool.connectionTimeoutMs` (padrão 10 s; para um pool injetado, o
+`connectionTimeoutMillis` dele quando definido), nunca o erro cru do `pg`. Um pool injetado sem
+`connectionTimeoutMillis` fica com uma vaga presa pela tentativa de conexão abandonada até o SO
+desistir dela (o `pg-pool` não consegue cancelar um connect pendente): configure
+`connectionTimeoutMillis` nos pools que você injeta, ou um pool injetado pequeno pode continuar
+fazendo o `start()` falhar mesmo com o banco no ar. A mensagem distingue as duas causas: quando a
+checagem nunca conseguiu nenhuma conexão porque o pool já estava em `max` ou tinha checkouts na
+fila, ela diz isso explicitamente ("...every connection of the pool (max N) stayed busy...") em
+vez de dar a entender que o Postgres está inacessível — confira o que mais segura as conexões do
+pool antes de assumir que o banco caiu. Detalhes completos (inclusive o equivalente no modo
+Postgres) em [14. Modo Postgres](14-modo-postgres.md#conexões-por-engine).
+
 ## Dimensionamento do pool
 
 O pool precisa de `max >= concorrência total dos workers + 5` (as próprias queries de bookkeeping
@@ -251,7 +265,14 @@ reenfileira toda run a partir de Postgres dentro de aproximadamente
   Redis no `createEngine()`: a primeira conexão abre no primeiro uso (tipicamente `engine.start()`,
   ou um `trigger()`/`runs.subscribe()` mais cedo, num engine só de disparo que nunca chama
   `start()`). Uma string de conexão malformada ou um Redis inacessível agora aparece como erro
-  dessa primeira chamada, não do `createEngine()` em si.
+  dessa primeira chamada, não do `createEngine()` em si. `runs.cancel()` e `tokens.complete()`
+  também contam como "primeiro uso": num engine só de disparo, agora carregam o backend (abrindo o
+  Redis) e leem a guarda de transporte misto (ver abaixo) já na primeira chamada, mesmo quando o id
+  da run/token não resolve para nada — qualquer UUID bem formado paga esse custo antes da consulta
+  que devolveria `"not_found"`.
+- **`start()` bounded no alcance do Postgres, nos dois transportes** — ver a seção acima e
+  [14. Modo Postgres](14-modo-postgres.md#conexões-por-engine). A mensagem agora distingue "pool
+  ocupado" de "Postgres inacessível".
 - **Debounce com `transport: "postgres"`: uma run pendente já vencida deixa de absorver
   triggers** — ver [07. Filas](07-filas.md#debounce). `transport: "bullmq"` não muda em relação a
   0.3.x: uma run debounced continua colapsável até um worker de fato adquiri-la, não importa
@@ -261,9 +282,14 @@ reenfileira toda run a partir de Postgres dentro de aproximadamente
   Resumo: `schema_meta` (nova nesta migration) passa a gravar qual transporte um schema usa, e um
   `start()` com o outro transporte no mesmo schema é `ConfigError`. Engines que nunca chamam
   `start()` (produtores só de disparo) só leem o marcador e recusam suas escritas com o mesmo
-  `ConfigError`. Engines em 0.3.x e anteriores
-  nunca gravaram esse marcador, então mover um schema existente para `transport: "postgres"` exige
-  atualizar todo engine dele para 0.4.0+ primeiro (procedimento completo na seção linkada).
+  `ConfigError` — inclusive `runs.cancel`/`tokens.complete` em qualquer id bem formado, mesmo um
+  que não resolva para uma run/token, e `trigger(..., { tx })`, cuja leitura passa pela sua própria
+  transação (conceda `SELECT` em `<schema>.schema_meta` para a role de `tx`, ou essa checagem é
+  silenciosamente pulada em vez de abortar sua transação com um erro de permissão — ver
+  [06. Outbox transacional](06-outbox.md#guarda-de-modo-misto-no-caminho-tx)). Engines em 0.3.x e
+  anteriores nunca gravaram esse marcador, então mover um schema existente para
+  `transport: "postgres"` exige atualizar todo engine dele para 0.4.0+ primeiro (procedimento
+  completo na seção linkada).
 - **Checar tipos com `skipLibCheck: false` pode exigir `@types/node`.** O próprio `.d.ts` do `pg`
   (já necessário via o peer opcional `@types/pg`) referencia tipos do Node; com `skipLibCheck:
   false` eles também são checados, não só ignorados. O próprio `scripts/check-pack.mjs`, na sua

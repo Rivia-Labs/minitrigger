@@ -7,9 +7,21 @@ the SQL shape it must use. `$schema` is always `escapeIdentifier(schema)`.
 ## Global rules
 
 - **Atomicity.** Every method is atomic. On `Store` (pool), a multi-statement method takes one
-  client and runs `BEGIN ... COMMIT` (ROLLBACK + rethrow on error, always `release()`). On `StoreTx`
-  it runs inside the caller's transaction. Only `runs.create` needs partial rollback: inside a
-  `StoreTx` it uses `SAVEPOINT`/`ROLLBACK TO SAVEPOINT`. `withTransaction` does not nest.
+  client and runs `BEGIN ... COMMIT` (ROLLBACK + rethrow on error). On `StoreTx` it runs inside the
+  caller's transaction. Only `runs.create` needs partial rollback: inside a `StoreTx` it uses
+  `SAVEPOINT`/`ROLLBACK TO SAVEPOINT`. `withTransaction` does not nest.
+- **Client release after a failed transaction is not always plain `release()`** (review 5 A7):
+  `atomic()` (`src/store/sql/db.ts`) and `boundedClaim()` (`src/store/sql/claim.ts`, the claim
+  transaction shared by `RunClaimStore.claimRuns` and `SystemJobStore.claim` in the Postgres
+  transport) both go through `releaseAfterRollback(release, err, rolledBack)`: a client whose
+  `ROLLBACK` succeeded after a server-reported statement-level error (constraint violation,
+  division by zero, the claim's own `statement_timeout`) is in sync and goes back to the pool
+  plain; a client is instead destroyed (`release(err)`) whenever the `ROLLBACK` itself failed, the
+  error never reached the server at all (a socket/protocol failure), or the server error's SQLSTATE
+  is connection-ending — class `57P*` (admin/crash shutdown, cannot connect now) or `08*`
+  (connection exception) — or its severity is `FATAL`/`PANIC`. `severity` is `pg`'s localized
+  field (`lc_messages`); the SQLSTATE class check does not depend on the server's language.
+  Destroying on every server error churned connections under contention; this is the fix.
 - **Isolation** READ COMMITTED. Correctness comes from row locks.
 - **Lock order** (no deadlocks between cancel, which goes top-down, and child completion, which
   goes bottom-up): parent run → run → descendants (level by level, `ORDER BY id`) → waitpoint

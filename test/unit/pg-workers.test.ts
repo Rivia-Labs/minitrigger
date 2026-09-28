@@ -323,6 +323,51 @@ describe("queue worker", () => {
 		worker.stopClaiming();
 	});
 
+	it("review 6 fix round 1: a sustained wake flood is pinned to burst + elapsed / MIN_WAKE_INTERVAL_MS", async () => {
+		const c = fakeClaim();
+		const p = controlledProcess();
+		const times: number[] = [];
+		const inner = c.claim.claimRuns.getMockImplementation();
+		c.claim.claimRuns.mockImplementation(async (input: ClaimRunsInput) => {
+			times.push(Date.now());
+			return (inner as (i: ClaimRunsInput) => Promise<RunRecord[]>)(input);
+		});
+		const { worker } = queueWorker(c.claim, p.process, {
+			polling: { intervalMs: 60_000, jitterMs: 0 },
+		});
+		worker.start();
+		await flush();
+		times.length = 0;
+		const start = Date.now();
+		// A wake every millisecond for 3 s: every pass is fruitless (the backlog stays empty).
+		const FLOOD_MS = 3_000;
+		for (let ms = 0; ms < FLOOD_MS; ms++) {
+			worker.wake();
+			worker.wake();
+			await vi.advanceTimersByTimeAsync(1);
+		}
+		// Upper bound at every point of the flood, not only at its end.
+		for (let i = 0; i < times.length; i++) {
+			const elapsed = (times[i] ?? 0) - start;
+			expect(i + 1, `claim #${i + 1} at ${elapsed} ms`).toBeLessThanOrEqual(
+				WAKE_BURST + Math.floor(elapsed / MIN_WAKE_INTERVAL_MS) + 1
+			);
+		}
+		// The same rate over every span of the flood (GCRA: one gap may be shorter than the
+		// interval, e.g. after a pass that ran 1 ms late, but no span beats the rate + burst).
+		for (let i = 0; i < times.length; i++) {
+			for (let j = i + 1; j < times.length; j++) {
+				const span = (times[j] ?? 0) - (times[i] ?? 0);
+				expect(j - i + 1, `claims #${i + 1}..#${j + 1} within ${span} ms`).toBeLessThanOrEqual(
+					WAKE_BURST + Math.floor(span / MIN_WAKE_INTERVAL_MS) + 1
+				);
+			}
+		}
+		// And the limiter does not starve the flood either: about one pass per interval.
+		expect(times.length).toBeGreaterThanOrEqual(Math.floor(FLOOD_MS / MIN_WAKE_INTERVAL_MS) - 2);
+		worker.stopClaiming();
+	});
+
 	it("wakes whose pass claims work never spend the rate limit: each claims at once", async () => {
 		const c = fakeClaim();
 		const p = controlledProcess();

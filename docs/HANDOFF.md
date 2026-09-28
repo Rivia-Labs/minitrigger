@@ -10,7 +10,8 @@ os registros da quinta revisão externa e desta rodada de pontos deixados ficam 
 
 ## Estado atual
 
-- **Fases 1 a 10 concluídas.** `pnpm check:pack` ok (última vez rodado); `examples/basic` roda de ponta a ponta.
+- **Fases 1 a 11 concluídas** (fase 11 — transporte Postgres, decisão 28 — mesclada na `main` local,
+  ver abaixo). `pnpm check:pack` ok (última vez rodado); `examples/basic` roda de ponta a ponta.
 - **Terceira revisão externa (2026-09-25):** aplicada e commitada (ver `CLAUDE.md`, "Terceira
   revisão externa"); testes novos em `test/{unit,integration}/review3-{engine,io}.test.ts`.
 - **Quarta revisão externa (2026-09-25):** aplicada e commitada (testes em
@@ -48,6 +49,16 @@ os registros da quinta revisão externa e desta rodada de pontos deixados ficam 
   passando + 14 pulados** (1872 coletados) em `unit`+`integration`, 3 no `flushall`; `check:pack`
   PASS (inclusive o diretório sem Redis). Arquivos de teste alterados (`pg-engine`,
   `pg-db-unreachable`) 3× seguidas verdes.
+- **Verificação completa (2026-09-28, revisão 6, branch `chore/review6`):** `pnpm typecheck && pnpm
+  lint && pnpm test` verde — **124 arquivos**, **1879 testes passando + 14 pulados** (1893
+  coletados) em `unit`+`integration`, mais **3 testes passando** no projeto `flushall` isolado. O
+  bloco de código da revisão 6 (guarda de modo misto no caminho `tx` sem tocar o pool, `release()`
+  depois de rollback que não confia mais na severidade localizada, mensagem de `AggregateError`
+  legível, limite de vazão do teste de inundação de `NOTIFY` independente do tempo — ver
+  `.superpowers/review5/review6-code-report.md`) já estava commitado antes desta rodada de docs;
+  esta rodada só mexeu em documentação/higiene/empacotamento (README, `docs/pt/*`, `docs/SPEC.md`
+  §4, `docs/store-contract.md`, `skills/*`, `.claude-plugin/*.json`, `.gitignore`,
+  `tsup.config.ts`).
 
 ### O que existe (resumo)
 
@@ -167,8 +178,15 @@ transporte nesta sessão (números na tabela do `CLAUDE.md`, consistentes com os
 **Estado depois do merge (2026-09-28):**
 
 - **Mesclado** na `main` local (`79c0082`) depois da quinta revisão externa, com a emenda da
-  decisão 16 (`7643404`). **Falta (depende do dono):** push de `main` para `origin` e publicação da
-  0.4.0 (subir `version`, `pnpm check:pack`, tag, release/npm).
+  decisão 16 (`7643404`). `package.json` já está em `0.4.0` (não falta subir a versão). **Falta
+  (depende do dono, aprovação já dada em 2026-09-28 para o `npm publish`):**
+  1. Push de `main` (com `chore/review6` e qualquer outro branch pendente mesclado nela) para
+     `origin`.
+  2. `pnpm check:pack` uma última vez contra o HEAD que vai ser publicado.
+  3. Tag `v0.4.0` (`git tag v0.4.0 && git push origin v0.4.0`).
+  4. GitHub Release com o `.tgz` gerado por `pnpm pack` anexado (como em v0.1.0/v0.2.0/v0.3.0).
+  5. `npm publish` — exige `npm login` na conta com acesso a `@rivia-labs/minitrigger`
+     (`publishConfig.access: "public"`, já configurado no `package.json`).
 - **Pendências pós-revisão final resolvidas (2026-09-26):** os dois "minor (deferred)" das Tasks 9
   e 12 e as cinco pendências da revisão final (claim com `statement_timestamp()` e limitado pelo
   prazo do dreno, re-checagem que falha devolve a run com backoff, `reconnectNow()` do listener,

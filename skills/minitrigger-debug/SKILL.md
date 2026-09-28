@@ -1,6 +1,6 @@
 ---
 name: minitrigger-debug
-description: Diagnose minitrigger (durable tasks/workflows on BullMQ + Redis + Postgres) problems in a running project - runs stuck queued/running/waiting, jobs not running, run stuck, duplicate run, a run executed twice, NonDeterminismError or DuplicateStepError in production, TaskNotRegisteredError, schedule not firing, queue paused unexpectedly, outbox backlog growing, no leader/reconciler running. Use when the user reports that background runs are not progressing, are slow, duplicated, or failing.
+description: Diagnose minitrigger (durable tasks/workflows on Postgres, plus BullMQ + Redis unless the project uses transport: "postgres") problems in a running project - runs stuck queued/running/waiting, jobs not running, run stuck, duplicate run, a run executed twice, NonDeterminismError or DuplicateStepError in production, TaskNotRegisteredError, schedule not firing, queue paused unexpectedly, outbox backlog growing, no leader/reconciler running. Use when the user reports that background runs are not progressing, are slow, duplicated, or failing.
 allowed-tools: "Bash(psql *) Bash(docker compose exec *) Read Grep Glob"
 ---
 

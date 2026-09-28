@@ -4,10 +4,11 @@
  * a dynamic `import()`) must be able to use them without pulling Redis in.
  */
 
-import type { ClientConfig, Pool, PoolClient } from "pg";
+import { type ClientConfig, escapeIdentifier, type Pool, type PoolClient } from "pg";
 import { DEFAULTS, derivePoolMax, type ResolvedConfig } from "../config.js";
 import { ConfigError, MinitriggerError } from "../errors.js";
 import type { ResolvedQueue } from "../registry.js";
+import type { SqlQueryable } from "../store/sql/db.js";
 import type { SqlStore } from "../store/sql/index.js";
 import type { BackendContext } from "./types.js";
 
@@ -74,7 +75,7 @@ export async function assertPostgresReachable(pool: Pool, timeoutMs: number): Pr
 	try {
 		reached = await withTimeout(probe, timeoutMs);
 	} catch (error) {
-		const reason = error instanceof Error ? error.message : String(error);
+		const reason = describeDriverError(error);
 		throw new MinitriggerError(
 			`cannot reach Postgres (${reason}); check config.postgres (host, port, credentials) ` +
 				"and that Postgres accepts connections, then call start() again",
@@ -102,6 +103,22 @@ export async function assertPostgresReachable(pool: Pool, timeoutMs: number): Pr
 			"injected pool's connectionTimeoutMillis); check config.postgres and that Postgres " +
 			"answers, then call start() again"
 	);
+}
+
+/**
+ * Review 6 L2: a readable reason for a connect/query failure. Node's happy-eyeballs connect
+ * (`localhost` resolving to ::1 and 127.0.0.1) rejects with an `AggregateError` whose own message
+ * is empty: use its `code` and first inner error instead.
+ */
+export function describeDriverError(error: unknown): string {
+	if (!(error instanceof Error)) return String(error);
+	if (error.message) return error.message;
+	const code = (error as { code?: unknown }).code;
+	const inner = error instanceof AggregateError ? error.errors[0] : undefined;
+	const innerMessage =
+		inner instanceof Error ? describeDriverError(inner) : inner === undefined ? "" : String(inner);
+	const parts = [typeof code === "string" ? code : "", innerMessage].filter(p => p !== "");
+	return parts.length > 0 ? parts.join(": ") : error.name;
 }
 
 /**
@@ -137,12 +154,21 @@ export function createSchemaTransportGuard(
 	store: Pick<SqlStore, "meta">,
 	resolved: Pick<ResolvedConfig, "schema" | "transport">,
 	now: () => number = Date.now
-): () => Promise<void> {
+): (tx?: SqlQueryable) => Promise<void> {
 	let settled: { ok: true } | { ok: false; mode: string } | undefined;
 	let unsetUntil = 0;
 	let reading: Promise<void> | undefined;
+	const table = `${escapeIdentifier(resolved.schema)}.${escapeIdentifier("schema_meta")}`;
 
-	async function read(): Promise<void> {
+	function record(mode: string | null): void {
+		if (mode === null) {
+			unsetUntil = now() + SCHEMA_TRANSPORT_UNSET_RECHECK_MS;
+			return;
+		}
+		settled = mode === resolved.transport ? { ok: true } : { ok: false, mode };
+	}
+
+	async function readViaPool(): Promise<void> {
 		let mode: string | null;
 		try {
 			mode = await store.meta.get("transport");
@@ -153,19 +179,49 @@ export function createSchemaTransportGuard(
 			if ((error as { code?: unknown } | null)?.code !== UNDEFINED_TABLE) throw error;
 			mode = null;
 		}
-		if (mode === null) {
-			unsetUntil = now() + SCHEMA_TRANSPORT_UNSET_RECHECK_MS;
-			return;
-		}
-		settled = mode === resolved.transport ? { ok: true } : { ok: false, mode };
+		record(mode);
 	}
 
-	return async () => {
+	/**
+	 * Review 6 M1: on the `tx` path the marker is read through the caller's client -- the 0.3.x
+	 * `tx` trigger never needed a pool connection, and a caller holding the only one of an
+	 * injected pool would otherwise wait for `connectionTimeoutMillis` (forever without one). Two
+	 * statements that cannot fail on a missing table (a failed statement would abort the caller's
+	 * transaction): `to_regclass` first, the key only when the table exists. No `SET`.
+	 * Review 6 fix round 1: the first statement also checks the caller's role may read the table
+	 * (`has_table_privilege` only runs once `to_regclass` found it, so it cannot raise on a missing
+	 * table): a least-privilege role without SELECT on `schema_meta` would get 42501 on the read,
+	 * which aborts the caller's transaction. No privilege = an absent marker (write allowed,
+	 * re-read after the same 30 s).
+	 */
+	async function readViaTx(tx: SqlQueryable): Promise<void> {
+		const exists = await tx.query(
+			`SELECT CASE WHEN to_regclass($1::text) IS NULL THEN false
+			 ELSE has_table_privilege($1::text, 'SELECT') END AS present`,
+			[table]
+		);
+		const present = (exists.rows[0] as { present?: unknown } | undefined)?.present;
+		if (present !== true && present !== "t") {
+			record(null);
+			return;
+		}
+		const { rows } = await tx.query(`SELECT value FROM ${table} WHERE key = $1`, ["transport"]);
+		const value = (rows[0] as { value?: unknown } | undefined)?.value;
+		record(typeof value === "string" ? value : null);
+	}
+
+	return async (tx?: SqlQueryable) => {
 		if (!settled && now() >= unsetUntil) {
-			reading ??= read().finally(() => {
-				reading = undefined;
-			});
-			await reading;
+			if (tx !== undefined) {
+				// Never joins a pool read in flight: that one may be waiting for the connection the
+				// caller holds.
+				await readViaTx(tx);
+			} else {
+				reading ??= readViaPool().finally(() => {
+					reading = undefined;
+				});
+				await reading;
+			}
 		}
 		// A fresh error per throw, so its stack points at this caller.
 		if (settled && !settled.ok) throw mixedModeError(resolved, settled.mode);

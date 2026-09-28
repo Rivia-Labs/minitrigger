@@ -87,6 +87,11 @@ describe("review 5 B1: mixed-mode guard on a trigger-only engine", () => {
 				.trigger(task, undefined, { tx: client })
 				.catch((e: unknown) => e);
 			expect(txError).toBeInstanceOf(ConfigError);
+			// Review 6 L4: the refusal leaves the caller's transaction usable (an aborted one would
+			// reject this with 25P02).
+			await expect(client.query("SELECT 1 AS one")).resolves.toMatchObject({
+				rows: [{ one: 1 }],
+			});
 			await client.query("ROLLBACK");
 		} finally {
 			client.release();
@@ -144,6 +149,25 @@ describe("review 5 B1: mixed-mode guard on a trigger-only engine", () => {
 			reason: "not_found",
 		});
 		expect(await runCount(nsNoMeta)).toBe(2);
+	});
+
+	it("review 6 L4: runs.replay, queues.resume and schedules.delete are guarded too", async () => {
+		const producer = engineFor("postgres", nsPg);
+		const handle = await producer.trigger(task, undefined);
+		const engine = engineFor("bullmq", nsPg);
+		const before = await runCount(nsPg);
+		// The mixed-mode refusal itself (mixedModeError), not some other ConfigError.
+		const mixed = /used by engines with transport "postgres"; mixed transports/;
+		for (const call of [
+			() => engine.runs.replay(handle.id),
+			() => engine.queues.resume(queue),
+			() => engine.schedules.delete("s1"),
+		]) {
+			const error = await call().catch((e: unknown) => e);
+			expect(error).toBeInstanceOf(ConfigError);
+			expect((error as Error).message).toMatch(mixed);
+		}
+		expect(await runCount(nsPg)).toBe(before);
 	});
 
 	it("review fix 2: runs.cancel and runs.cancelMany are guarded too", async () => {

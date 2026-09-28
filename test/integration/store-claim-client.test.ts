@@ -71,6 +71,20 @@ describe("client reuse after a statement error (A7)", () => {
 		expect(removed - before).toBe(0);
 	});
 
+	it("review 6 L4: a non-server error inside atomic() destroys the client", async () => {
+		await settle();
+		const before = removed;
+		const bug = new Error("thrown by the callback, not by Postgres");
+		await expect(
+			atomic({ kind: "pool", pool }, async db => {
+				await db.query("SELECT 1");
+				throw bug;
+			})
+		).rejects.toBe(bug);
+		await settle();
+		expect(removed - before).toBe(1);
+	});
+
 	it("a connection error still destroys the client", async () => {
 		await settle();
 		const before = removed;

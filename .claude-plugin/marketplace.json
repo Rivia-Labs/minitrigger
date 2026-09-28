@@ -1,13 +1,13 @@
 {
   "name": "minitrigger",
   "owner": { "name": "igorabreu29" },
-  "description": "Claude Code plugin for adopting @rivia-labs/minitrigger (durable tasks/workflows on BullMQ + Redis + Postgres) in TypeScript/Node.js projects.",
+  "description": "Claude Code plugin for adopting @rivia-labs/minitrigger (durable tasks/workflows on Postgres, with BullMQ + Redis by default or Postgres alone via transport: \"postgres\") in TypeScript/Node.js projects.",
   "plugins": [
     {
       "name": "minitrigger",
       "source": "./",
       "description": "Setup, task authoring, outbox refactoring, testing and debugging skills for minitrigger.",
-      "version": "0.1.0",
+      "version": "0.4.0",
       "category": "development",
       "tags": ["bullmq", "postgres", "redis", "outbox", "durable-execution"]
     }

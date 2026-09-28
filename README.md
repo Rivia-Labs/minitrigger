@@ -422,6 +422,16 @@ try {
   `debounce` (it would lock the shared pending run until your transaction ends) and not supported
   by `createTestEngine` (`ConfigError`). The engine only runs parameterized, schema-qualified
   statements on your client — never `SET`, `LISTEN` or other session state.
+- **The mixed-transport guard is read through this same `tx` client**, never the pool, so it can't
+  compete for a connection your app might be holding all of (see the note in
+  [Pool sizing](#pool-sizing)): `to_regclass` first (safe even before migration 009 has run), then
+  `schema_meta.transport` itself only if the caller's role can read it. A mismatch throws
+  `ConfigError` and leaves your transaction usable — you decide whether to commit or roll back the
+  rest of it. **If the `tx` role has no `SELECT` on `<schema>.schema_meta`, this check is skipped
+  silently** (treated the same as no engine having recorded a transport yet: the write goes
+  through, and the marker is re-read after 30 s) instead of aborting your transaction with a
+  permission error — grant `SELECT` on `<schema>.schema_meta` to whatever role runs `tx` triggers
+  if you want the guard active on this path.
 - **Tuning.** `outbox.pollIntervalMs` (default 2 000, minimum 100), `outbox.batchSize` (default
   500, rows per `claimOutbox` statement, maximum 10 000) and `outbox.reconnectMaxMs` (default
   30 000, the LISTEN client's reconnect backoff cap, **minimum 500** — the backoff itself starts at
@@ -1429,7 +1439,16 @@ it("approves when the token resolves truthy", async () => {
   connection at `createEngine()` time — the first connection opens on first use (typically
   `engine.start()`, or an earlier `trigger()`/`runs.subscribe()` call on a trigger-only engine that
   never calls `start()`). A malformed `redis` connection string or an unreachable Redis now
-  surfaces as an error from that first call, not from `createEngine()` itself.
+  surfaces as an error from that first call, not from `createEngine()` itself. `runs.cancel()` and
+  `tokens.complete()` are also a "first use": on a trigger-only engine they now load the backend
+  (opening Redis) and read the mixed-transport guard (see below) on their very first call, even
+  when the run/token id turns out not to resolve to anything — any syntactically valid UUID pays
+  that cost before the `"not_found"` lookup runs.
+- **`start()`'s Postgres reachability check can now say "pool busy" instead of "unreachable".**
+  When the bounded check (see [Pool sizing](#pool-sizing) and
+  [Postgres-only mode](#postgres-only-mode)) never got a connection at all because the pool was
+  already at `max` or had checkouts queued, the `MinitriggerError` now says so explicitly instead
+  of implying Postgres itself is down — see the wording note in both sections below.
 - **Debounce with `transport: "postgres"`: a pending run already past its own due time no longer
   absorbs triggers** — see the note at the end of [Debounce](#debounce). `transport: "bullmq"` is
   unchanged from 0.3.x: a debounced run stays collapsible until a worker actually acquires it,
@@ -1438,9 +1457,16 @@ it("approves when the token resolves truthy", async () => {
   [Postgres-only mode](#postgres-only-mode). In short: `schema_meta` (new in this migration) now
   records which transport a schema is used with, and a `start()` with the other transport on the
   same schema is `ConfigError`. Engines that never call `start()` (trigger-only producers) only
-  read the marker, and refuse their writes with the same `ConfigError`. Engines on 0.3.x and
+  read the marker, and refuse their writes with the same `ConfigError` — including `runs.cancel`/
+  `tokens.complete` on any well-formed id, even one that doesn't resolve to a run/token, and
+  `trigger(..., { tx })`, whose read goes through your own transaction (grant `SELECT` on
+  `<schema>.schema_meta` to the `tx` role, or that path's check is silently skipped instead of
+  aborting your transaction on a permission error). Engines on 0.3.x and
   earlier never wrote that marker, so moving an existing schema to `transport: "postgres"` requires
   upgrading every engine on it to 0.4.0+ first (see the linked section for the full procedure).
+- **`start()`'s reachability check can now name a busy pool instead of an unreachable database**,
+  and a legitimate wake on `transport: "postgres"` can wait up to ~15 ms behind a `NOTIFY` flood —
+  see the notes in [Pool sizing](#pool-sizing) and [Postgres-only mode](#postgres-only-mode).
 - **Type-checking with `skipLibCheck: false` may need `@types/node`.** `pg`'s own `.d.ts` (already
   needed via the optional `@types/pg` peer) references Node core types; with `skipLibCheck: false`
   those get checked too, not just skimmed. `scripts/check-pack.mjs`'s own `skipLibCheck: false`
@@ -1665,7 +1691,10 @@ concern is specific to 005's two new indexes.
   the likely cause (check `maxclients`/`CLIENT LIST` or the network) instead of hanging; fix it
   and call `start()` again. Right after the `PING`, Postgres gets the same treatment: an
   unreachable database rejects with a `MinitriggerError` ("cannot reach Postgres", the driver
-  error as `cause`) within `pool.connectionTimeoutMs`, never the raw `pg` error.
+  error as `cause`) within `pool.connectionTimeoutMs`, never the raw `pg` error. When the check
+  never got a connection at all because the pool was already at `max` or had checkouts queued, the
+  message says so instead ("...every connection of the pool (max N) stayed busy...") — the
+  database itself may be fine; see [Pool sizing](#pool-sizing).
 - **Postgres is the source of truth.** `trigger()` does two non-atomic writes: insert the run in
   Postgres, then enqueue it in Redis. If the process dies between the two, the run exists but was
   never enqueued. This is recovered by the **reconciler**, which periodically re-enqueues
@@ -1836,7 +1865,12 @@ overhead. Outside what's listed below, the two transports are equivalent: same `
   earliest `run_after` and sleeps until then, capped at `polling.intervalMs` (default 1 000 ms,
   minimum 100) plus up to `polling.jitterMs` of jitter (default 50 ms, spreading out the thundering
   herd a burst of `NOTIFY`s would otherwise cause). So worst-case wake-up latency without `NOTIFY`
-  is bounded by `polling.intervalMs`, never indefinite.
+  is bounded by `polling.intervalMs`, never indefinite. Because the wake channel is untrusted input
+  (any role with `CONNECT` can `NOTIFY` it), incoming wakes that turn up nothing to claim are
+  rate-limited (a token bucket: a burst of 4, then one every 15 ms) so a `NOTIFY` flood can't spin
+  the claim loop — a legitimate wake arriving while a flood is in progress can wait up to that same
+  ~15 ms before its claim runs. Ordinary traffic (a real trigger, a token completing) is never
+  throttled: only wake-triggered passes that claimed nothing count against the limit.
 - **`globalConcurrency` is exact.** With a limit, the claim runs inside a short transaction that
   first takes a per-queue advisory lock, then counts the queue's `running` rows once — concurrent
   claims of the same queue serialize on that lock, so the `running` count across every process
@@ -1892,7 +1926,11 @@ called again once the database is back. BullMQ mode runs the same check right af
 `PING`. An injected pool without `connectionTimeoutMillis` still keeps one slot held by
 the abandoned connection attempt until the OS gives up on it (`pg-pool` cannot cancel a pending
 connect), so a small injected pool can keep failing `start()` in the meantime: set
-`connectionTimeoutMillis` on pools you inject. `stop()` resolves within its usual bounds with the database gone, whether `start()`
+`connectionTimeoutMillis` on pools you inject. The error message distinguishes the two causes: a
+pool that never handed out a connection at all because it was already at `max` or had checkouts
+queued says so explicitly ("...every connection of the pool (max N) stayed busy...") instead of
+implying Postgres itself is unreachable — check what else holds the pool's connections before
+assuming the database is down. `stop()` resolves within its usual bounds with the database gone, whether `start()`
 failed or the engine was running (a run it could not hand back stays `running` until another
 engine's stall recovery).
 
@@ -1960,7 +1998,18 @@ refuses the write with the same `ConfigError` when the schema belongs to the oth
 recorded mode is read once per engine. While no engine has recorded one yet (or the schema has no
 `schema_meta` table, not migrated to 009 yet), writes are allowed and the marker is read again at
 most every 30 s, so a producer can keep writing for up to 30 s after an engine of the other mode
-first starts on that schema.
+first starts on that schema. `runs.cancel`/`tokens.complete` pay this read (and, with
+`transport: "bullmq"`, load the backend — opening Redis on a trigger-only engine) on their very
+first call even when the run/token id turns out not to resolve to anything: any well-formed UUID
+reaches the guard before the `"not_found"` lookup runs.
+
+With `{ tx }`, the read goes through your own transaction instead of the pool (two read-only
+statements: `to_regclass`, then the marker itself) — see
+[Transactional trigger](#transactional-trigger-outbox). **A `tx` role without `SELECT` on
+`<schema>.schema_meta` gets no guard on that path**: the missing privilege is treated the same as
+an absent marker (write allowed, re-read after 30 s) rather than raising a permission error that
+would abort your transaction — grant `SELECT` on `<schema>.schema_meta` to whatever role runs
+`tx` triggers to keep the check active there too.
 
 **Engines on 0.3.x and earlier never write that marker** (it's new in migration 009). To move an
 existing schema from `"bullmq"` to `transport: "postgres"`:
