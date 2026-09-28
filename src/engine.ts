@@ -10,7 +10,7 @@ import { randomUUID } from "node:crypto";
 import { Pool } from "pg";
 import { createLazyBackend } from "./backends/lazy.js";
 import { createPostgresBackend } from "./backends/postgres.js";
-import { withTimeout } from "./backends/shared.js";
+import { createSchemaTransportGuard, withTimeout } from "./backends/shared.js";
 import type { BackendContext, BackendFactory, BackendRuntime } from "./backends/types.js";
 import {
 	assertTimerMs,
@@ -633,6 +633,12 @@ export interface EngineBackend {
 	 * subscriber; `start()` loads it in its first step. Absent: always loaded.
 	 */
 	load?(): Promise<void>;
+	/**
+	 * Review 5 item B1: awaited before every write that creates or re-enqueues a run (the same
+	 * points as `load`), also on an engine that never calls `start()`. `createEngine`: refuses a
+	 * schema whose `schema_meta.transport` is another mode (`ConfigError`). Absent: no check.
+	 */
+	beforeWrite?(): Promise<void>;
 }
 
 /** Lifecycle state owned by the engine wrapping the core. @internal */
@@ -857,6 +863,8 @@ export function createEngineCore(
 	 * `tokens.complete`, keep their best-effort enqueue; a stopping engine never starts a load).
 	 */
 	async function loadBackendForWrite(): Promise<void> {
+		// The mode guard first: a mismatch is refused before the (BullMQ) backend opens anything.
+		await backend.beforeWrite?.();
 		if (backend.load && !lifecycle.isShuttingDown()) await backend.load();
 	}
 	/**
@@ -1663,11 +1671,17 @@ export function createEngine(config: EngineConfig): Engine {
 			: createLazyBackend(backendContext, loadBullmqBackendFactory);
 	const { transport } = runtime;
 
-	const core = createEngineCore(resolved, registry, runtime.backend, {
-		isShuttingDown: () => shuttingDown,
-		assertNotStopped,
-		assertNotClosed,
-	});
+	// Review 5 item B1: a trigger-only engine never runs `start()`'s `assertSchemaTransport`.
+	const core = createEngineCore(
+		resolved,
+		registry,
+		{ ...runtime.backend, beforeWrite: createSchemaTransportGuard(store, resolved) },
+		{
+			isShuttingDown: () => shuttingDown,
+			assertNotStopped,
+			assertNotClosed,
+		}
+	);
 	boundCore = core;
 	const { deps, active, notifier, notifyStatus, abortLocal } = core;
 

@@ -40,12 +40,60 @@ export async function assertSchemaTransport(
 	resolved: Pick<ResolvedConfig, "schema" | "transport">
 ): Promise<void> {
 	const mode = await store.meta.setIfAbsent("transport", resolved.transport);
-	if (mode !== resolved.transport) {
-		throw new ConfigError(
-			`schema "${resolved.schema}" is used by engines with transport "${mode}"; mixed transports ` +
-				"on one schema are not supported (see docs/SPEC.md decision 28)"
-		);
+	if (mode !== resolved.transport) throw mixedModeError(resolved, mode);
+}
+
+/** How long "no engine recorded a transport yet" is trusted before the key is read again. */
+export const SCHEMA_TRANSPORT_UNSET_RECHECK_MS = 30_000;
+
+/**
+ * Review 5 item B1: the mixed-mode guard of {@link assertSchemaTransport}, for the write paths of
+ * an engine that may never call `start()` (a trigger-only producer). Reads `schema_meta.transport`
+ * -- never writes it, only `start()` does -- and throws the same `ConfigError` when another mode
+ * recorded it. A match or a mismatch is final (the key never changes), so it costs one query per
+ * engine; an absent key (no engine started yet) allows the write and is read again after
+ * {@link SCHEMA_TRANSPORT_UNSET_RECHECK_MS}; a failed read is not memoized (the write fails).
+ */
+export function createSchemaTransportGuard(
+	store: Pick<SqlStore, "meta">,
+	resolved: Pick<ResolvedConfig, "schema" | "transport">,
+	now: () => number = Date.now
+): () => Promise<void> {
+	let settled: { ok: true } | { ok: false; error: ConfigError } | undefined;
+	let unsetUntil = 0;
+	let reading: Promise<void> | undefined;
+
+	async function read(): Promise<void> {
+		const mode = await store.meta.get("transport");
+		if (mode === null) {
+			unsetUntil = now() + SCHEMA_TRANSPORT_UNSET_RECHECK_MS;
+			return;
+		}
+		settled =
+			mode === resolved.transport
+				? { ok: true }
+				: { ok: false, error: mixedModeError(resolved, mode) };
 	}
+
+	return async () => {
+		if (!settled && now() >= unsetUntil) {
+			reading ??= read().finally(() => {
+				reading = undefined;
+			});
+			await reading;
+		}
+		if (settled && !settled.ok) throw settled.error;
+	};
+}
+
+function mixedModeError(
+	resolved: Pick<ResolvedConfig, "schema" | "transport">,
+	mode: string
+): ConfigError {
+	return new ConfigError(
+		`schema "${resolved.schema}" is used by engines with transport "${mode}"; mixed transports ` +
+			"on one schema are not supported (see docs/SPEC.md decision 28)"
+	);
 }
 
 /**
