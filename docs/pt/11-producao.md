@@ -34,15 +34,18 @@ causa provável (checar `maxclients`/`CLIENT LIST` ou a rede) em vez de travar; 
 
 O pool precisa de `max >= concorrência total dos workers + 5` (as próprias queries de bookkeeping
 do engine precisam de folga além do que seus workers consomem; essa folga fixa de `+5` não vem de
-`systemConcurrency` — a conta é só `max(10, soma da concorrência das filas de task + 5)`, nunca
-soma a concorrência do worker `-system`, mesmo os dois tendo o mesmo valor padrão). Além do pool,
-todo engine **iniciado** segura **até duas** conexões dedicadas fora dele (eleição de líder e o
-`LISTEN` do outbox) — menos enquanto uma delas ainda está conectando ou em backoff depois de cair,
-e momentaneamente menos se uma delas falha ao (re)conectar —, então dimensione `max_connections`
+`systemConcurrency`). No modo BullMQ a conta é `max(10, soma da concorrência das filas de task +
+5)`, sem somar a concorrência do worker `-system` (os jobs dele rodam num worker do BullMQ e
+dividem a folga de `+5`). No modo Postgres o worker `-system` reivindica e roda seus jobs neste
+pool, então a conta é `max(10, soma da concorrência das filas de task + systemConcurrency + 5)`.
+Além do pool, todo engine **iniciado** segura **até duas** conexões dedicadas fora dele (eleição
+de líder e uma conexão `LISTEN`: a do outbox no modo BullMQ, a de wake/status/cancel no modo
+Postgres) — menos enquanto uma delas ainda está conectando ou em backoff depois de cair, e
+momentaneamente menos se uma delas falha ao (re)conectar —, então dimensione `max_connections`
 para `processos × (pool.max + 2)`. Um pool que o engine cria já recebe esse tamanho por padrão (no
-mínimo 10) e um `connectionTimeoutMillis` de 10 s (`pool.connectionTimeoutMs`). Se você aumentar
-`systemConcurrency` bem além do padrão, dimensione o `pool.max` por conta própria — o aviso do
-`start()` não considera isso.
+mínimo 10) e um `connectionTimeoutMillis` de 10 s (`pool.connectionTimeoutMs`). No modo BullMQ,
+se você aumentar `systemConcurrency` bem além do padrão, dimensione o `pool.max` por conta
+própria — o aviso do `start()` não considera isso.
 
 Se você injeta seu próprio `pg.Pool`, dimensione-o da mesma forma e configure um
 `connectionTimeoutMillis`: `start()` avisa quando ele é menor do que as filas iniciadas precisam ou
@@ -194,7 +197,10 @@ reenfileira toda run a partir de Postgres dentro de aproximadamente
   a entrada principal e `/testing` não importam mais nenhum dos dois estaticamente no carregamento
   do módulo; o backend BullMQ carrega sob demanda (`import()` dinâmico) na primeira vez que um
   engine realmente precisa dele. Se não estiverem instalados, esse primeiro uso (não o
-  `createEngine()` em si) lança `ConfigError` mandando instalar `bullmq` e `ioredis`.
+  `createEngine()` em si) lança `ConfigError` mandando instalar `bullmq` e `ioredis`. Isso inclui
+  `engine.schedules.upsert()`/`delete()`: o backend carrega depois da validação da entrada e antes
+  da escrita no Postgres, então um peer ausente é `ConfigError` sem nada gravado (e não uma linha
+  de schedule cujo scheduler do BullMQ nunca é criado).
 - **Cron agora é validado pelo próprio `cron-parser`**, não uma regex própria, em
   `defineTask({ schedule })` e `engine.schedules.upsert()`, nos dois transportes. `cron-parser`
   reconhece 5 ou 6 campos separados por espaço (um campo de segundos opcional no começo); **um
@@ -212,6 +218,9 @@ reenfileira toda run a partir de Postgres dentro de aproximadamente
     `@`, e padrões de 3–4 campos. Cuidado com estes: o `cron-parser` os preenche pela direita (os
     campos dados são os últimos: dia do mês/mês/dia da semana), então `* * 5` significa "a cada
     minuto às sextas", raramente o que se queria — escreva os 5 campos.
+  - **Continua rejeitado:** um padrão vazio ou só com espaços continua `ConfigError`, como na regex
+    antiga. O `cron-parser` sozinho leria `""` como "a cada minuto", então a biblioteca rejeita
+    antes de chamá-lo.
 - **`EngineConfig` virou uma união discriminada** por `transport`
   (`{ transport?: "bullmq"; redis; prefix?; outbox? } | { transport: "postgres"; polling? }`), então
   o compilador agora pega `redis`/`prefix`/`outbox` junto com `transport: "postgres"` (ou `polling`
@@ -250,7 +259,9 @@ reenfileira toda run a partir de Postgres dentro de aproximadamente
 - **Guarda de transporte misto, e mover um schema entre transportes** — ver
   [14. Modo Postgres](14-modo-postgres.md#guarda-de-modo-misto-e-mover-um-schema-entre-transportes).
   Resumo: `schema_meta` (nova nesta migration) passa a gravar qual transporte um schema usa, e um
-  `start()` com o outro transporte no mesmo schema é `ConfigError`. Engines em 0.3.x e anteriores
+  `start()` com o outro transporte no mesmo schema é `ConfigError`. Engines que nunca chamam
+  `start()` (produtores só de disparo) só leem o marcador e recusam suas escritas com o mesmo
+  `ConfigError`. Engines em 0.3.x e anteriores
   nunca gravaram esse marcador, então mover um schema existente para `transport: "postgres"` exige
   atualizar todo engine dele para 0.4.0+ primeiro (procedimento completo na seção linkada).
 - **Checar tipos com `skipLibCheck: false` pode exigir `@types/node`.** O próprio `.d.ts` do `pg`

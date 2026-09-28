@@ -64,8 +64,8 @@ you, release assets need GitHub authentication; download the tarball with the Gi
 with access to the repo) and add it from disk:
 
 ```bash
-gh release download v0.3.0 -R igorabreu29/minitrigger -p "*.tgz"
-pnpm add ./rivia-labs-minitrigger-0.3.0.tgz bullmq ioredis pg
+gh release download v0.4.0 -R igorabreu29/minitrigger -p "*.tgz"
+pnpm add ./rivia-labs-minitrigger-0.4.0.tgz bullmq ioredis pg
 pnpm add -D @types/pg   # optional, only needed if you use TypeScript
 ```
 
@@ -98,7 +98,7 @@ Needs git access to the repo (SSH key or a credential helper for HTTPS) — only
 repository is private; a public repo needs no auth for this.
 
 ```bash
-pnpm add github:igorabreu29/minitrigger#v0.3.0 bullmq ioredis pg
+pnpm add github:igorabreu29/minitrigger#v0.4.0 bullmq ioredis pg
 ```
 
 `dist/` is `.gitignore`d and only produced by minitrigger's own `prepare` script, and pnpm 10+
@@ -1374,7 +1374,10 @@ it("approves when the token resolves truthy", async () => {
   main entry and `/testing` no longer statically import either package; the BullMQ backend loads
   lazily (a dynamic `import()`) the first time an engine actually needs it. If they aren't
   installed, that first use (not `createEngine()` itself) throws `ConfigError` telling you to
-  install `bullmq` and `ioredis`.
+  install `bullmq` and `ioredis`. That includes `engine.schedules.upsert()`/`delete()`: the
+  backend is loaded after the input is validated and before the Postgres write, so a missing peer
+  is a `ConfigError` with nothing written (not a schedule row whose BullMQ scheduler silently
+  never gets created).
 - **Cron patterns are now validated by `cron-parser` itself**, not a hand-rolled regex, in both
   `defineTask({ schedule })` and `engine.schedules.upsert()`, in both transports. `cron-parser`
   recognizes 5 or 6 whitespace-separated fields (an optional leading seconds field); **a 7-field
@@ -1392,6 +1395,9 @@ it("approves when the token resolves truthy", async () => {
     `@` shortcuts, and 3–4 field patterns. Careful with the latter: `cron-parser` fills them from
     the right (the given fields are the last ones: day-of-month/month/day-of-week), so `* * 5`
     means "every minute on Fridays", which is rarely what was meant — write all 5 fields.
+  - **Still rejected:** an empty or whitespace-only pattern stays a `ConfigError`, as with the old
+    regex. `cron-parser` alone would read `""` as "every minute", so the library rejects it before
+    calling it.
 - **`EngineConfig` is now a discriminated union** on `transport`
   (`{ transport?: "bullmq"; redis; prefix?; outbox? } | { transport: "postgres"; polling? }`), so
   the compiler now catches `redis`/`prefix`/`outbox` paired with `transport: "postgres"` (or
@@ -1431,9 +1437,10 @@ it("approves when the token resolves truthy", async () => {
 - **Mixed-transport guard, and moving a schema between transports** — see
   [Postgres-only mode](#postgres-only-mode). In short: `schema_meta` (new in this migration) now
   records which transport a schema is used with, and a `start()` with the other transport on the
-  same schema is `ConfigError`. Engines on 0.3.x and earlier never wrote that marker, so moving an
-  existing schema to `transport: "postgres"` requires upgrading every engine on it to 0.4.0+
-  first (see the linked section for the full procedure).
+  same schema is `ConfigError`. Engines that never call `start()` (trigger-only producers) only
+  read the marker, and refuse their writes with the same `ConfigError`. Engines on 0.3.x and
+  earlier never wrote that marker, so moving an existing schema to `transport: "postgres"` requires
+  upgrading every engine on it to 0.4.0+ first (see the linked section for the full procedure).
 - **Type-checking with `skipLibCheck: false` may need `@types/node`.** `pg`'s own `.d.ts` (already
   needed via the optional `@types/pg` peer) references Node core types; with `skipLibCheck: false`
   those get checked too, not just skimmed. `scripts/check-pack.mjs`'s own `skipLibCheck: false`
@@ -1684,12 +1691,12 @@ concern is specific to 005's two new indexes.
 #### Pool sizing
 
 The pool needs `max >= total worker concurrency + 5` (the engine's own
-bookkeeping queries need headroom beyond what your workers consume; this fixed `+5` headroom is
-not derived from `systemConcurrency` — see the note below). On top of the pool, every **started**
-engine holds **up to two** dedicated Postgres connections outside it (leader election and the
-outbox `LISTEN`) — fewer while either is still connecting or backing off after a dropped
-connection, and momentarily fewer if one fails to (re)connect — so budget `max_connections` for
-`processes × (pool.max + 2)`. A pool the engine creates
+bookkeeping queries need headroom beyond what your workers consume), plus `systemConcurrency`
+with `transport: "postgres"` — see the note below. On top of the pool, every **started**
+engine holds **up to two** dedicated Postgres connections outside it (leader election, and the
+`LISTEN` connection: the outbox's in BullMQ mode, the wake/status/cancel one in Postgres mode) —
+fewer while either is still connecting or backing off after a dropped connection, and momentarily
+fewer if one fails to (re)connect — so budget `max_connections` for `processes × (pool.max + 2)`. A pool the engine creates
 gets that size by default (at least 10) and a 10 s `connectionTimeoutMillis`
 (`pool.connectionTimeoutMs`). If you inject your own `pg.Pool`, size it the same way and set a
 `connectionTimeoutMillis`: `start()` warns when it is smaller than the started queues need or
@@ -1697,13 +1704,16 @@ has no acquisition timeout (a heartbeat would then wait for a connection without
 failing with a warning). A separate, dedicated pool for the library is recommended over sharing
 your application's pool.
 
-The `+5` headroom above (`DEFAULTS.poolHeadroom`) is a fixed constant, not a count of
-`systemConcurrency`'s own queries: the recommended `pool.max` is `max(10, sum of task-queue
-concurrency + 5)`, computed only from your task queues' `concurrency` (`recommendedPoolMax` in
-`src/engine.ts`) — it never adds `systemConcurrency` (default `5`, the `-system` worker's own
-concurrency), even though the two numbers happen to match by default. If you raise
-`systemConcurrency` well above its default, size `pool.max` for that yourself; `start()`'s warning
-won't account for it.
+The `+5` headroom above is a fixed constant, not a count of `systemConcurrency`'s own queries.
+The recommended `pool.max` (the default of a pool the engine creates, and the threshold of
+`start()`'s warning) is:
+
+- `transport: "bullmq"`: `max(10, sum of task-queue concurrency + 5)`. It never adds
+  `systemConcurrency` (default `5`): the `-system` jobs run on a BullMQ worker, and their
+  Postgres queries share the `+5` headroom. If you raise `systemConcurrency` well above its
+  default, size `pool.max` for that yourself; the warning won't account for it.
+- `transport: "postgres"`: `max(10, sum of task-queue concurrency + systemConcurrency + 5)`. The
+  `-system` worker claims and runs its jobs against this pool, so its concurrency is counted.
 
 #### Redis connections per engine
 
@@ -1830,9 +1840,11 @@ overhead. Outside what's listed below, the two transports are equivalent: same `
   never exceeds the limit. No approximation, unlike relying on Redis-side counting under racing
   claims.
 - **The internal `-system` queue is a table, not a BullMQ queue.** `system_jobs` (migration 009)
-  holds waitpoint expirations, retention sweeps, cron ticks and reconciler runs, claimed the same
-  way (`SKIP LOCKED`) with a fencing token (`locked_by`): a worker whose lock expired can never
-  complete, delay or reschedule a row another worker has since reclaimed.
+  holds waitpoint expirations (`wp-<id>-expire`), retention sweeps (`retention-<window>`) and cron
+  ticks (`schedule-tick:<id>`), claimed the same way (`SKIP LOCKED`) with a fencing token
+  (`locked_by`): a worker whose lock expired can never complete, delay or reschedule a row another
+  worker has since reclaimed. The reconciler is not a job: the leader runs it inline on its own
+  timer (`reconciler.intervalMs`), as in BullMQ mode.
 - **Cron ticks never disappear on failure.** Instead of a BullMQ job scheduler, a schedule is one
   row (`schedule-tick:<id>`) that's *rewritten in place* to its next occurrence when the tick
   succeeds or exhausts its retries — never deleted and recreated — so there's no window where the
@@ -1866,6 +1878,14 @@ is still connecting or backing off after a dropped connection. Size `max_connect
 the same way and set a `connectionTimeoutMillis` — `start()` warns otherwise, same as in BullMQ
 mode.
 
+Postgres is this mode's only dependency, so its reachability plays the role of Redis's `PING` in
+BullMQ mode: with the database unreachable, `start()` rejects with a `MinitriggerError` ("cannot
+reach Postgres", the driver error as `cause`) after a few `pool.connectionTimeoutMs` at most,
+instead of hanging; nothing is left running, and `start()` can be called again once the database
+is back. `stop()` resolves within its usual bounds with the database gone, whether `start()`
+failed or the engine was running (a run it could not hand back stays `running` until another
+engine's stall recovery).
+
 ### PgBouncer
 
 A transaction-mode pooler breaks both dedicated connections this mode needs held open across
@@ -1874,20 +1894,36 @@ across transactions) and the leader's session-level advisory lock. `start()` run
 after connecting — a `NOTIFY` on the wake channel that must echo back to its own `LISTEN` within
 1 s — and only `warn`s if it doesn't ("notifications do not arrive... wake-up latency falls back to
 the poll"), so a pooler in front of these two connections doesn't fail `start()`; it just silently
-drops to poll-only wake-ups (and no leader, hence no reconciler/retention — see
-[No leader](#no-leader) below). Point the engine's `postgres` at a session-mode pool, or directly at
-Postgres, for millisecond wake-ups and a working leader election; ordinary claim/heartbeat/
+drops to poll-only wake-ups. Leader election breaks in a less obvious way: the session-level
+advisory lock stays on whichever server connection ran `pg_try_advisory_lock`, and an elector that
+won never checks the lock again. Another engine whose attempt the pooler routes to that same server
+connection also gets the lock (two leaders at once); the pooler recycling that server connection
+frees the lock while the first engine still believes it leads (another one can then win too); and
+an unlock or a closed client never reaches that server connection, so the lock can stay leaked (no
+leader until it is recycled). So expect duplicate or unstable leaders, and at times none (see
+[No leader](#no-leader) below), not a clean "no leader". No self-test detects this: point the
+engine's `postgres` at a session-mode pool, or directly at Postgres, for millisecond wake-ups and a
+working leader election; ordinary claim/heartbeat/
 completion queries through the main pool work fine behind a transaction-mode pooler either way
 (they're all single statements).
 
 ### `NOTIFY` visibility
 
 `pg_notify`/`LISTEN` only need `CONNECT` on the database — no extra grant for the application role.
-That also means **any role with `CONNECT` can `LISTEN`** on this mode's channels and see the
-`runId`s flowing through them (never payloads, outputs, or progress — every message on these
-channels carries only a bare id, and every subscriber re-reads Postgres before acting on one). If
-which run ids exist is itself sensitive in your setting, use a database dedicated to this engine
-rather than one shared with other roles/teams.
+That also means **any role with `CONNECT` can `LISTEN`** on this mode's channels (their names
+derive from the schema name, so they are easy to guess). What such a role sees: the `runId`s on the
+status and cancel channels, the **queue names** on the wake channel, and the **timing** of every
+enqueue, status change and cancel — never payloads, outputs, or progress (every message carries
+only a bare id or a queue name, and every subscriber re-reads Postgres before acting on one). If
+run ids, queue names or activity patterns are sensitive in your setting, use a database dedicated
+to this engine rather than one shared with other roles/teams.
+
+The same role can also `NOTIFY` on those channels. Wake and status notifications are only hints
+(a forged one costs a claim pass or a re-read; wake-triggered passes that claim nothing are
+rate-limited), and a forged cancel never aborts a run that isn't `canceled` in Postgres. The
+`start()` self-test is not authenticated either: its echo carries a random token, but a role that
+sees that token on the wake channel can send it back. A forged echo can only hide the "notifications
+do not arrive" warning; it never changes what the engine does.
 
 ### No leader
 
@@ -1906,6 +1942,15 @@ A schema only ever has one transport at a time: the first `start()` (either mode
 transport gets `ConfigError` — a BullMQ engine and a Postgres engine sharing one schema would be two
 independent sources of `-system` jobs (racing to run the same cron tick, expire the same waitpoint,
 and so on).
+
+An engine that never calls `start()` (a trigger-only producer) never writes the marker, but reads
+it before its first write (`trigger`, including `{ tx }`; `runs.replay`/`cancel`/`cancelMany`/
+`retryFailed`; `tokens.complete`; `queues.pause`/`resume`; `schedules.upsert`/`delete`) and
+refuses the write with the same `ConfigError` when the schema belongs to the other transport. A
+recorded mode is read once per engine. While no engine has recorded one yet (or the schema has no
+`schema_meta` table, not migrated to 009 yet), writes are allowed and the marker is read again at
+most every 30 s, so a producer can keep writing for up to 30 s after an engine of the other mode
+first starts on that schema.
 
 **Engines on 0.3.x and earlier never write that marker** (it's new in migration 009). To move an
 existing schema from `"bullmq"` to `transport: "postgres"`:
@@ -1928,12 +1973,24 @@ writes the `-system` jobs changes.
 
 ### `system_jobs` autovacuum
 
-Rows are deleted as soon as a job completes (waitpoint expirations, most cron ticks — schedule
-ticks are the exception, rewritten in place, see above) or exhausts its retries, so this table
+Rows are deleted as soon as a job completes (waitpoint expirations, retention sweeps) or exhausts
+its retries — schedule ticks are the exception, rewritten in place (see above) — so this table
 churns heavily relative to its size: expect a steady stream of dead tuples. Give it the same
 attention you'd give any other high-churn table — a lower `autovacuum_vacuum_scale_factor` (a
 per-table `ALTER TABLE system_jobs SET (autovacuum_vacuum_scale_factor = ...)` in the target schema)
 keeps it from bloating between the database-wide autovacuum thresholds.
+
+### Slow `-system` jobs (retention)
+
+A claimed `system_jobs` row is locked for `stallTimeoutMs` (`locked_until`), and a running handler
+never renews that lock. A handler that runs longer than `stallTimeoutMs` — in practice a large
+retention sweep — can be claimed again by another `-system` worker and run twice in parallel. The
+design accepts this: retention deletes with `SKIP LOCKED` (a second sweep only costs queries), a
+waitpoint expiration re-checks the waitpoint before acting, a cron tick collides on its idempotency
+key (`__schedule:<id>:<ts>`), and the `locked_by` fencing lets only the current owner complete or
+reschedule the row. A sweep keeps deleting batches until the backlog is gone, so if sweeps
+regularly run past `stallTimeoutMs`, run retention more often (`retention.intervalMs`, less to
+delete per sweep) or raise `stallTimeoutMs`.
 
 ### Mode differences worth knowing
 

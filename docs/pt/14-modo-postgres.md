@@ -70,10 +70,11 @@ que está listado abaixo, os dois transportes são equivalentes: mesmo `defineTa
   todos os processos nunca passa do limite. Sem aproximação, ao contrário de contar do lado do
   Redis sob claims concorrentes.
 - **A fila interna `-system` é uma tabela, não uma fila BullMQ.** `system_jobs` (migration 009)
-  guarda expirações de waitpoint, varreduras de retenção, ticks de cron e execuções do
-  reconciliador, reivindicadas da mesma forma (`SKIP LOCKED`) com um token de fencing
-  (`locked_by`): um worker cujo lock venceu nunca completa, adia ou reagenda uma linha que outro
-  worker já reivindicou.
+  guarda expirações de waitpoint (`wp-<id>-expire`), varreduras de retenção (`retention-<janela>`)
+  e ticks de cron (`schedule-tick:<id>`), reivindicadas da mesma forma (`SKIP LOCKED`) com um
+  token de fencing (`locked_by`): um worker cujo lock venceu nunca completa, adia ou reagenda uma
+  linha que outro worker já reivindicou. O reconciliador não é um job: o líder o roda inline no
+  próprio timer (`reconciler.intervalMs`), como no modo BullMQ.
 - **Ticks de cron nunca somem numa falha.** Em vez de um job scheduler do BullMQ, um schedule é uma
   única linha (`schedule-tick:<id>`) que é *regravada no lugar* para a próxima ocorrência quando o
   tick tem sucesso ou esgota as tentativas — nunca apagada e recriada — então não existe uma janela
@@ -108,6 +109,14 @@ conectando ou em backoff depois de cair. Dimensione `max_connections` para
 mesma forma e configure um `connectionTimeoutMillis` — `start()` avisa quando não, igual no modo
 BullMQ.
 
+O Postgres é a única dependência deste modo, então a alcançabilidade dele faz o papel do `PING` do
+Redis no modo BullMQ: com o banco inacessível, `start()` rejeita com um `MinitriggerError` ("cannot
+reach Postgres", com o erro do driver em `cause`) depois de no máximo alguns
+`pool.connectionTimeoutMs`, em vez de travar; nada fica rodando, e `start()` pode ser chamado de
+novo quando o banco voltar. `stop()` resolve dentro dos limites de sempre com o banco fora, tanto
+depois de um `start()` que falhou quanto com o engine rodando (uma run que ele não conseguiu
+devolver fica `running` até a recuperação de stall de outro engine).
+
 ## PgBouncer
 
 Um pooler em modo transação quebra as duas conexões dedicadas que este modo precisa manter abertas
@@ -116,8 +125,15 @@ entre statements: a conexão `LISTEN` (uma conexão em modo transação não man
 depois de conectar — um `NOTIFY` no canal de wake que precisa ecoar de volta no próprio `LISTEN`
 dentro de 1 s — e só gera um `warn` se não ecoar ("notificações não chegam... a latência de wake
 cai para o poll"), então um pooler na frente dessas duas conexões não falha o `start()`; ele só cai
-silenciosamente para wake-ups só por poll (e sem líder, logo sem reconciliador/retenção — ver
-[Sem líder](#sem-líder) abaixo). Aponte a `postgres` do engine para um pool em modo sessão, ou
+silenciosamente para wake-ups só por poll. A eleição de líder quebra de um jeito menos óbvio: o
+advisory lock de sessão fica na conexão de servidor que rodou `pg_try_advisory_lock`, e um eleitor
+que venceu nunca mais confere o lock. Outro engine cuja tentativa o pooler encaminha para essa
+mesma conexão de servidor também recebe o lock (dois líderes ao mesmo tempo); o pooler reciclar
+essa conexão de servidor libera o lock enquanto o primeiro engine ainda se acha líder (outro pode
+vencer também); e um unlock ou um client fechado nunca chega a essa conexão de servidor, então o
+lock pode ficar vazado (sem líder até ela ser reciclada). Ou seja: espere líderes duplicados ou
+instáveis, e às vezes nenhum (ver [Sem líder](#sem-líder) abaixo), não um "sem líder" limpo.
+Nenhum autoteste detecta isso: aponte a `postgres` do engine para um pool em modo sessão, ou
 direto para o Postgres, para wake-ups em milissegundos e uma eleição de líder funcionando; as
 queries comuns de claim/heartbeat/conclusão pelo pool principal funcionam bem atrás de um pooler em
 modo transação de qualquer forma (são todas statements únicos).
@@ -126,10 +142,19 @@ modo transação de qualquer forma (são todas statements únicos).
 
 `pg_notify`/`LISTEN` só precisam de `CONNECT` no database — nenhum grant extra para a role da
 aplicação. Isso também significa que **qualquer role com `CONNECT` pode dar `LISTEN`** nos canais
-deste modo e ver os `runId`s que passam por eles (nunca payloads, outputs ou progresso — toda
-mensagem nesses canais carrega só um id puro, e todo assinante relê o Postgres antes de agir sobre
-um). Se quais run ids existem já é sensível no seu contexto, use um database dedicado a este
-engine em vez de um compartilhado com outras roles/times.
+deste modo (os nomes derivam do nome do schema, então são fáceis de adivinhar). O que essa role
+vê: os `runId`s nos canais de status e cancel, os **nomes de fila** no canal de wake e o
+**momento** de todo enqueue, mudança de status e cancel — nunca payloads, outputs ou progresso
+(toda mensagem carrega só um id puro ou um nome de fila, e todo assinante relê o Postgres antes de
+agir sobre ela). Se run ids, nomes de fila ou padrões de atividade são sensíveis no seu contexto,
+use um database dedicado a este engine em vez de um compartilhado com outras roles/times.
+
+A mesma role também pode dar `NOTIFY` nesses canais. Notificações de wake e de status são só dicas
+(uma forjada custa uma passada de claim ou uma releitura; passadas disparadas por wake que não
+reivindicam nada têm taxa limitada), e um cancel forjado nunca aborta uma run que não está
+`canceled` no Postgres. O autoteste do `start()` também não é autenticado: o eco carrega um token
+aleatório, mas uma role que vê esse token no canal de wake pode devolvê-lo. Um eco forjado só
+esconde o aviso "notificações não chegam"; nunca muda o que o engine faz.
 
 ## Sem líder
 
@@ -148,6 +173,15 @@ Um schema só tem um transporte por vez: o primeiro `start()` (qualquer um dos m
 *outro* recebe `ConfigError` — um engine BullMQ e um engine Postgres compartilhando um schema
 seriam duas fontes independentes de jobs `-system` (disputando para rodar o mesmo tick de cron,
 expirar o mesmo waitpoint, e assim por diante).
+
+Um engine que nunca chama `start()` (produtor só de disparo) nunca grava o marcador, mas o lê antes
+da primeira escrita (`trigger`, inclusive com `{ tx }`; `runs.replay`/`cancel`/`cancelMany`/
+`retryFailed`; `tokens.complete`; `queues.pause`/`resume`; `schedules.upsert`/`delete`) e recusa a
+escrita com o mesmo `ConfigError` quando o schema pertence ao outro transporte. Um modo gravado é
+lido uma vez por engine. Enquanto nenhum engine gravou o modo (ou o schema ainda não tem a tabela
+`schema_meta`, sem a migration 009), as escritas passam e o marcador é relido no máximo a cada
+30 s, então um produtor pode continuar escrevendo por até 30 s depois que um engine do outro modo
+inicia pela primeira vez nesse schema.
 
 **Engines em 0.3.x e anteriores nunca gravam esse marcador** (é novo na migration 009). Para mover
 um schema existente de `"bullmq"` para `transport: "postgres"`:
@@ -171,13 +205,25 @@ lê e escreve os jobs `-system` muda.
 
 ## Autovacuum de `system_jobs`
 
-Linhas são apagadas assim que um job completa (expirações de waitpoint, a maioria dos ticks de cron
-— ticks de schedule são a exceção, regravados no lugar, ver acima) ou esgota as tentativas, então
+Linhas são apagadas assim que um job completa (expirações de waitpoint, varreduras de retenção) ou
+esgota as tentativas — ticks de schedule são a exceção, regravados no lugar (ver acima) —, então
 essa tabela tem bastante churn em relação ao próprio tamanho: espere um fluxo constante de tuplas
 mortas. Dê a ela a mesma atenção que qualquer outra tabela de alto churn — um
 `autovacuum_vacuum_scale_factor` mais baixo (`ALTER TABLE system_jobs SET
 (autovacuum_vacuum_scale_factor = ...)` no schema alvo) evita que ela infle entre os limiares
 padrão de autovacuum do banco.
+
+## Jobs lentos da `-system` (retenção)
+
+Uma linha de `system_jobs` reivindicada fica travada por `stallTimeoutMs` (`locked_until`), e um
+handler em execução nunca renova esse lock. Um handler que roda mais que `stallTimeoutMs` — na
+prática, uma varredura de retenção grande — pode ser reivindicado de novo por outro worker
+`-system` e rodar duas vezes em paralelo. O design aceita isso: a retenção apaga com `SKIP LOCKED`
+(uma segunda varredura só custa queries), uma expiração de waitpoint re-checa o waitpoint antes de
+agir, um tick de cron colide na chave de idempotência (`__schedule:<id>:<ts>`), e o fencing por
+`locked_by` deixa só o dono atual concluir ou reagendar a linha. Uma varredura apaga lotes até o
+backlog acabar, então, se as varreduras passam de `stallTimeoutMs` com frequência, rode a retenção
+mais vezes (`retention.intervalMs`, menos a apagar por varredura) ou aumente `stallTimeoutMs`.
 
 ## Diferenças de modo que vale saber
 
