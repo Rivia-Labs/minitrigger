@@ -105,18 +105,22 @@ export function createSystemJobStore(exec: SqlExecutor, ctx: SqlContext): System
 		async claim(limit, lockMs, remainingMs) {
 			if (limit <= 0) return [];
 			// Same bounded transaction as the run claim (review 5, A6): once `stop()` set the drain
-			// deadline, a claim never commits after the drain gave up on it.
+			// deadline, a claim never commits after the drain gave up on it. Hence
+			// `statement_timestamp()`, not `now()` (frozen at that BEGIN): a job that came due after
+			// the BEGIN would be skipped, and the lock would start in the past.
 			const statement = (q: Db) =>
 				q.query<SystemJobRow>(
 					`WITH picked AS (
 				   SELECT job_id FROM ${table}
-				   WHERE run_after <= now() AND (locked_until IS NULL OR locked_until <= now())
+				   WHERE run_after <= statement_timestamp()
+				     AND (locked_until IS NULL OR locked_until <= statement_timestamp())
 				   ORDER BY run_after
 				   LIMIT $1::int
 				   FOR UPDATE SKIP LOCKED
 				 )
 				 UPDATE ${table} j
-				 SET locked_until = ${nowPlusMs("$2")}, locked_by = gen_random_uuid()
+				 SET locked_until = statement_timestamp() + $2::float8 * interval '1 millisecond',
+				     locked_by = gen_random_uuid()
 				 FROM picked WHERE j.job_id = picked.job_id
 				 RETURNING ${QUALIFIED_COLUMNS}`,
 					[limit, lockMs]
