@@ -103,6 +103,9 @@ export function createLazyBackend(
 		name: string,
 		signal: AbortSignal | undefined
 	): AsyncGenerator<string | Json, void, undefined> {
+		// Review 5 item B6: first iterated after stop() began ends quietly, as the loaded backend's
+		// own reader does (and 0.3.x did) -- never a load (sealed) that would reject.
+		if (signal?.aborted || ctx.isShuttingDown()) return;
 		const runtime = await ensure();
 		yield* runtime.backend.readStream(runId, name, signal);
 	}
