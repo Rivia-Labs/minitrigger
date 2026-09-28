@@ -153,6 +153,21 @@ chave fica bloqueada até sua transação terminar, então um trigger concorrent
 espera por ela. Um client sem `BEGIN` também funciona (cada trigger então faz autocommit por conta
 própria — você só perde a atomicidade com suas próprias escritas).
 
+## Guarda de modo misto no caminho `tx`
+
+A guarda de transporte misto (`schema_meta.transport`, decisão 28) é lida através deste mesmo
+client `tx`, nunca do pool — assim ela não compete por uma conexão que sua aplicação esteja
+segurando toda (ver [11. Produção](11-producao.md#dimensionamento-do-pool)): primeiro
+`to_regclass` (seguro mesmo antes da migration 009 ter rodado), depois `schema_meta.transport` em
+si, só se a role do chamador conseguir lê-la. Uma divergência lança `ConfigError` e deixa sua
+transação utilizável — você decide se comita ou desfaz o resto dela. **Se a role de `tx` não tem
+`SELECT` em `<schema>.schema_meta`, essa checagem é silenciosamente pulada** (tratada como se
+nenhum engine tivesse gravado um transporte ainda: a escrita passa, e o marcador é relido depois de
+30 s) em vez de abortar sua transação com um erro de permissão — conceda `SELECT` em
+`<schema>.schema_meta` para a role que roda triggers `tx` se quiser a checagem ativa nesse caminho.
+Ver [14. Modo Postgres](14-modo-postgres.md#guarda-de-modo-misto-e-mover-um-schema-entre-transportes)
+para o resto da guarda.
+
 ## Limitações
 
 - `delay` conta a partir do início da sua transação (o `now()` do Postgres).

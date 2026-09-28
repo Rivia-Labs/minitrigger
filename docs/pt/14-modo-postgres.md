@@ -63,7 +63,13 @@ que está listado abaixo, os dois transportes são equivalentes: mesmo `defineTa
   `polling.intervalMs` (padrão 1 000 ms, mínimo 100) mais até `polling.jitterMs` de jitter (padrão
   50 ms, para diluir o rebanho de trovão que uma rajada de `NOTIFY`s causaria). Então, na pior
   hipótese, a latência de wake-up sem `NOTIFY` é limitada por `polling.intervalMs`, nunca
-  indefinida.
+  indefinida. Como o canal de wake é entrada não confiável (qualquer role com `CONNECT` pode dar
+  `NOTIFY` nele), wakes recebidos que não acham nada para reivindicar são limitados (um token
+  bucket: uma rajada de 4, depois um a cada 15 ms) para que uma inundação de `NOTIFY` não gire o
+  laço de claim sem parar — um wake legítimo que chega durante essa inundação pode esperar até
+  esses mesmos ~15 ms antes do claim rodar. Tráfego comum (um trigger de verdade, um token sendo
+  completado) nunca é limitado: só passes disparadas por wake que não reivindicaram nada contam
+  contra o limite.
 - **`globalConcurrency` é exato.** Com um limite, o claim roda dentro de uma transação curta que
   primeiro toma um advisory lock por fila, depois conta as linhas `running` da fila uma única vez
   — claims concorrentes da mesma fila se serializam nesse lock, então a contagem de `running` entre
@@ -120,7 +126,10 @@ faz a mesma checagem logo depois do `PING` do Redis. Um pool injetado sem `conne
 ainda fica com uma vaga presa pela tentativa de conexão abandonada até o SO desistir dela (o
 `pg-pool` não consegue cancelar um connect pendente), então um pool injetado pequeno pode continuar
 fazendo o `start()` falhar enquanto isso: configure `connectionTimeoutMillis` nos pools que você
-injeta. `stop()` resolve dentro dos limites de
+injeta. A mensagem de erro distingue as duas causas: um pool que nunca conseguiu nenhuma conexão
+porque já estava em `max` ou tinha checkouts na fila diz isso explicitamente ("...every connection
+of the pool (max N) stayed busy...") em vez de dar a entender que o Postgres está inacessível —
+confira o que mais segura as conexões do pool antes de assumir que o banco caiu. `stop()` resolve dentro dos limites de
 sempre com o banco fora, tanto depois de um `start()` que falhou quanto com o engine rodando (uma
 run que ele não conseguiu devolver fica `running` até a recuperação de stall de outro engine).
 
@@ -188,7 +197,18 @@ escrita com o mesmo `ConfigError` quando o schema pertence ao outro transporte. 
 lido uma vez por engine. Enquanto nenhum engine gravou o modo (ou o schema ainda não tem a tabela
 `schema_meta`, sem a migration 009), as escritas passam e o marcador é relido no máximo a cada
 30 s, então um produtor pode continuar escrevendo por até 30 s depois que um engine do outro modo
-inicia pela primeira vez nesse schema.
+inicia pela primeira vez nesse schema. `runs.cancel`/`tokens.complete` pagam essa leitura (e, no
+modo `"bullmq"`, carregam o backend — abrindo o Redis num engine só de disparo) já na primeira
+chamada, mesmo quando o id da run/token não resolve para nada: qualquer UUID bem formado chega à
+guarda antes da consulta que devolveria `"not_found"`.
+
+Com `{ tx }`, a leitura passa pela sua própria transação em vez do pool (dois statements
+só-leitura: `to_regclass`, depois o marcador em si) — ver [06. Outbox transacional](06-outbox.md).
+**Uma role de `tx` sem `SELECT` em `<schema>.schema_meta` fica sem essa guarda nesse caminho**: a
+falta do privilégio é tratada como um marcador ausente (a escrita passa, relida depois de 30 s) em
+vez de lançar um erro de permissão que abortaria sua transação — conceda `SELECT` em
+`<schema>.schema_meta` para a role que roda triggers `tx` se quiser a checagem ativa também nesse
+caminho.
 
 **Engines em 0.3.x e anteriores nunca gravam esse marcador** (é novo na migration 009). Para mover
 um schema existente de `"bullmq"` para `transport: "postgres"`:

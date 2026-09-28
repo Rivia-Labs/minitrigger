@@ -305,8 +305,12 @@ minitrigger/
 │   ├── task.ts                # defineTask, tipos, Serializable<T>
 │   ├── executor/             # executeRun, contexto de step, sinais, heartbeat
 │   ├── queue/                # adaptação BullMQ (workers, fila -system, jobIds, schedulers)
-│   ├── backends/             # bullmq.ts (import() dinâmico), postgres.ts
-│   ├── pg/                   # listener.ts, transport.ts, workers.ts, pubsub.ts, schedulers.ts
+│   ├── backends/             # bullmq.ts (import() dinâmico), postgres.ts, lazy.ts (carrega o
+│   │                         #   backend BullMQ sob demanda), shared.ts (guarda de modo misto,
+│   │                         #   checagem de alcance do Postgres), types.ts (contrato BackendContext/
+│   │                         #   BackendRuntime/BackendStartStep entre createEngine e as fábricas)
+│   ├── pg/                   # listener.ts, transport.ts, workers.ts, pubsub.ts, schedulers.ts,
+│   │                         #   notify-batcher.ts (agrupa publicações de NOTIFY numa janela curta)
 │   ├── store/                # interfaces de store + repositórios SQL + memória (modo de teste)
 │   ├── migrations/           # 001_init.sql, ... embutidos no bundle
 │   ├── adapters/              # subpaths /typeorm, /knex, /drizzle, /prisma (decisão 26)
