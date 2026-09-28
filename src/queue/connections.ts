@@ -1,5 +1,6 @@
-import { Redis } from "ioredis";
+import { Cluster, Redis } from "ioredis";
 import type { RedisLike } from "../config.js";
+import { ConfigError } from "../errors.js";
 
 /** What a dedicated connection is used for; see {@link RedisConnections.dedicated}. */
 export type DedicatedPurpose = "worker" | "subscriber" | "stream";
@@ -90,7 +91,7 @@ export function createRedisConnections(
 	// an injected connection is, in practice, always a real `ioredis` `Redis` instance -- the cast
 	// crosses back to it here, the one place that actually needs `.duplicate()` to return something
 	// usable as a `Worker`/subscriber connection.
-	const injected = input.connection as unknown as Redis;
+	const injected = assertInjectedRedis(input.connection);
 
 	return {
 		shared: () => injected,
@@ -137,4 +138,37 @@ export async function closeConnection(
 	} finally {
 		clearTimeout(timer);
 	}
+}
+
+/** Methods an injected connection needs (as ioredis `Redis` has them), beyond `RedisLike`. */
+const REDIS_METHODS = ["duplicate", "connect", "disconnect", "quit", "publish", "subscribe"];
+
+/**
+ * Review 5 item B3: `RedisLike` (the public type) is structural, so a `Cluster` or a hand-made
+ * object type-checks and would only fail deep inside BullMQ. An ioredis `Redis` is accepted; so is
+ * an object shaped like one (another copy of ioredis, where `instanceof` fails); a `Cluster`
+ * (never supported: BullMQ's cluster mode needs hash-tagged prefixes) or anything else is a
+ * `ConfigError`.
+ */
+export function assertInjectedRedis(connection: RedisLike): Redis {
+	if (connection instanceof Redis) return connection;
+	const candidate = connection as unknown as Record<string, unknown> | null;
+	if (connection instanceof Cluster || candidate?.["isCluster"] === true) {
+		throw new ConfigError(
+			"config.redis.connection is an ioredis Cluster, which minitrigger does not support; " +
+				"pass a single-node ioredis Redis instance or a connection string"
+		);
+	}
+	const redisShaped =
+		typeof candidate === "object" &&
+		candidate !== null &&
+		typeof candidate["status"] === "string" &&
+		REDIS_METHODS.every(name => typeof candidate[name] === "function");
+	if (!redisShaped) {
+		throw new ConfigError(
+			"config.redis.connection must be an ioredis Redis instance (or a connection string); " +
+				"the object given lacks ioredis methods such as connect/disconnect/quit/subscribe"
+		);
+	}
+	return connection as unknown as Redis;
 }

@@ -1,9 +1,12 @@
 export type {
+	BullmqEngineConfig,
 	BullmqTransportConfig,
+	CommonConfig,
 	EngineConfig,
 	EngineLimits,
 	EngineLogFn,
 	EngineLogger,
+	PostgresEngineConfig,
 	PostgresTransportConfig,
 	RedisLike,
 } from "./config.js";

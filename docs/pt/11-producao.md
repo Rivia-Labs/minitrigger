@@ -210,6 +210,24 @@ reenfileira toda run a partir de Postgres dentro de aproximadamente
   volta para `"bullmq" | "postgres"` a menos que você o fixe — escreva
   `{ ...base, transport: "postgres" as const }` (ou dê a `base` um tipo mais estreito) para o
   resultado continuar casando exatamente com um membro da união.
+
+  Alguns padrões da 0.3.x que tratavam `EngineConfig` como um tipo de objeto só deixam de
+  compilar. Cada um tem correção de uma palavra: use o novo `BullmqEngineConfig`
+  (= `CommonConfig & BullmqTransportConfig`, também exportado, como `PostgresEngineConfig`), ou o
+  equivalente `Extract<EngineConfig, { transport?: "bullmq" }>`:
+
+  | Código 0.3.x | Erro na 0.4 | Escreva |
+  |---|---|---|
+  | `interface AppConfig extends EngineConfig` | TS2312 (não estende união) | `extends BullmqEngineConfig` |
+  | `Omit<EngineConfig, "tasks">` e depois `createEngine({ ...base, tasks })` | TS2345/TS2379 | `Omit<BullmqEngineConfig, "tasks">` |
+  | overrides `Partial<EngineConfig>` espalhados no `createEngine` | TS2379/TS2322 | `Partial<BullmqEngineConfig>` |
+  | `config.redis` usado como sempre presente | TS18048 | tipe `config` como `BullmqEngineConfig` |
+  | `config.redis.connection` usado como `Redis` do ioredis | TS2740 (`RedisLike` é estrutural) | `BullmqEngineConfig<Redis>` |
+
+  `redis.connection` continua sendo um `Redis` do ioredis: como `RedisLike` é só um tipo
+  estrutural (para os tipos públicos nunca importarem `ioredis`), um `Cluster` ou um objeto feito à
+  mão agora passam no tipo e são rejeitados em runtime com `ConfigError` quando o backend BullMQ
+  carrega (primeiro uso), em vez de falhar lá dentro do BullMQ. `Cluster` nunca foi suportado.
 - **O Redis conecta sob demanda com `transport: "bullmq"`.** O engine não abre mais nenhuma conexão
   Redis no `createEngine()`: a primeira conexão abre no primeiro uso (tipicamente `engine.start()`,
   ou um `trigger()`/`runs.subscribe()` mais cedo, num engine só de disparo que nunca chama

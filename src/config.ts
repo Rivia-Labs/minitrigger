@@ -163,14 +163,19 @@ export interface CommonConfig {
 	logger?: EngineLogger;
 }
 
-/** Default transport (spec §3.10): Redis + BullMQ. */
-export interface BullmqTransportConfig {
+/**
+ * Default transport (spec §3.10): Redis + BullMQ. `R` (review 5 item B3) lets a caller keep its
+ * own connection type when reading the config back, e.g. `BullmqEngineConfig<Redis>` so that
+ * `config.redis.connection` is an ioredis `Redis` again, as in 0.3.x.
+ */
+export interface BullmqTransportConfig<R extends RedisLike = RedisLike> {
 	transport?: "bullmq";
 	/**
-	 * Connection string, or an existing ioredis instance. An injected instance is only used for
-	 * non-blocking producers; workers/subscribers get `duplicate()`s (decision 14).
+	 * Connection string, or an existing ioredis `Redis` instance (not a `Cluster`, checked when
+	 * the backend loads). An injected instance is only used for non-blocking producers;
+	 * workers/subscribers get `duplicate()`s (decision 14).
 	 */
-	redis: string | { connection: RedisLike };
+	redis: string | { connection: R };
 	/** BullMQ key prefix (decision 15). Default `"minitrigger"`. */
 	prefix?: string;
 	outbox?: OutboxConfig;
@@ -201,7 +206,19 @@ export interface PostgresTransportConfig {
  * `polling` with `transport: "bullmq"`/omitted) at the type level; `resolveConfig` repeats the
  * same checks at runtime for plain JS callers or a cast.
  */
-export type EngineConfig = CommonConfig & (BullmqTransportConfig | PostgresTransportConfig);
+export type EngineConfig = BullmqEngineConfig | PostgresEngineConfig;
+
+/**
+ * One arm of {@link EngineConfig} (review 5 item B3): an object type (not a union), so it works
+ * where 0.3.x code used `EngineConfig` itself -- `interface X extends BullmqEngineConfig`,
+ * `Omit<BullmqEngineConfig, "tasks">` + spread, `Partial<BullmqEngineConfig>`, a required
+ * `config.redis`. `BullmqEngineConfig<Redis>` also types `config.redis.connection` as `Redis`.
+ */
+export type BullmqEngineConfig<R extends RedisLike = RedisLike> = CommonConfig &
+	BullmqTransportConfig<R>;
+
+/** The `transport: "postgres"` arm of {@link EngineConfig}; see {@link BullmqEngineConfig}. */
+export type PostgresEngineConfig = CommonConfig & PostgresTransportConfig;
 
 export interface ResolvedConfig {
 	postgres: string | { pool: Pool };

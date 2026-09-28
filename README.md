@@ -708,7 +708,8 @@ Names already covered by their own subsection above/below link there instead of 
 | `createEngine(config)` | Builds an [`Engine`](#createengineconfig). |
 | `Engine`, `EngineClient` | `Engine` is the full client (also `migrate`/`start`/`stop`); `EngineClient` is the `Pick<Engine, "trigger" \| "runs" \| "tokens" \| "schedules" \| "events">` subset both `Engine` and `TestEngine` satisfy. |
 | `EngineConfig`, `EngineLimits`, `EngineLogger`, `EngineLogFn` | `createEngine`'s config shape (a discriminated union on `transport`, see [Postgres-only mode](#postgres-only-mode)); payload/output size limits ([config table](#config-options)); the pino/console-compatible logger shape and its per-level function type. |
-| `BullmqTransportConfig`, `PostgresTransportConfig`, `RedisLike` | The two members of the `EngineConfig` union (`transport: "bullmq"` \| `"postgres"`); `RedisLike` is the minimal structural shape an injected `redis.connection` must satisfy (no `ioredis` import in public types). |
+| `BullmqTransportConfig`, `PostgresTransportConfig`, `RedisLike` | The transport-specific halves of the `EngineConfig` union (`transport: "bullmq"` \| `"postgres"`); `RedisLike` is the minimal structural shape of an injected `redis.connection` (no `ioredis` import in public types; checked to be an ioredis `Redis` at runtime). |
+| `BullmqEngineConfig`, `PostgresEngineConfig`, `CommonConfig` | The two members of `EngineConfig` (`CommonConfig & BullmqTransportConfig`, `CommonConfig & PostgresTransportConfig`) and their shared fields; object types, for `extends`/`Omit`/`Partial` (see [Upgrading to 0.4.0](#upgrading-to-040)). `BullmqEngineConfig<Redis>` types `redis.connection` as ioredis `Redis`. |
 | `StartOptions` | `engine.start(options)`'s options (e.g. `{ queues }` to start only some). |
 | `TriggerOptions`, `DebounceOptions`, `TransactionClient` | `engine.trigger`'s third argument (idempotency, delay, [debounce](#debounce)/[concurrency keys](#concurrency-keys)/[`tx`](#transactional-trigger-outbox)); `DebounceOptions` is its `debounce` field; `TransactionClient` is the `tx` client shape. |
 | `Run`, `RunList`, `ListRunsOptions`, `RunStep`, `RunLogEntry`, `RunLogPage`, `RunLogsOptions` | Shapes returned by `runs.get`/`list`/`steps`/`logs` — see [Run introspection](#run-introspection-events-and-streams). |
@@ -1390,6 +1391,24 @@ it("approves when the token resolves truthy", async () => {
   you pin it — write `{ ...base, transport: "postgres" as const }` (or give `base` itself a
   narrower type) so the result still matches one union member exactly instead of failing to
   type-check as `EngineConfig`.
+
+  Some 0.3.x patterns that treated `EngineConfig` as one object type no longer compile. Each has a
+  one-word fix: use the new `BullmqEngineConfig` (= `CommonConfig & BullmqTransportConfig`, also
+  exported, as is `PostgresEngineConfig`), or the equivalent
+  `Extract<EngineConfig, { transport?: "bullmq" }>`:
+
+  | 0.3.x code | Error in 0.4 | Write instead |
+  |---|---|---|
+  | `interface AppConfig extends EngineConfig` | TS2312 (can't extend a union) | `extends BullmqEngineConfig` |
+  | `Omit<EngineConfig, "tasks">` then `createEngine({ ...base, tasks })` | TS2345/TS2379 | `Omit<BullmqEngineConfig, "tasks">` |
+  | `Partial<EngineConfig>` overrides spread into `createEngine` | TS2379/TS2322 | `Partial<BullmqEngineConfig>` |
+  | `config.redis` used as always present | TS18048 | type `config` as `BullmqEngineConfig` |
+  | `config.redis.connection` used as an ioredis `Redis` | TS2740 (`RedisLike` is structural) | `BullmqEngineConfig<Redis>` |
+
+  `redis.connection` is still meant to be an ioredis `Redis`: since `RedisLike` is only a
+  structural type (so the public types never import `ioredis`), a `Cluster` or a hand-made object
+  now type-checks, and is rejected at runtime with `ConfigError` when the BullMQ backend loads
+  (first use), instead of failing deep inside BullMQ. A `Cluster` was never supported.
 - **Redis connects lazily with `transport: "bullmq"`.** The engine no longer opens any Redis
   connection at `createEngine()` time — the first connection opens on first use (typically
   `engine.start()`, or an earlier `trigger()`/`runs.subscribe()` call on a trigger-only engine that
