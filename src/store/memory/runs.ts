@@ -138,8 +138,13 @@ function createDebounced(tx: MemTx, input: NewRun, debounce: NewRunDebounce): Cr
 	for (const r of tx.db.runs.values()) {
 		if (r.status === "queued" && r.taskId === taskId && r.debounceKey === key) existing = r;
 	}
-	if (existing && existing.runAfter !== null && existing.runAfter <= tx.now) {
-		// Decision 24 (mirrors the SQL store): a due pending run no longer absorbs triggers; its key
+	if (
+		debounce.releaseDue === true &&
+		existing &&
+		existing.runAfter !== null &&
+		existing.runAfter <= tx.now
+	) {
+		// Decision 24 (mirrors the SQL store; Postgres transport only, review 5 item B2): a due pending run no longer absorbs triggers; its key
 		// is released (nothing else changes) and this trigger opens a new window below.
 		updateRun(tx, existing, { debounceKey: null });
 		existing = undefined;

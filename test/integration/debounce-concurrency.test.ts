@@ -210,6 +210,19 @@ describeTransports("debounce-concurrency", transport => {
 			}
 		});
 
+		// Review 5 item B2: releasing a pending run that is already due (so a `SKIP LOCKED` claim can
+		// get it) is Postgres-only; BullMQ keeps one pending run per key (the 0.3 behavior).
+		it("triggers spaced past the delay with no worker: one run on BullMQ, one per trigger on Postgres", async () => {
+			const task = defineTask({ id: `deb-due-${shortId()}`, run: async () => "ok" });
+			const engine = makeEngine([task]);
+			for (let i = 0; i < 5; i++) {
+				if (i > 0) await sleep(250);
+				await engine.trigger(task, undefined, { debounce: { key: "due", delay: "100ms" } });
+			}
+			const runs = await runsOf(engine, task.id);
+			expect(runs).toHaveLength(transport === "bullmq" ? 1 : 5);
+		});
+
 		it("two processes racing the same key make one run", async () => {
 			const task = defineTask({
 				id: `deb-race-${shortId()}`,

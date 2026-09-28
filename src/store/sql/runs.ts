@@ -195,8 +195,8 @@ export function createRunStore(exec: SqlExecutor, ctx: SqlContext): RunStore {
 			[input.taskId, debounce.key]
 		);
 		let existing = found[0];
-		if (existing?.due) {
-			// Decision 24: a pending run already due (its delay/maxDelay deadline reached) no longer
+		if (existing?.due && debounce.releaseDue === true) {
+			// Decision 24 (Postgres transport only, review 5 item B2): a pending run already due (its delay/maxDelay deadline reached) no longer
 			// absorbs triggers. Its key is released (nothing else on the row changes, so the run keeps
 			// its payload, run_after and seq) and this trigger opens a new window below. Otherwise a
 			// key triggered faster than acquisition keeps the row locked by collapses and a

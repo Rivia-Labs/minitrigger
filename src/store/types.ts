@@ -304,6 +304,14 @@ export interface NewRunDebounce {
 	payload: "last" | "first";
 	/** Cap on how far the run can be postponed from its first trigger; null = no cap. */
 	maxDelayMs: number | null;
+	/**
+	 * Review 5 item B2 (`transport: "postgres"` only): a pending run of the key that is already due
+	 * no longer absorbs triggers; its key is released and this trigger opens a new run. Needed by
+	 * the `SKIP LOCKED` claim (decision 28(a)): collapses would otherwise keep the row locked under
+	 * a fast burst and no run of the key would ever be claimed. Absent/false (BullMQ): a due pending
+	 * run still collapses, one pending run per key.
+	 */
+	releaseDue?: boolean;
 }
 
 export type CreateRunResult =

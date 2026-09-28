@@ -283,20 +283,23 @@ partial index), so it holds across processes and survives a Redis `FLUSHALL`.
   `__` prefix reserved). `debounce` cannot be combined with `idempotencyKey` or `delay`.
 - A collapsed trigger doesn't change the run's status, so it emits no event and no
   `runs.subscribe` update. A run that already started and went back to `queued` (retry, resume
-  from a sleep, graceful hand-back) never absorbs triggers. Neither does a still-pending run whose
-  own `run_after` has already come due (its `delay`/`maxDelay` deadline was reached but no worker
-  has acquired it yet): the next trigger for that key releases its debounce key instead (the due
-  run's payload/`run_after`/attempt count are untouched — it still runs exactly as it would have)
-  and opens a **new** pending run for the key. Without this, a key triggered faster than a worker
-  could acquire it would keep absorbing forever — breaking the "runs periodically" guarantee above,
-  and in `transport: "postgres"` specifically starving the row of its `SKIP LOCKED` claim for as
-  long as the burst lasted (see [Postgres-only mode](#postgres-only-mode)).
+  from a sleep, graceful hand-back) never absorbs triggers. With `transport: "postgres"` only,
+  neither does a still-pending run whose own `run_after` has already come due (its
+  `delay`/`maxDelay` deadline was reached but no worker has claimed it yet): the next trigger for
+  that key releases its debounce key instead (the due run's payload/`run_after`/attempt count are
+  untouched — it still runs exactly as it would have) and opens a **new** pending run for the key.
+  Without this, a key triggered faster than a worker could claim it would keep the row locked by
+  collapses and starve it of its `SKIP LOCKED` claim for as long as the burst lasted (see
+  [Postgres-only mode](#postgres-only-mode)). With `transport: "bullmq"` (as in 0.3.x) a due
+  pending run keeps absorbing triggers until a worker acquires it.
 - A collapsed trigger also doesn't change the pending run's `concurrencyKey`, `maxDelay` deadline
   or `maxAttempts` — only its `payload` (per the `payload` option) and `run_after` move; those
   other fields are fixed by whichever trigger created the pending run (first trigger wins).
 
-Debounce keeps one pending run per key; to also keep two runs of the key from executing at the
-same time, add a concurrency key (below) — together they give "one pending + one running".
+Debounce keeps one pending run per key (with `transport: "postgres"`, a pending run already due
+and not yet claimed can briefly coexist with the next window's pending run, see above); to also
+keep two runs of the key from executing at the same time, add a concurrency key (below) —
+together they give "one pending + one running".
 
 ### Concurrency keys
 
@@ -1392,10 +1395,10 @@ it("approves when the token resolves truthy", async () => {
   `engine.start()`, or an earlier `trigger()`/`runs.subscribe()` call on a trigger-only engine that
   never calls `start()`). A malformed `redis` connection string or an unreachable Redis now
   surfaces as an error from that first call, not from `createEngine()` itself.
-- **Debounce: a pending run already past its own due time no longer absorbs triggers**, in both
-  transports — see the note at the end of [Debounce](#debounce). This is a behavior change from
-  0.3.x and earlier: previously, a debounced run stayed collapsible until a worker actually
-  acquired it, however far past its own `delay`/`maxDelay` deadline that took.
+- **Debounce with `transport: "postgres"`: a pending run already past its own due time no longer
+  absorbs triggers** — see the note at the end of [Debounce](#debounce). `transport: "bullmq"` is
+  unchanged from 0.3.x: a debounced run stays collapsible until a worker actually acquires it,
+  however far past its own `delay`/`maxDelay` deadline that takes.
 - **Mixed-transport guard, and moving a schema between transports** — see
   [Postgres-only mode](#postgres-only-mode). In short: `schema_meta` (new in this migration) now
   records which transport a schema is used with, and a `start()` with the other transport on the

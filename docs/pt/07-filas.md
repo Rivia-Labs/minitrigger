@@ -100,15 +100,15 @@ run pendente por chave, e ela sempre vê os dados mais recentes. A regra vive em
   caracteres, prefixo `__` reservado). `debounce` não combina com `idempotencyKey` nem com `delay`.
 - Um trigger colapsado não muda o status da run, então não emite evento nem atualização de
   `runs.subscribe`. Uma run que já iniciou e voltou para `queued` (retentativa, retomada de um
-  sleep, devolução graciosa no shutdown) nunca absorve triggers. Nem uma run ainda pendente cujo
-  próprio `run_after` já venceu (o prazo de `delay`/`maxDelay` foi atingido, mas nenhum worker a
-  adquiriu ainda): o próximo trigger para essa chave libera a chave de debounce dela em vez disso
-  (o payload/`run_after`/tentativa da run vencida ficam intocados — ela ainda executa exatamente
-  como executaria) e abre uma **nova** run pendente para a chave. Sem essa regra, uma chave
-  disparada mais rápido do que um worker consegue adquirir continuaria absorvendo para sempre —
-  quebrando a garantia "executa periodicamente" acima e, especificamente em
-  `transport: "postgres"`, deixando a linha sem vez no claim `SKIP LOCKED` enquanto a rajada durar
-  (ver [14. Modo Postgres](14-modo-postgres.md)).
+  sleep, devolução graciosa no shutdown) nunca absorve triggers. Só com `transport: "postgres"`,
+  nem uma run ainda pendente cujo próprio `run_after` já venceu (o prazo de `delay`/`maxDelay` foi
+  atingido, mas nenhum worker a reivindicou ainda): o próximo trigger para essa chave libera a
+  chave de debounce dela em vez disso (o payload/`run_after`/tentativa da run vencida ficam
+  intocados — ela ainda executa exatamente como executaria) e abre uma **nova** run pendente para
+  a chave. Sem essa regra, uma chave disparada mais rápido do que um worker consegue reivindicar
+  manteria a linha travada por colapsos, sem vez no claim `SKIP LOCKED` enquanto a rajada durar
+  (ver [14. Modo Postgres](14-modo-postgres.md)). Com `transport: "bullmq"` (como na 0.3.x), uma
+  run pendente vencida continua absorvendo triggers até um worker adquiri-la.
 - Um trigger colapsado também não muda o `concurrencyKey` da run pendente, o prazo de `maxDelay`
   nem o `maxAttempts` — só o `payload` (conforme a opção `payload`) e o `run_after` se movem; os
   outros campos são fixados por qualquer que tenha sido o trigger que criou a run pendente (o
@@ -129,8 +129,9 @@ await engine.trigger(recalcClassification, { courseId }, {
 });
 ```
 
-Debounce mantém uma run pendente por chave; para também impedir que duas runs da mesma chave
-executem ao mesmo tempo, adicione uma chave de concorrência — juntos, os dois dão "um pendente + um
+Debounce mantém uma run pendente por chave (com `transport: "postgres"`, uma run pendente já
+vencida e ainda não reivindicada pode coexistir brevemente com a run pendente da janela seguinte,
+ver acima); para também impedir que duas runs da mesma chave executem ao mesmo tempo, adicione uma chave de concorrência — juntos, os dois dão "um pendente + um
 rodando".
 
 ## Pausar, retomar e escalar filas

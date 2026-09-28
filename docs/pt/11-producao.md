@@ -215,10 +215,10 @@ reenfileira toda run a partir de Postgres dentro de aproximadamente
   ou um `trigger()`/`runs.subscribe()` mais cedo, num engine só de disparo que nunca chama
   `start()`). Uma string de conexão malformada ou um Redis inacessível agora aparece como erro
   dessa primeira chamada, não do `createEngine()` em si.
-- **Debounce: uma run pendente já vencida deixa de absorver triggers**, nos dois transportes — ver
-  [07. Filas](07-filas.md#debounce). Mudança de comportamento em relação a 0.3.x e anteriores: antes, uma run debounced continuava
-  colapsável até um worker de fato adquiri-la, não importa quanto tempo depois do próprio prazo
-  `delay`/`maxDelay` isso levasse.
+- **Debounce com `transport: "postgres"`: uma run pendente já vencida deixa de absorver
+  triggers** — ver [07. Filas](07-filas.md#debounce). `transport: "bullmq"` não muda em relação a
+  0.3.x: uma run debounced continua colapsável até um worker de fato adquiri-la, não importa
+  quanto tempo depois do próprio prazo `delay`/`maxDelay` isso leve.
 - **Guarda de transporte misto, e mover um schema entre transportes** — ver
   [14. Modo Postgres](14-modo-postgres.md#guarda-de-modo-misto-e-mover-um-schema-entre-transportes).
   Resumo: `schema_meta` (nova nesta migration) passa a gravar qual transporte um schema usa, e um

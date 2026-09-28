@@ -997,7 +997,13 @@ export function createEngineCore(
 		}
 		const delayMs = options.delay === undefined ? 0 : parseDuration(options.delay);
 		const debounce =
-			options.debounce === undefined ? undefined : resolveDebounce(options, idempotency);
+			options.debounce === undefined
+				? undefined
+				: {
+						...resolveDebounce(options, idempotency),
+						// Review 5 item B2: only the SKIP LOCKED claim needs a due run to stop absorbing.
+						releaseDue: resolved.transport === "postgres",
+					};
 		const concurrencyKey =
 			options.concurrencyKey === undefined
 				? undefined
