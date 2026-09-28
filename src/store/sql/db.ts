@@ -91,7 +91,12 @@ export async function checkOut(
 function isServerError(err: unknown): boolean {
 	if (typeof err !== "object" || err === null) return false;
 	const { code, severity } = err as { code?: unknown; severity?: unknown };
-	return typeof code === "string" && typeof severity === "string" && severity !== "FATAL";
+	if (typeof code !== "string" || typeof severity !== "string") return false;
+	// Review 6 L3: `severity` is localized (`lc_messages`), and `pg` does not expose the
+	// non-localized `V` field; the SQLSTATE class is not localized: 57P* (admin shutdown, crash
+	// shutdown, cannot connect now, ...) and 08* (connection exception) end the session.
+	if (code.startsWith("57P") || code.startsWith("08")) return false;
+	return severity !== "FATAL" && severity !== "PANIC";
 }
 
 /**
