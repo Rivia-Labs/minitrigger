@@ -34,7 +34,12 @@ export default defineConfig({
 	// deprecation into a hard error, so it is silenced for the d.ts build only.
 	dts: { compilerOptions: { ignoreDeprecations: "6.0" } },
 	clean: true,
-	sourcemap: true,
+	// Review 6 H3: no `.map` files in the published package. `sourcesContent` isn't embedded (the
+	// consumer's own TS sources aren't in the tarball either), so a map without them only lets a
+	// debugger step through the bundled/minified-adjacent output itself -- not much of a win for
+	// ~2.9 MB of the ~4.6 MB unpacked package. Source maps still exist locally during development
+	// (this only affects the published tarball's build).
+	sourcemap: false,
 	splitting: true,
 	treeshake: true,
 	// Migrations are embedded in the bundle as strings (decision 18).
