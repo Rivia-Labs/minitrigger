@@ -640,8 +640,10 @@ export interface EngineBackend {
 	 * Review 5 item B1: awaited before every write that creates or re-enqueues a run (the same
 	 * points as `load`), also on an engine that never calls `start()`. `createEngine`: refuses a
 	 * schema whose `schema_meta.transport` is another mode (`ConfigError`). Absent: no check.
+	 * Given `tx` (`trigger(..., { tx })`, review 6 M1), it reads through the caller's client only,
+	 * never the pool, with statements that cannot abort the caller's transaction.
 	 */
-	beforeWrite?(): Promise<void>;
+	beforeWrite?(tx?: TransactionClient): Promise<void>;
 }
 
 /** Lifecycle state owned by the engine wrapping the core. @internal */
@@ -834,7 +836,7 @@ export function createEngineCore(
 		maxPayloadBytes: resolved.limits.maxPayloadBytes,
 		assertNotStopped,
 		assertNotClosed,
-		beforeWrite: () => loadBackendForWrite(),
+		beforeWrite: () => loadBackendForWrite(assertNotStopped),
 	});
 
 	const deps: ExecutorDeps = {
@@ -865,10 +867,14 @@ export function createEngineCore(
 	 * call would resolve. Skipped once stop() began (writes still allowed while draining, e.g.
 	 * `tokens.complete`, keep their best-effort enqueue; a stopping engine never starts a load).
 	 */
-	async function loadBackendForWrite(): Promise<void> {
+	async function loadBackendForWrite(recheck: () => void, tx?: TransactionClient): Promise<void> {
 		// Load first: a missing peer fails before any Postgres query (the guard below reads one).
 		if (backend.load && !lifecycle.isShuttingDown()) await backend.load();
-		await backend.beforeWrite?.();
+		await backend.beforeWrite?.(tx);
+		// Review 6 L1: the caller's lifecycle check ran before these awaits; a stop() that
+		// progressed meanwhile must fail the write with the engine's own error, not the raw
+		// "Cannot use a pool after calling end".
+		recheck();
 	}
 	/**
 	 * Ends every open `runs.subscribe` iteration: quietly on `stop()`, or with the given error
@@ -903,8 +909,9 @@ export function createEngineCore(
 			label: `payload of task "${task.id}"`,
 			maxBytes: resolved.limits.maxPayloadBytes,
 		});
-		// Before the insert: `trigger`, `runs.replay` and `runs.retryFailed` all create runs here.
-		await loadBackendForWrite();
+		// Before the insert: `trigger`, `runs.replay` and `runs.retryFailed` all create runs here
+		// (all three are `assertNotStopped` calls).
+		await loadBackendForWrite(assertNotStopped, options.tx);
 		const input: NewRun = {
 			id: randomUUID(),
 			taskId: task.id,
@@ -1119,7 +1126,7 @@ export function createEngineCore(
 					`${[...registry.queues.keys()].map(q => `"${q}"`).join(", ") || "no queue"}`
 			);
 		}
-		await loadBackendForWrite();
+		await loadBackendForWrite(assertNotStopped);
 		// Postgres first (the source of truth, decision 1), then the Redis flag. A failed Redis call
 		// only warns: the leader's reconciler tick and every start() re-apply the persisted state.
 		const { record } = await store.queues.setPaused(queue, paused);
@@ -1247,7 +1254,7 @@ export function createEngineCore(
 			const runId = runIdOf(run);
 			if (!isUuid(runId)) return "not_found";
 			// Review 5 fix round 1: a cancel can re-enqueue a waiting parent (afterResolution).
-			await loadBackendForWrite();
+			await loadBackendForWrite(assertNotClosed);
 			const result = await store.runs.cancel(runId, "canceled via engine.runs.cancel()");
 			if (result.kind !== "canceled") return result.kind;
 
@@ -1276,7 +1283,7 @@ export function createEngineCore(
 			assertNotStopped();
 			const valid = validBatchFilter("runs.cancelMany", filter);
 			// Review 5 fix round 1: like runs.cancel (a parent may be re-enqueued).
-			await loadBackendForWrite();
+			await loadBackendForWrite(assertNotStopped);
 			const page = await store.runs.listBatchCandidates({ purpose: "cancel", ...valid });
 			const perRun = await mapBounded(page.items, BATCH_CONCURRENCY, r => cancelOneOfBatch(r.id));
 			const canceled: string[] = [];
@@ -1300,7 +1307,7 @@ export function createEngineCore(
 			// Once for the whole batch: a load failure fails the call, instead of being reported per
 			// run as an `invalid_payload` skip (retryOneOfBatch maps ConfigError to that).
 			const valid = validBatchFilter("runs.retryFailed", filter);
-			await loadBackendForWrite();
+			await loadBackendForWrite(assertNotStopped);
 			const page = await store.runs.listBatchCandidates({ purpose: "retry", ...valid });
 			const outcomes = await mapBounded(page.items, BATCH_CONCURRENCY, retryOneOfBatch);
 			const result: RetryFailedResult = {
@@ -1518,7 +1525,7 @@ export function createEngineCore(
 			if (typeof tokenId !== "string" || !UUID_PATTERN.test(tokenId)) {
 				return { completed: false, reason: "not_found" };
 			}
-			await loadBackendForWrite();
+			await loadBackendForWrite(assertNotClosed);
 			const result = await store.waitpoints.completeToken(tokenId, value as Json);
 			switch (result.kind) {
 				case "not_found":

@@ -43,3 +43,48 @@ describe("assertPostgresReachable: timeout wording", () => {
 		expect(error.message).toMatch(/^cannot reach Postgres within 20 ms/);
 	});
 });
+
+describe("assertPostgresReachable: driver error wording (review 6 L2)", () => {
+	/** Node's happy-eyeballs connect: `localhost` -> ::1 and 127.0.0.1, an empty-message aggregate. */
+	function aggregateRefused(): AggregateError {
+		const error = new AggregateError(
+			[
+				Object.assign(new Error("connect ECONNREFUSED ::1:5432"), { code: "ECONNREFUSED" }),
+				Object.assign(new Error("connect ECONNREFUSED 127.0.0.1:5432"), { code: "ECONNREFUSED" }),
+			],
+			""
+		);
+		return Object.assign(error, { code: "ECONNREFUSED" });
+	}
+
+	it("an AggregateError with an empty message names its code and first inner error", async () => {
+		const cause = aggregateRefused();
+		const pool = {
+			options: {},
+			totalCount: 0,
+			waitingCount: 0,
+			connect: () => Promise.reject(cause),
+		} as unknown as Pool;
+		const error = await assertPostgresReachable(pool, 1_000).then(
+			() => undefined,
+			(e: unknown) => e as Error
+		);
+		expect(error).toBeInstanceOf(MinitriggerError);
+		expect(error?.message).not.toContain("Postgres ()");
+		expect(error?.message).toMatch(
+			/^cannot reach Postgres \(ECONNREFUSED: connect ECONNREFUSED ::1:5432\)/
+		);
+		expect((error as Error & { cause?: unknown }).cause).toBe(cause);
+	});
+
+	it("an ordinary error keeps its message", async () => {
+		const pool = {
+			options: {},
+			totalCount: 0,
+			waitingCount: 0,
+			connect: () => Promise.reject(new Error('password authentication failed for user "x"')),
+		} as unknown as Pool;
+		const error = await assertPostgresReachable(pool, 1_000).catch((e: unknown) => e as Error);
+		expect(error?.message).toMatch(/^cannot reach Postgres \(password authentication failed/);
+	});
+});
