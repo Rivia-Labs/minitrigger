@@ -22,7 +22,8 @@
  * so it only drops the schema.
  *
  * Prints a summary table, then cleans up: drops the schema and, in `bullmq` mode, obliterates
- * every BullMQ queue it created (including `${prefix}-system`).
+ * every BullMQ queue it created (including `${prefix}-system`), then deletes the
+ * `${prefix}:owner-schema` marker and any other key left under the prefix.
  *
  * Imports from `../dist/index.js` (the **built** package entry), not `../src`: running this file
  * straight off `.ts` sources works (Node >=23.6 strips erasable TS syntax with no flag/deps), but
@@ -399,6 +400,19 @@ async function cleanup(taskQueueNames: string[]): Promise<void> {
 			} finally {
 				await queue.close();
 			}
+		}
+		// Not a queue key: the prefix-owner marker `claimPrefix()` writes on start() (no TTL), then
+		// anything else left under this run's unique prefix.
+		try {
+			await redis.del(`${namespace}:owner-schema`);
+			let cursor = "0";
+			do {
+				const [next, keys] = await redis.scan(cursor, "MATCH", `${namespace}:*`, "COUNT", 500);
+				cursor = next;
+				if (keys.length > 0) await redis.del(...keys);
+			} while (cursor !== "0");
+		} catch (err) {
+			console.error(`[bench] failed to delete the keys under prefix "${namespace}"`, err);
 		}
 	} finally {
 		redis.disconnect();
