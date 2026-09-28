@@ -874,7 +874,19 @@ async function streamTo(
 	if (typeof name !== "string" || name.length === 0) {
 		throw new ConfigError("ctx.stream: name must be a non-empty string");
 	}
-	if (!deps.streams) throw new MinitriggerError("ctx.stream is not available in this engine");
+	if (!deps.streams) {
+		if (deps.config.transport !== "postgres") {
+			throw new MinitriggerError("ctx.stream is not available in this engine");
+		}
+		// Review 5 item B5: a code bug like an invalid step argument -- fatal (no retry, even when
+		// the task catches it), instead of a retryable error that burns every attempt.
+		const error = new ConfigError(
+			'ctx.stream is not available with transport "postgres" (decision 28(f)); use ' +
+				'transport "bullmq" for Redis Streams'
+		);
+		state.markFatal(error);
+		throw error;
+	}
 	// `ctx.signal` ends the stream (with an error end marker) if the attempt is aborted or
 	// finishes while the source is still producing, so readers never block forever.
 	await deps.streams.pipe(state.runId, name, source, { signal: state.signal });

@@ -1790,7 +1790,7 @@ overhead. Outside what's listed below, the two transports are equivalent: same `
 | `redis`, `prefix` | `ConfigError` at `createEngine()` — no Redis in this mode; NOTIFY channels derive from `schema` instead. |
 | `outbox.*` | `ConfigError` at `createEngine()` — `trigger(..., { tx })` already writes straight into the row the claim reads (decision 28(j)); there's no separate outbox to tune. |
 | `queue.rateLimit` | `ConfigError` at `createEngine()` — not implemented for this transport (no SQL rate limiter yet). |
-| `ctx.stream(name, source)` | `ConfigError` thrown to the task when called. |
+| `ctx.stream(name, source)` | `ConfigError` thrown to the task when called; like an invalid step argument, it fails the run without retry, even if the task catches it. |
 | `runs.readStream(run, name)` | `ConfigError` thrown when called. |
 
 ### How it works

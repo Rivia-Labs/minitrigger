@@ -39,7 +39,7 @@ que está listado abaixo, os dois transportes são equivalentes: mesmo `defineTa
 | `redis`, `prefix` | `ConfigError` no `createEngine()` — sem Redis neste modo; canais de `NOTIFY` derivam de `schema` em vez disso. |
 | `outbox.*` | `ConfigError` no `createEngine()` — `trigger(..., { tx })` já escreve direto na linha que o claim lê (decisão 28(j)); não há outbox separado para configurar. |
 | `queue.rateLimit` | `ConfigError` no `createEngine()` — não implementado para este transporte (ainda sem rate limiter em SQL). |
-| `ctx.stream(name, source)` | `ConfigError` lançado para a task quando chamado. |
+| `ctx.stream(name, source)` | `ConfigError` lançado para a task quando chamado; como um argumento de step inválido, falha a run sem retry, mesmo que a task capture o erro. |
 | `runs.readStream(run, name)` | `ConfigError` lançado quando chamado. |
 
 ## Como funciona

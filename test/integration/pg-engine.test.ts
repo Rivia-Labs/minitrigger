@@ -626,8 +626,10 @@ describe("engine with transport postgres", () => {
 		const engine = makeEngine([task]);
 		await engine.start();
 		const handle = await engine.trigger(task);
-		const run = await waitForStatus(engine, handle.id, "completed");
-		expect(run.output).toBe("ConfigError");
+		// Review 5 item B5: fatal (like an invalid step argument), even though the task caught it.
+		const run = await waitForStatus(engine, handle.id, "failed");
+		expect(run.error?.name).toBe("ConfigError");
+		expect(run.attempt).toBe(1);
 		expect(() => engine.runs.readStream(handle.id, "out")).toThrow(ConfigError);
 	});
 

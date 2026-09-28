@@ -125,8 +125,11 @@ export function createLazyBackend(
 			return current.backend.createPubSub();
 		},
 		streams: {
-			pipe: async (runId, name, source, options) =>
-				(await ensure()).backend.streams.pipe(runId, name, source, options),
+			pipe: async (runId, name, source, options) => {
+				const streams = (await ensure()).backend.streams;
+				if (!streams) throw new MinitriggerError("internal: backend without streams");
+				return streams.pipe(runId, name, source, options);
+			},
 		},
 		readStream,
 		createRunInTransaction: async (tx, input) => {

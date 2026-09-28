@@ -163,15 +163,8 @@ export function createPostgresBackend(ctx: BackendContext): BackendRuntime {
 				logger,
 			});
 		},
-		streams: {
-			// Decision 28(f): thrown to the task (a rejection of `ctx.stream`).
-			pipe: async () => {
-				throw new ConfigError(
-					'ctx.stream is not available with transport "postgres" (decision 28(f)); use ' +
-						'transport "bullmq" for Redis Streams'
-				);
-			},
-		},
+		// Decision 28(f): no `streams` -- `ctx.stream` fails the run without retry (the executor's
+		// `streamTo`, review 5 item B5).
 		readStream: () => {
 			throw new ConfigError(
 				'runs.readStream is not available with transport "postgres" (decision 28(f)); use ' +

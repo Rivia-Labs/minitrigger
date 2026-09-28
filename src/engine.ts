@@ -612,8 +612,11 @@ export interface EngineBackend {
 	publisher: PubSubPublisher;
 	/** Builds the subscriber side; called at most once, lazily. */
 	createPubSub(): PubSub;
-	/** Behind `ctx.stream`. */
-	streams: Pick<Streams, "pipe">;
+	/**
+	 * Behind `ctx.stream`. Absent (`transport: "postgres"`, decision 28(f)): `ctx.stream` fails the
+	 * run without retry (review 5 item B5).
+	 */
+	streams?: Pick<Streams, "pipe">;
 	/** Behind `runs.readStream`. */
 	readStream(
 		runId: string,
@@ -842,7 +845,7 @@ export function createEngineCore(
 		active,
 		isShuttingDown: lifecycle.isShuttingDown,
 		notify: notifier,
-		streams: backend.streams,
+		...(backend.streams ? { streams: backend.streams } : {}),
 		claimFailureLog: createLogThrottle(CLAIM_FAILURE_LOG_INTERVAL_MS),
 	};
 
