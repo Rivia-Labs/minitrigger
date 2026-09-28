@@ -21,6 +21,24 @@ Nomes de evento: `run:queued`, `run:started`, `run:waiting`, `run:completed`, `r
   Ausente em `run:queued`, `run:started` e `run:canceled`, que não estão marcando o fim de uma
   tentativa.
 
+### Exemplo: métricas e alertas a partir de eventos
+
+```ts
+engine.events.on("run:completed", event => {
+	metrics.histogram("task_duration_ms", event.durationMs ?? 0, { task: event.taskId });
+});
+engine.events.on("run:retrying", event => {
+	metrics.increment("task_retries", { task: event.taskId, error: event.error?.name ?? "unknown" });
+});
+engine.events.on("run:failed", async event => {
+	// Um handler que rejeita é logado com logger.error; nunca afeta a run.
+	await alerts.send(`${event.taskId} ${event.runId} failed after ${event.attempt} attempts: ${event.error?.message}`);
+});
+```
+
+Registre handlers em todo processo que roda workers: eventos são locais, então cada processo só vê
+as transições que ele mesmo fez.
+
 ## Logs
 
 ```ts
@@ -85,6 +103,33 @@ falhar, só aquele valor é descartado (com aviso). O progresso sobrevive a rete
 como rede de segurança; uma mudança só de progresso é emitida sozinha, não apenas como efeito
 colateral de uma transição de status).
 
+### Exemplo: endpoint SSE de progresso
+
+Um endpoint Server-Sent Events que empurra status e progresso para o navegador até a run terminar
+(`node:http` puro; o mesmo laço funciona em qualquer framework):
+
+```ts
+import { createServer } from "node:http";
+
+createServer(async (req, res) => {
+	const runId = new URL(req.url ?? "/", "http://localhost").searchParams.get("run");
+	if (!runId) return void res.writeHead(400).end();
+
+	res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache" });
+	const abort = new AbortController();
+	req.on("close", () => abort.abort()); // o navegador foi embora: encerra a assinatura
+
+	// Primeiro o estado atual de Postgres, depois toda mudança; termina depois de um status terminal.
+	for await (const { status, progress, updatedAt } of engine.runs.subscribe(runId, { signal: abort.signal })) {
+		res.write(`data: ${JSON.stringify({ status, progress, updatedAt })}\n\n`);
+	}
+	res.end();
+}).listen(3000);
+```
+
+Um id de run que não existe encerra o laço sem emitir nada. O engine que serve isso não precisa
+estar iniciado (ele abre sua própria conexão de subscriber).
+
 ## `runs.subscribe`
 
 ```ts
@@ -135,6 +180,32 @@ próxima tentativa que chama `ctx.stream` com o mesmo nome acrescenta ao mesmo s
 marcador: um leitor que começa do início nunca vê os chunks da retentativa. Use um nome por
 tentativa (ex.: `` `answer-${ctx.run.attempt}` ``) quando um stream precisa sobreviver a
 retentativas.
+
+### Exemplo: transmitindo a resposta de um LLM
+
+```ts
+export const answer = defineTask({
+	id: "answer",
+	run: async (payload: { question: string }, ctx) => {
+		let text = "";
+		async function* tokens() {
+			for await (const token of llm.stream(payload.question, { signal: ctx.signal })) {
+				text += token;
+				yield token;
+			}
+		}
+		await ctx.stream("answer", tokens()); // ao vivo, para os leitores abaixo
+		return { text }; // o resultado durável, em runs.output
+	},
+});
+
+// Leitor (outro processo também serve): chunks conforme chegam, termina no marcador de fim do escritor.
+const { id } = await engine.trigger(answer, { question });
+for await (const token of engine.runs.readStream<string>(id, "answer")) process.stdout.write(token);
+```
+
+`ctx.stream` precisa de `transport: "bullmq"` (Redis Streams). Se a run pode retentar depois de um
+stream com falha, use um nome por tentativa como explicado acima.
 
 ## `attachDefaultLogger`
 

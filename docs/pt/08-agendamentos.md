@@ -33,6 +33,40 @@ correspondente em Postgres é removido; um scheduler cujo cron/timezone divergiu
 recriado). Todo tick lê `cron`/`timezone`/`payload` direto de Postgres — nunca da cópia guardada no
 próprio job do BullMQ.
 
+Uma task sem payload não precisa de um no seu schedule também:
+
+```ts
+export const purgeExpiredSessions = defineTask({
+	id: "purge-expired-sessions",
+	schedule: { cron: "*/15 * * * *" }, // a cada 15 minutos
+	run: async () => { await db.sessions.deleteExpired(); },
+});
+```
+
+Schedules por cliente gerenciados a partir da tela de configurações do seu app: um schedule
+`"api"` por cliente, atualizado no lugar quando o cliente muda o horário (`upsert` é chaveado por
+`id`). Ids de schedule aceitam letras, dígitos, `_`, `.` e `-` (1 a 128 caracteres):
+
+```ts
+async function saveReportSettings(customer: { id: string; hour: number; timezone: string }) {
+	await engine.schedules.upsert({
+		id: `weekly-report.${customer.id}`,
+		task: weeklyReport,                       // defineTask cujo run recebe { customerId: string }
+		cron: `0 ${customer.hour} * * 1`,         // segundas-feiras, no horário escolhido...
+		timezone: customer.timezone,              // ...no próprio fuso do cliente
+		payload: { customerId: customer.id },
+	});
+}
+
+async function disableReport(customerId: string) {
+	await engine.schedules.delete(`weekly-report.${customerId}`);
+}
+```
+
+Cada tick cria uma run comum (com o payload do schedule lido direto de Postgres), então
+`runs.list({ taskId: "weekly-report" })`, eventos e retentativas funcionam como para qualquer outro
+trigger.
+
 ## Idempotência de tick
 
 Cada tick dispara a task com a chave de idempotência `` `__schedule:${id}:${scheduledAtMs}` `` (o

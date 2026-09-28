@@ -245,6 +245,116 @@ type WaitResult<T> =
 so a subtask failing, timing out, or being canceled never throws into the parent — you always
 check `.ok`.
 
+#### Example: an approval workflow
+
+A run that loads data, asks a human for approval through a link, waits up to three days for the
+answer (without holding a worker), then pays after a cool-off period. Every side effect is inside a
+step, so a crash or a retry at any point replays the finished steps from Postgres instead of
+re-running them. Steps are at-least-once, though: one interrupted mid-way (a crash after the email
+went out but before the step's result was saved) runs again, so make the side effects themselves
+idempotent where a duplicate matters (e.g. the payment provider's idempotency key, as in
+[Retries & backoff](#retries--backoff)).
+
+```ts
+import { AbortTaskRunError, defineTask } from "@rivia-labs/minitrigger";
+
+type Decision = { approved: boolean; note: string };
+
+export const approveExpense = defineTask({
+	id: "approve-expense",
+	retry: { maxAttempts: 5, backoff: { type: "exponential", baseMs: 2_000, maxMs: 60_000 } },
+	run: async (payload: { expenseId: string; approver: string }, ctx) => {
+		const expense = await ctx.step.run("load", () => db.expenses.find(payload.expenseId));
+		if (!expense) throw new AbortTaskRunError(`expense ${payload.expenseId} not found`); // no retry
+
+		const token = await ctx.step.createToken("approval", { timeout: "3d" });
+		await ctx.step.run("email-approver", () =>
+			mailer.send(payload.approver, `https://app.example.com/approve?token=${token.id}`),
+		);
+
+		const decision = await ctx.step.waitForToken<Decision>(token); // suspends: no worker slot used
+		if (!decision.ok) {
+			// decision.error.name === "Timeout": nobody answered within 3 days
+			await ctx.step.run("escalate", () => mailer.send("finance@example.com", `stuck: ${expense.id}`));
+			return { status: "escalated" as const };
+		}
+		if (!decision.output.approved) return { status: "rejected" as const, note: decision.output.note };
+
+		await ctx.step.sleep("cool-off", "1h"); // durable: survives restarts and deploys
+		const payment = await ctx.step.run("pay", () => payments.pay(expense.id, expense.amount));
+		ctx.logger.info("expense paid", { paymentId: payment.id });
+		return { status: "paid" as const, paymentId: payment.id };
+	},
+});
+```
+
+The link's handler completes the token from any process (an engine that never called `start()`
+is enough):
+
+```ts
+// e.g. POST /approve?token=...
+async function handleApproval(tokenId: string, approved: boolean, note: string) {
+	const outcome = await engine.tokens.complete(tokenId, { approved, note });
+	if (!outcome.completed) {
+		// "not_found" | "completed" (already answered) | "timed_out" | "run_finished"
+		return { status: 409, body: { reason: outcome.reason } };
+	}
+	return { status: 204 };
+}
+```
+
+`tokens.complete` only records the output and makes the run due; a worker picks it up right away.
+Completing twice is harmless (`reason: "completed"`), so the handler can be retried by the client.
+
+#### Example: subtasks
+
+```ts
+import { AbortTaskRunError, defineTask } from "@rivia-labs/minitrigger";
+
+export const resizeImage = defineTask({
+	id: "resize-image",
+	queue: { name: "images", concurrency: 8 },
+	run: async (payload: { url: string; width: number }) => ({ url: await resize(payload.url, payload.width) }),
+});
+
+export const notifyFollowers = defineTask({
+	id: "notify-followers",
+	run: async (payload: { albumId: string }) => { /* ... */ },
+});
+
+export const publishAlbum = defineTask({
+	id: "publish-album",
+	run: async (payload: { albumId: string; photos: string[] }, ctx) => {
+		// Fan out: one child run per photo; the parent suspends and resumes exactly once.
+		const thumbs = await ctx.step.batchTriggerAndWait(
+			"thumbnails",
+			resizeImage,
+			payload.photos.map(url => ({ url, width: 320 })),
+			{ timeout: "30m" },
+		);
+		// One WaitResult per payload, in the same order. A failed/timed-out child never throws here.
+		const ok = thumbs.flatMap(r => (r.ok ? [r.output.url] : []));
+		const failed = thumbs.filter(r => !r.ok).length;
+		if (failed > 0) ctx.logger.warn("some thumbnails failed", { failed });
+
+		const cover = await ctx.step.triggerAndWait("cover", resizeImage, {
+			url: payload.photos[0] ?? "",
+			width: 1200,
+		});
+		// A replay returns the same memoized failure, so retrying the parent can't help: abort.
+		if (!cover.ok) throw new AbortTaskRunError(`cover failed: ${cover.error.message}`);
+
+		// Fire and forget: the child runs on its own, the parent doesn't wait for it.
+		await ctx.step.trigger("notify", notifyFollowers, { albumId: payload.albumId });
+		return { thumbnails: ok, cover: cover.output.url };
+	},
+});
+```
+
+Each child is a normal run (visible in `runs.list()` with `parentRunId` set, retried by its own
+`retry` policy); the parent only sees its final result. Canceling the parent cancels its pending
+children.
+
 ### Idempotency
 
 ```ts
@@ -258,12 +368,37 @@ exceed `retention.days` (a key can't outlive the run it points to). Keys startin
 supplies one. `engine.runs.replay(runId)` starts a **new** run of the same task/payload — it does
 **not** reuse the original idempotency key.
 
+A typical use is a webhook that the provider may deliver more than once: key the run by the
+provider's event id and every redelivery gets the same run back.
+
+```ts
+async function onPaymentWebhook(event: { id: string; invoiceId: string }) {
+	const run = await engine.trigger(
+		fulfillInvoice,
+		{ invoiceId: event.invoiceId },
+		{ idempotencyKey: `stripe-${event.id}`, idempotencyKeyTtl: "30d" }, // TTL <= retention.days
+	);
+	return run.id; // same id for every delivery of this event while the key lives
+}
+```
+
 ### Debounce
 
 ```ts
 await engine.trigger(recalcClassification, { courseId }, {
 	debounce: { key: `course:${courseId}`, delay: "2s" },
 });
+```
+
+With every option: reindex a product 5 s after its last edit, with the newest payload, but never
+later than one minute after the first edit of a burst:
+
+```ts
+await engine.trigger(
+	reindexProduct,
+	{ productId, editedBy: userId },
+	{ debounce: { key: `product:${productId}`, delay: "5s", maxDelay: "1m", payload: "last" } },
+);
 ```
 
 Triggers with the same `(task, debounce.key)` collapse into **one pending run** while that run is
@@ -313,6 +448,20 @@ await engine.trigger(recalcClassification, { courseId }, {
 	concurrencyKey: courseId,
 	debounce: { key: courseId, delay: "2s" },
 });
+```
+
+A per-tenant limit works the same way: every tenant gets at most two syncs at once against a
+third-party API, while the queue as a whole still runs up to 20 in this process, so one busy
+tenant can't take every slot.
+
+```ts
+export const syncCrm = defineTask({
+	id: "sync-crm",
+	queue: { name: "crm-sync", concurrency: 20, concurrencyKey: { limit: 2 } },
+	run: async (payload: { tenantId: string; since: string }) => { /* ... */ },
+});
+
+await engine.trigger(syncCrm, { tenantId, since }, { concurrencyKey: `tenant-${tenantId}` });
 ```
 
 A queue that declares `concurrencyKey: { limit }` executes at most `limit` runs with the same
@@ -518,6 +667,212 @@ await prisma.$transaction(async tx => {
   backslash-adjacent one apart in that case. Minitrigger's own SQL never contains one; this only
   matters if you send other raw SQL through the same wrapped `tx`.
 
+The examples below assume one engine for the whole app (triggering only, or started — the `tx`
+path is the same) and a task like:
+
+```ts
+export const sendReceipt = defineTask({
+	id: "send-receipt",
+	run: async (payload: { orderId: string }) => { /* ... */ },
+});
+```
+
+In every one of them, if the transaction rolls back (an error thrown inside the callback, an
+explicit rollback, a failed `COMMIT`), **the run never existed**: no row, no job, no event — there
+is nothing to clean up. The engine must use the same database as the ORM (any connection; the
+run row is written through your transaction, not the engine's pool).
+
+##### TypeORM
+
+With `dataSource.transaction(...)` (commits when the callback resolves, rolls back when it throws):
+
+```ts
+import { typeormTx } from "@rivia-labs/minitrigger/typeorm";
+
+const order = await dataSource.transaction(async manager => {
+	const order = await manager.save(Order, { customerId, total });
+	await engine.trigger(sendReceipt, { orderId: order.id }, {
+		tx: typeormTx(manager),
+		idempotencyKey: `receipt-${order.id}`, // claimed in the same transaction
+	});
+	if (total > creditLimit) throw new Error("over the limit"); // rolls back the order AND the run
+	return order;
+});
+```
+
+With a `QueryRunner`, when you drive the transaction yourself:
+
+```ts
+const runner = dataSource.createQueryRunner();
+await runner.connect();
+await runner.startTransaction();
+try {
+	const order = await runner.manager.save(Order, { customerId, total });
+	await engine.trigger(sendReceipt, { orderId: order.id }, { tx: typeormTx(runner) });
+	await runner.commitTransaction(); // only now can the run execute
+} catch (error) {
+	await runner.rollbackTransaction(); // the run is gone with the order
+	throw error;
+} finally {
+	await runner.release();
+}
+```
+
+`typeormTx(dataSource.manager)` (a manager outside any transaction) throws `ConfigError` right
+away, and so does a wrapper used after `commitTransaction()`/`rollbackTransaction()`/`release()`:
+the transaction state is checked on every query, so a run can never silently autocommit on its
+own.
+
+##### knex
+
+```ts
+import { knexTx } from "@rivia-labs/minitrigger/knex";
+
+await knex.transaction(async trx => {
+	const [order] = await trx("orders").insert({ customer_id: customerId, total }).returning("id");
+	await engine.trigger(sendReceipt, { orderId: order.id }, { tx: knexTx(trx) });
+});
+```
+
+Or with a transaction object you commit/roll back yourself:
+
+```ts
+const trx = await knex.transaction();
+try {
+	const [order] = await trx("orders").insert({ customer_id: customerId, total }).returning("id");
+	await engine.trigger(sendReceipt, { orderId: order.id }, { tx: knexTx(trx) });
+	await trx.commit();
+} catch (error) {
+	await trx.rollback();
+	throw error;
+}
+```
+
+`knexTx(knex)` (the instance, not a transaction), a transaction that already committed or rolled
+back, and a non-`pg` client are `ConfigError`s. Remember the backslash limitation above if you
+also send your own raw SQL through the wrapped `tx` (the knex query builder itself is unaffected:
+it doesn't go through the wrapper).
+
+##### Drizzle
+
+Pass drizzle's own `sql` tag as the second argument (the adapter builds its statements with it,
+so it never imports drizzle-orm itself). Both PostgreSQL drivers work:
+
+```ts
+import { sql } from "drizzle-orm";
+import { drizzle } from "drizzle-orm/node-postgres";
+// or: import { drizzle } from "drizzle-orm/postgres-js"; const db = drizzle({ client: postgres(url) });
+import { Pool } from "pg";
+import { drizzleTx } from "@rivia-labs/minitrigger/drizzle";
+
+const db = drizzle({ client: new Pool({ connectionString: process.env.DATABASE_URL }) });
+
+await db.transaction(async tx => {
+	const [order] = await tx.insert(orders).values({ customerId, total }).returning();
+	await engine.trigger(sendReceipt, { orderId: order!.id }, { tx: drizzleTx(tx, sql) });
+	if (order!.total > creditLimit) tx.rollback(); // throws; the order and the run are rolled back
+});
+```
+
+`drizzleTx(db, sql)` (the database, not a transaction) and a missing `sql` tag are
+`ConfigError`s. Create the wrapper and `await` every `trigger` **inside** the callback: a wrapper
+used after the callback returned is detected (see above) and throws instead of running in someone
+else's transaction.
+
+##### Prisma
+
+Prisma 7 with the `prisma-client` generator and the `pg` driver adapter:
+
+```ts
+import { PrismaPg } from "@prisma/adapter-pg";
+import { prismaTx } from "@rivia-labs/minitrigger/prisma";
+import { PrismaClient } from "./generated/prisma/client.js"; // your generator's `output`
+
+const prisma = new PrismaClient({
+	adapter: new PrismaPg({ connectionString: process.env.DATABASE_URL! }),
+});
+
+const order = await prisma.$transaction(
+	async tx => {
+		const order = await tx.order.create({ data: { customerId, total } });
+		await engine.trigger(sendReceipt, { orderId: order.id }, { tx: prismaTx(tx) });
+		return order;
+	},
+	{ timeout: 10_000 }, // the interactive transaction's own limit (default 5 s) covers the trigger too
+);
+```
+
+Only the **interactive** form works: `prisma.$transaction([...])` (the array/batch form) never
+hands you a transaction client, so there is nothing to pass as `tx`. `prismaTx(prisma)` (the
+`PrismaClient` itself, where each statement would autocommit) is a `ConfigError`.
+
+##### Plain `pg`, and any other driver
+
+A node-postgres `PoolClient`/`Client` with an open `BEGIN` is already a valid `tx` (see the first
+example of this section). For any other driver, pass an object whose `query(text, values)` runs the
+statement (`$1..$n` placeholders, values as bind parameters) **on the transaction's connection**
+and resolves to `{ rows }`. For example, postgres.js without an ORM:
+
+```ts
+import postgres from "postgres";
+import type { TransactionClient } from "@rivia-labs/minitrigger";
+
+// postgres.js serializes a value bound to a json/jsonb parameter itself (JSON.stringify, picked
+// from the type the server infers), but the engine already sends the payload as JSON text, so it
+// would be stored as a jsonb *string*. Pass json/jsonb values through as-is, as drizzle-orm does
+// for its own postgres.js client. This applies to every query on this client: use a dedicated
+// one for triggers, or send JSON.stringify(value) yourself for your own json/jsonb parameters.
+const sql = postgres(process.env.DATABASE_URL!);
+sql.options.serializers[114] = sql.options.serializers[3802] = (x: unknown) => x; // json, jsonb
+
+await sql.begin(async tx => {
+	const [order] = await tx`
+		INSERT INTO orders (customer_id, total) VALUES (${customerId}, ${total}) RETURNING id`;
+	const client: TransactionClient = {
+		query: async (text, values = []) => ({ rows: await tx.unsafe(text, values as never[]) }),
+	};
+	await engine.trigger(sendReceipt, { orderId: String(order!.id) }, { tx: client });
+});
+```
+
+The engine only sends strings, numbers, booleans and `null` as values (the payload is sent as JSON
+text with an explicit `::jsonb` cast), and the run insert casts every placeholder explicitly, so a
+driver that types every bind parameter as `text` (like Prisma's raw queries) works too. A driver
+that instead re-serializes each value according to the parameter type the server infers must have
+that disabled for json/jsonb, as above — otherwise the payload is JSON-encoded twice. `drizzleTx`
+(on either driver) and node-postgres need nothing extra.
+
+##### Several triggers in one transaction
+
+Trigger as many runs as you need in the same transaction — of the same task or different ones.
+They commit together. With `transport: "bullmq"` and `outbox.notify` at its default, the whole
+transaction sends a single `NOTIFY`; with `transport: "postgres"`, one per distinct queue of the
+runs it triggered (Postgres collapses identical notifications within a transaction):
+
+```ts
+await dataSource.transaction(async manager => {
+	const order = await manager.save(Order, { customerId, total, items });
+	const tx = typeormTx(manager); // one wrapper per transaction is enough
+	await engine.trigger(sendReceipt, { orderId: order.id }, { tx });
+	await engine.trigger(reserveStock, { orderId: order.id }, { tx });
+	for (const item of items) {
+		await engine.trigger(notifyWarehouse, { orderId: order.id, sku: item.sku }, { tx });
+	}
+});
+```
+
+Issue them one after another (`await` each), not with `Promise.all`: they share one connection,
+which runs one statement at a time anyway.
+
+##### With `transport: "postgres"`
+
+`trigger(..., { tx })` works the same in [Postgres-only mode](#postgres-only-mode), and the
+adapters above are used unchanged (the same parameterized insert goes through them). The run row
+itself is the queue there, so the insert in your transaction is all there is: on commit, a
+`NOTIFY` wakes the queue's workers (the poll picks it up otherwise), and on rollback the row never
+existed. There is no separate outbox sweep in that mode, which is why the `outbox.*` options are
+rejected with `transport: "postgres"`.
+
 ### Queues
 
 ```ts
@@ -538,6 +893,24 @@ is BullMQ's own queue-level limit, enforced across **every** process sharing the
 via `Queue.setGlobalConcurrency()`) — set it when several deployed processes share a queue and the
 cap needs to hold across all of them, not per process.
 
+```ts
+// Two tasks share the "emails" queue; only one of them declares its settings.
+export const sendWelcome = defineTask({
+	id: "send-welcome",
+	queue: { name: "emails", concurrency: 5, globalConcurrency: 20 }, // 5 per process, 20 in total
+	run: async (payload: { userId: string }) => { /* ... */ },
+});
+export const sendDigest = defineTask({
+	id: "send-digest",
+	queue: { name: "emails" },
+	run: async (payload: { userId: string; week: string }) => { /* ... */ },
+});
+
+// Split workloads across processes: this one only consumes "emails" (plus the internal `-system`
+// queue, which always starts); an engine that never calls start() only triggers.
+await engine.start({ queues: ["emails"] });
+```
+
 #### Pausing, resuming and scaling queues
 
 ```ts
@@ -545,6 +918,23 @@ await engine.queues.pause("llm");   // every process stops starting new runs of 
 await engine.queues.resume("llm");
 await engine.queues.list();         // [{ name, paused, updatedAt, declared, declaredConcurrency, concurrency, activeLocal }]
 await engine.queues.scale("llm", 5); // THIS process's worker only, until it restarts
+```
+
+For example, an admin script that holds outgoing email while the provider has an incident. It
+never starts workers; pausing still applies to every running process at once:
+
+```ts
+const admin = createEngine({
+	postgres: process.env.DATABASE_URL!,
+	redis: process.env.REDIS_URL!,
+	tasks: [sendWelcome, sendDigest],
+});
+
+const state = await admin.queues.pause("emails"); // { name: "emails", paused: true, updatedAt }
+// ...later, once the provider is back:
+await admin.queues.resume("emails");               // queued runs start draining right away
+for (const q of await admin.queues.list()) console.log(q.name, q.paused ? "paused" : "running");
+await admin.stop();
 ```
 
 - `pause`/`resume` work across processes and survive restarts. The state is saved in Postgres
@@ -597,6 +987,39 @@ type: "exponential", baseMs: 1_000, maxMs: 60_000 } }`. Throwing `AbortTaskRunEr
 task (or a `step.run` callback) fails the run permanently — **no retry is scheduled**, regardless
 of `maxAttempts`.
 
+A common split: transient failures throw a normal error (retried with backoff), permanent ones throw
+`AbortTaskRunError`. A retry replays the function, so steps that already succeeded are not redone:
+
+```ts
+import { AbortTaskRunError, defineTask } from "@rivia-labs/minitrigger";
+
+export const chargeCard = defineTask({
+	id: "charge-card",
+	retry: { maxAttempts: 6, backoff: { type: "exponential", baseMs: 5_000, maxMs: 10 * 60_000 } },
+	maxDurationMs: 60_000,
+	run: async (payload: { invoiceId: string }, ctx) => {
+		const invoice = await ctx.step.run("load-invoice", () => loadInvoice(payload.invoiceId));
+		return ctx.step.run("charge", async () => {
+			const res = await fetch("https://payments.example.com/charges", {
+				method: "POST",
+				headers: { "idempotency-key": invoice.id }, // the provider dedupes a retried call
+				body: JSON.stringify({ amount: invoice.amount }),
+				signal: ctx.signal, // aborted on cancel, maxDurationMs, shutdown
+			});
+			if (res.status >= 400 && res.status < 500 && res.status !== 408 && res.status !== 429) {
+				throw new AbortTaskRunError(`charge rejected (${res.status})`); // retrying won't help
+			}
+			// 5xx, 408 (timeout), 429 (rate limited): retried with backoff
+			if (!res.ok) throw new Error(`payments API ${res.status} (attempt ${ctx.run.attempt})`);
+			return (await res.json()) as { chargeId: string };
+		});
+	},
+});
+```
+
+A step's `fn` that throws is not memoized: the next attempt runs it again, so side effects inside
+it should be idempotent on the other end (as the `idempotency-key` header above).
+
 ### `maxDurationMs`
 
 ```ts
@@ -628,6 +1051,26 @@ const { retried, skipped, hasMore, nextCursor } = await engine.runs.retryFailed(
 	createdFrom: new Date(Date.now() - 24 * 3_600_000),
 	limit: 100,
 });
+```
+
+A nightly sweep that retries every failed `send-email` run of the last day, page by page (safe to
+run twice: a run already retried is never a candidate again):
+
+```ts
+import type { BatchRunsFilter } from "@rivia-labs/minitrigger";
+
+const filter: BatchRunsFilter = {
+	taskId: "send-email",
+	createdFrom: new Date(Date.now() - 24 * 3_600_000),
+	limit: 200,
+};
+let page = await engine.runs.retryFailed(filter);
+for (;;) {
+	for (const { runId, newRunId } of page.retried) console.log(`retried ${runId} as ${newRunId}`);
+	for (const { runId, reason } of page.skipped) console.warn(`skipped ${runId}: ${reason}`);
+	if (!page.hasMore || !page.nextCursor) break;
+	page = await engine.runs.retryFailed({ ...filter, cursor: page.nextCursor });
+}
 ```
 
 - Filter: `taskId?`, `queue?`, `createdFrom?` (inclusive), `createdTo?` (exclusive), `cursor?`, and a
@@ -716,7 +1159,7 @@ Names already covered by their own subsection above/below link there instead of 
 | Export | What it is |
 |---|---|
 | `createEngine(config)` | Builds an [`Engine`](#createengineconfig). |
-| `Engine`, `EngineClient` | `Engine` is the full client (also `migrate`/`start`/`stop`); `EngineClient` is the `Pick<Engine, "trigger" \| "runs" \| "tokens" \| "schedules" \| "events">` subset both `Engine` and `TestEngine` satisfy. |
+| `Engine`, `EngineClient` | `Engine` is the full client (also `migrate`/`start`/`stop`); `EngineClient` is the `Pick<Engine, "trigger" \| "runs" \| "tokens" \| "schedules" \| "events" \| "queues">` subset both `Engine` and `TestEngine` satisfy. |
 | `EngineConfig`, `EngineLimits`, `EngineLogger`, `EngineLogFn` | `createEngine`'s config shape (a discriminated union on `transport`, see [Postgres-only mode](#postgres-only-mode)); payload/output size limits ([config table](#config-options)); the pino/console-compatible logger shape and its per-level function type. |
 | `BullmqTransportConfig`, `PostgresTransportConfig`, `RedisLike` | The transport-specific halves of the `EngineConfig` union (`transport: "bullmq"` \| `"postgres"`); `RedisLike` is the minimal structural shape of an injected `redis.connection` (no `ioredis` import in public types; checked to be an ioredis `Redis` at runtime). |
 | `BullmqEngineConfig`, `PostgresEngineConfig`, `CommonConfig` | The two members of `EngineConfig` (`CommonConfig & BullmqTransportConfig`, `CommonConfig & PostgresTransportConfig`) and their shared fields; object types, for `extends`/`Omit`/`Partial` (see [Upgrading to 0.4.0](#upgrading-to-040)). `BullmqEngineConfig<Redis>` types `redis.connection` as ioredis `Redis`. |
@@ -900,6 +1343,50 @@ for await (const token of engine.runs.readStream<string>(runId, "answer")) proce
   a reader starting from the beginning never sees the retry's chunks. Use a per-attempt name
   (e.g. `` `answer-${ctx.run.attempt}` ``) when a stream must survive retries.
 
+#### Example: metrics and alerts from events
+
+```ts
+engine.events.on("run:completed", event => {
+	metrics.histogram("task_duration_ms", event.durationMs ?? 0, { task: event.taskId });
+});
+engine.events.on("run:retrying", event => {
+	metrics.increment("task_retries", { task: event.taskId, error: event.error?.name ?? "unknown" });
+});
+engine.events.on("run:failed", async event => {
+	// A rejected handler is logged with logger.error; it never affects the run.
+	await alerts.send(`${event.taskId} ${event.runId} failed after ${event.attempt} attempts: ${event.error?.message}`);
+});
+```
+
+Register handlers on every process that runs workers: events are local, so each process sees the
+transitions it made itself.
+
+#### Example: streaming an LLM answer
+
+```ts
+export const answer = defineTask({
+	id: "answer",
+	run: async (payload: { question: string }, ctx) => {
+		let text = "";
+		async function* tokens() {
+			for await (const token of llm.stream(payload.question, { signal: ctx.signal })) {
+				text += token;
+				yield token;
+			}
+		}
+		await ctx.stream("answer", tokens()); // live, for readers below
+		return { text }; // the durable result, in runs.output
+	},
+});
+
+// Reader (another process is fine): chunks as they arrive, then ends at the writer's end marker.
+const { id } = await engine.trigger(answer, { question });
+for await (const token of engine.runs.readStream<string>(id, "answer")) process.stdout.write(token);
+```
+
+`ctx.stream` needs `transport: "bullmq"` (Redis Streams). If the run can retry after a failed
+stream, use a per-attempt name as explained above.
+
 #### Structured logging (`attachDefaultLogger`)
 
 ```ts
@@ -916,7 +1403,7 @@ detach();
 ```
 
 Opt-in only — neither `createEngine` nor `start()` calls it for you. `engine` can be any engine
-exposing `events` — a real `Engine` or a `TestEngine` (the `EventSource` type) — but the `logger`
+exposing `events` — a real `Engine` or a `TestEngine` (the `EngineEventSource` type) — but the `logger`
 argument is only optional for an `Engine`, which carries its own `config.logger`; a `TestEngine`
 has none, so it's required there (omitting it throws `ConfigError`). It subscribes to
 `engine.events` and writes one structured line per run transition:
@@ -959,6 +1446,31 @@ run: async (payload, ctx) => {
 ```ts
 (await engine.runs.get(runId))?.progress; // { processed: 340, total: 800 } | null
 ```
+
+A Server-Sent Events endpoint that pushes status and progress to the browser until the run
+finishes (plain `node:http`; the same loop works in any framework):
+
+```ts
+import { createServer } from "node:http";
+
+createServer(async (req, res) => {
+	const runId = new URL(req.url ?? "/", "http://localhost").searchParams.get("run");
+	if (!runId) return void res.writeHead(400).end();
+
+	res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache" });
+	const abort = new AbortController();
+	req.on("close", () => abort.abort()); // browser went away: end the subscription
+
+	// First the current state from Postgres, then every change; ends after a terminal status.
+	for await (const { status, progress, updatedAt } of engine.runs.subscribe(runId, { signal: abort.signal })) {
+		res.write(`data: ${JSON.stringify({ status, progress, updatedAt })}\n\n`);
+	}
+	res.end();
+}).listen(3000);
+```
+
+A run id that doesn't exist ends the loop without emitting anything. The engine serving this
+doesn't need to be started (it opens its own subscriber connection).
 
 `ctx.progress.set(value)` overwrites a single value per run (`runs.progress`; `null` until the
 first call) — not a log, not a step: it isn't memoized and doesn't participate in non-determinism
@@ -1009,6 +1521,39 @@ export const dailyDigest = defineTask({
 	run: async (payload: { url: string }) => { /* ... */ },
 });
 ```
+
+A task that takes no payload needs none in its schedule either:
+
+```ts
+export const purgeExpiredSessions = defineTask({
+	id: "purge-expired-sessions",
+	schedule: { cron: "*/15 * * * *" }, // every 15 minutes
+	run: async () => { await db.sessions.deleteExpired(); },
+});
+```
+
+Per-customer schedules managed from your app's settings screen: one `"api"` schedule per
+customer, updated in place when the customer changes the time (`upsert` is keyed by `id`).
+Schedule ids allow letters, digits, `_`, `.` and `-` (1–128 characters):
+
+```ts
+async function saveReportSettings(customer: { id: string; hour: number; timezone: string }) {
+	await engine.schedules.upsert({
+		id: `weekly-report.${customer.id}`,
+		task: weeklyReport,                       // defineTask whose run takes { customerId: string }
+		cron: `0 ${customer.hour} * * 1`,         // Mondays at the chosen hour...
+		timezone: customer.timezone,              // ...in the customer's own timezone
+		payload: { customerId: customer.id },
+	});
+}
+
+async function disableReport(customerId: string) {
+	await engine.schedules.delete(`weekly-report.${customerId}`);
+}
+```
+
+Each tick creates an ordinary run (with the schedule's payload read fresh from Postgres), so
+`runs.list({ taskId: "weekly-report" })`, events and retries work as for any other trigger.
 
 Postgres is the source of truth for `cron`/`timezone`/`payload` (decision 8): `engine.schedules.*`
 and the declarative sync write it first, then sync the BullMQ job scheduler on the internal
@@ -1252,6 +1797,49 @@ it("approves a document", async () => {
   `retention`, only `days` is accepted (for the idempotency-key TTL check, exactly as in
   `createEngine`): the test engine never runs retention sweeps.
 
+#### Example: testing both outcomes of a timeout
+
+Using the `approveExpense` task from [the approval workflow example](#example-an-approval-workflow)
+(with `db`, `mailer` and `payments` mocked as usual in your test runner). With the default clock
+the `sleep("cool-off", "1h")` is instant; with `autoAdvance: false` you move time yourself, which is
+how you reach the token's 3-day timeout:
+
+```ts
+import { createTestEngine } from "@rivia-labs/minitrigger/testing";
+import { expect, it } from "vitest";
+import { approveExpense } from "./tasks.js";
+
+it("pays an approved expense", async () => {
+	const engine = createTestEngine({ tasks: [approveExpense] });
+	const run = await engine.runInline(approveExpense, { expenseId: "e1", approver: "ana@example.com" });
+	expect(run.status).toBe("waiting");
+
+	const [token] = await engine.tokens.pending(run.runId); // [{ id, name: "approval" }]
+	expect(await engine.tokens.complete(token!.id, { approved: true, note: "ok" })).toEqual({ completed: true });
+
+	const final = await engine.drive(run.runId); // the 1h sleep is skipped by autoAdvance
+	expect(final.status).toBe("completed");
+	expect(final.output).toMatchObject({ status: "paid" });
+	await engine.stop();
+});
+
+it("escalates when nobody answers in 3 days", async () => {
+	const engine = createTestEngine({ tasks: [approveExpense], clock: { autoAdvance: false } });
+	const run = await engine.runInline(approveExpense, { expenseId: "e1", approver: "ana@example.com" });
+
+	await engine.clock.advance("3d"); // the token expires; the run resumes with { ok: false }
+	const final = await engine.drive(run.runId);
+	expect(final).toMatchObject({ status: "completed", output: { status: "escalated" } });
+
+	const steps = await engine.runs.steps(run.runId);
+	expect(steps.map(s => s.name)).toContain("escalate");
+	await engine.stop();
+});
+```
+
+`events.on` works here too, e.g. to assert that a run retried: collect `run:retrying` events into
+an array before driving the engine.
+
 ### `assertTriggered` / `refuteTriggered` / `allTriggered`
 
 Also from `@rivia-labs/minitrigger/testing`, inspired by `@rivia-labs/oban-ts`'s
@@ -1290,6 +1878,25 @@ assertions off it (`(await assertTriggered(engine, ...)).runId`); with no match,
 `AssertionError` listing what WAS triggered (bounded, payloads truncated, never a full dump).
 `allTriggered(engine, match?)` returns every match, oldest first.
 
+```ts
+const engine = createTestEngine({ tasks: [publishAlbum, resizeImage, notifyFollowers, syncCrm] });
+
+// Every child of publishAlbum's batch was triggered, and linked to the parent. Runs created in
+// the same millisecond have no guaranteed order, so compare them as a set.
+const parent = await engine.runInline(publishAlbum, { albumId: "a1", photos: ["p1.jpg", "p2.jpg"] });
+const thumbs = await allTriggered(engine, { task: resizeImage, payload: { width: 320 } });
+expect(thumbs.map(r => r.payload)).toHaveLength(2);
+expect(thumbs.map(r => r.payload)).toEqual(
+	expect.arrayContaining([{ url: "p1.jpg", width: 320 }, { url: "p2.jpg", width: 320 }]),
+);
+expect(thumbs.every(r => r.parentRunId === parent.runId)).toBe(true);
+
+// A per-tenant sync was queued with the right concurrency key, and nothing for another tenant.
+await engine.trigger(syncCrm, { tenantId: "42", since: "2026-01-01" }, { concurrencyKey: "tenant-42" });
+await assertTriggered(engine, { task: "sync-crm", concurrencyKey: "tenant-42", status: "queued" });
+await refuteTriggered(engine, { task: "sync-crm", concurrencyKey: "tenant-7" });
+```
+
 ### `runTask`: unit-testing one task's logic
 
 `runTask(task, payload, options?)`, also from the testing subpath, runs a task's `run` function
@@ -1306,6 +1913,34 @@ it("approves when the token resolves truthy", async () => {
 		tokens: { approval: { approved: true } },
 	});
 	expect(result).toMatchObject({ output: { status: "approved" }, error: null });
+});
+```
+
+Children are replaced by stubs keyed by the child task's id. A stub that throws becomes that
+child's `{ ok: false, error }`, so failure handling is easy to exercise:
+
+```ts
+it("keeps the thumbnails that worked and notifies followers", async () => {
+	const result = await runTask(publishAlbum, { albumId: "a1", photos: ["p1.jpg", "bad.jpg"] }, {
+		children: {
+			"resize-image": payload => {
+				const { url, width } = payload as { url: string; width: number };
+				if (url === "bad.jpg" && width === 320) throw new Error("corrupt image");
+				return { url: `${url}@${width}` };
+			},
+			"notify-followers": () => null,
+		},
+	});
+
+	expect(result.error).toBeNull();
+	expect(result.output).toEqual({ thumbnails: ["p1.jpg@320"], cover: "p1.jpg@1200" });
+	expect(result.logs).toContainEqual(expect.objectContaining({ level: "warn", data: { failed: 1 } }));
+	expect(result.triggered.map(t => [t.mode, t.taskId])).toEqual([
+		["batchTriggerAndWait", "resize-image"],
+		["batchTriggerAndWait", "resize-image"],
+		["triggerAndWait", "resize-image"],
+		["trigger", "notify-followers"],
+	]);
 });
 ```
 
@@ -1888,6 +2523,42 @@ overhead. Outside what's listed below, the two transports are equivalent: same `
   schedule doesn't exist. Missed ticks (no process running) are still not backfilled, same as
   BullMQ mode; a tick that has to retry (backoff) delays its own following ticks, since there's
   never more than one in flight for a given schedule.
+
+### Example: a full setup
+
+A fuller setup than the one at the top of this section, with a shared `pg.Pool` and graceful
+shutdown. Everything else — `defineTask`, steps, `trigger` (including `{ tx }` with the ORM
+adapters), schedules, queues, events, `runs.subscribe` — is written exactly as in the examples
+earlier in this README:
+
+```ts
+import { createEngine, type PostgresEngineConfig } from "@rivia-labs/minitrigger";
+import { Pool } from "pg";
+
+// Your own pool: size it for the queues' concurrency + systemConcurrency + 5, and set a timeout.
+const pool = new Pool({
+	connectionString: process.env.DATABASE_URL,
+	max: 40,
+	connectionTimeoutMillis: 10_000,
+});
+
+const config: PostgresEngineConfig = {
+	transport: "postgres",
+	postgres: { pool },                       // never closed by the engine
+	schema: "jobs",
+	tasks: [approveExpense, publishAlbum, resizeImage, notifyFollowers],
+	polling: { intervalMs: 500, jitterMs: 50 }, // fallback when a NOTIFY is missed (default 1 000)
+};
+const engine = createEngine(config);
+
+await engine.migrate();
+await engine.start();
+
+process.once("SIGTERM", async () => {
+	await engine.stop(); // finishes or hands back running runs
+	await pool.end();
+});
+```
 
 ### Latencies
 

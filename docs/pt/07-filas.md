@@ -26,6 +26,24 @@ ela — uma segunda declaração diferente para o mesmo nome falha a criação d
 claro. Uma task sem `queue` pertence à fila `"default"` (concorrência 10, salvo declaração
 diferente).
 
+```ts
+// Duas tasks compartilham a fila "emails"; só uma delas declara as configurações.
+export const sendWelcome = defineTask({
+	id: "send-welcome",
+	queue: { name: "emails", concurrency: 5, globalConcurrency: 20 }, // 5 por processo, 20 no total
+	run: async (payload: { userId: string }) => { /* ... */ },
+});
+export const sendDigest = defineTask({
+	id: "send-digest",
+	queue: { name: "emails" },
+	run: async (payload: { userId: string; week: string }) => { /* ... */ },
+});
+
+// Divida a carga entre processos: este só consome "emails" (mais a fila interna `-system`,
+// que sempre inicia); um engine que nunca chama start() só dispara.
+await engine.start({ queues: ["emails"] });
+```
+
 ## Chaves de concorrência (`concurrencyKey`)
 
 ```ts
@@ -36,6 +54,20 @@ defineTask({
 });
 
 await engine.trigger(recalcClassification, { courseId }, { concurrencyKey: courseId });
+```
+
+Um limite por tenant funciona do mesmo jeito: cada tenant tem no máximo duas sincronizações
+simultâneas contra uma API de terceiros, enquanto a fila como um todo ainda roda até 20 neste
+processo, então um tenant ocupado não consegue tomar todos os slots.
+
+```ts
+export const syncCrm = defineTask({
+	id: "sync-crm",
+	queue: { name: "crm-sync", concurrency: 20, concurrencyKey: { limit: 2 } },
+	run: async (payload: { tenantId: string; since: string }) => { /* ... */ },
+});
+
+await engine.trigger(syncCrm, { tenantId, since }, { concurrencyKey: `tenant-${tenantId}` });
 ```
 
 Uma fila que declara `concurrencyKey: { limit }` executa no máximo `limit` runs com o mesmo
@@ -74,12 +106,48 @@ iniciada — ela volta para a fila **sem gastar uma tentativa**, e tenta de novo
   (`stallTimeoutMs`) perceber e reenfileirá-la — um worker travado pode bloquear uma chave por até
   esse tempo.
 
+## Idempotência
+
+```ts
+await engine.trigger(sendReceipt, { orderId }, { idempotencyKey: `receipt-${orderId}` });
+```
+
+`idempotencyKey` faz `trigger()` devolver a run existente em vez de criar outra enquanto a chave
+ainda vive (`idempotencyKeyTtl`, padrão 7 dias, não pode exceder `retention.days` — uma chave não
+sobrevive à run que ela aponta). Um uso típico é um webhook que o provedor pode entregar mais de uma
+vez: chaveie a run pelo id do evento do provedor e toda redelivery recebe a mesma run de volta.
+
+```ts
+async function onPaymentWebhook(event: { id: string; invoiceId: string }) {
+	const run = await engine.trigger(
+		fulfillInvoice,
+		{ invoiceId: event.invoiceId },
+		{ idempotencyKey: `stripe-${event.id}`, idempotencyKeyTtl: "30d" }, // TTL <= retention.days
+	);
+	return run.id; // mesmo id para toda entrega deste evento enquanto a chave viver
+}
+```
+
+`engine.runs.replay(runId)` inicia uma run **nova** da mesma task/payload — ela **não** reaproveita
+a chave de idempotência original.
+
 ## Debounce
 
 ```ts
 await engine.trigger(recalcClassification, { courseId }, {
 	debounce: { key: `course:${courseId}`, delay: "2s" },
 });
+```
+
+Com todas as opções: reindexar um produto 5 s depois da última edição, com o payload mais recente,
+mas nunca mais que um minuto depois da primeira edição de uma rajada:
+
+```ts
+await engine.trigger(
+	reindexProduct,
+	{ productId, editedBy: userId },
+	{ debounce: { key: `product:${productId}`, delay: "5s", maxDelay: "1m", payload: "last" } },
+);
 ```
 
 Triggers com o mesmo `(task, debounce.key)` colapsam em **uma run pendente** enquanto essa run
@@ -141,6 +209,24 @@ await engine.queues.pause("llm");    // todo processo para de iniciar novas runs
 await engine.queues.resume("llm");
 await engine.queues.list();          // [{ name, paused, updatedAt, declared, declaredConcurrency, concurrency, activeLocal }]
 await engine.queues.scale("llm", 5); // só o worker DESTE processo, até ele reiniciar
+```
+
+Por exemplo, um script administrativo que segura o envio de e-mails enquanto o provedor tem um
+incidente. Ele nunca inicia workers; pausar continua valendo para todo processo em execução na
+hora:
+
+```ts
+const admin = createEngine({
+	postgres: process.env.DATABASE_URL!,
+	redis: process.env.REDIS_URL!,
+	tasks: [sendWelcome, sendDigest],
+});
+
+const state = await admin.queues.pause("emails"); // { name: "emails", paused: true, updatedAt }
+// ...mais tarde, quando o provedor voltar:
+await admin.queues.resume("emails");               // runs enfileiradas começam a drenar na hora
+for (const q of await admin.queues.list()) console.log(q.name, q.paused ? "paused" : "running");
+await admin.stop();
 ```
 
 - `pause`/`resume` funcionam entre processos e sobrevivem a reinicializações. O estado é salvo

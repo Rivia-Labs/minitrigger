@@ -70,6 +70,50 @@ Pontos importantes:
 - `maxDurationMs`, heartbeats e flushes de log continuam usando timers reais. Um drain que processa
   mais que `maxJobsPerDrain` jobs (padrão 10 000) lança, para pegar runs que nunca assentam.
 
+### Exemplo: testando os dois desfechos de um timeout
+
+Usando a task `approveExpense` do
+[exemplo de fluxo de aprovação](05-espera.md#exemplo-um-fluxo-de-aprovação) (com `db`, `mailer` e
+`payments` mockados como de costume no seu test runner). Com o relógio padrão, o
+`sleep("cool-off", "1h")` é instantâneo; com `autoAdvance: false` você move o tempo você mesmo, que
+é como se chega ao timeout de 3 dias do token:
+
+```ts
+import { createTestEngine } from "@rivia-labs/minitrigger/testing";
+import { expect, it } from "vitest";
+import { approveExpense } from "./tasks.js";
+
+it("paga uma despesa aprovada", async () => {
+	const engine = createTestEngine({ tasks: [approveExpense] });
+	const run = await engine.runInline(approveExpense, { expenseId: "e1", approver: "ana@example.com" });
+	expect(run.status).toBe("waiting");
+
+	const [token] = await engine.tokens.pending(run.runId); // [{ id, name: "approval" }]
+	expect(await engine.tokens.complete(token!.id, { approved: true, note: "ok" })).toEqual({ completed: true });
+
+	const final = await engine.drive(run.runId); // o sleep de 1h é pulado pelo autoAdvance
+	expect(final.status).toBe("completed");
+	expect(final.output).toMatchObject({ status: "paid" });
+	await engine.stop();
+});
+
+it("escala quando ninguém responde em 3 dias", async () => {
+	const engine = createTestEngine({ tasks: [approveExpense], clock: { autoAdvance: false } });
+	const run = await engine.runInline(approveExpense, { expenseId: "e1", approver: "ana@example.com" });
+
+	await engine.clock.advance("3d"); // o token expira; a run retoma com { ok: false }
+	const final = await engine.drive(run.runId);
+	expect(final).toMatchObject({ status: "completed", output: { status: "escalated" } });
+
+	const steps = await engine.runs.steps(run.runId);
+	expect(steps.map(s => s.name)).toContain("escalate");
+	await engine.stop();
+});
+```
+
+`events.on` também funciona aqui, por exemplo para verificar que uma run retentou: colete eventos
+`run:retrying` num array antes de fazer o engine avançar.
+
 ### Unit test simples de uma task com `runTask`
 
 `runTask(task, payload, options?)` roda a função `run` de uma task diretamente — **sem engine, sem
@@ -86,6 +130,34 @@ it("aprova quando o token resolve com valor truthy", async () => {
 		tokens: { approval: { approved: true } },
 	});
 	expect(result).toMatchObject({ output: { status: "approved" }, error: null });
+});
+```
+
+Filhas são substituídas por dublês chaveados pelo id da task filha. Um dublê que lança vira
+`{ ok: false, error }` daquela filha, então testar o tratamento de falha fica fácil:
+
+```ts
+it("mantém as thumbnails que funcionaram e notifica os seguidores", async () => {
+	const result = await runTask(publishAlbum, { albumId: "a1", photos: ["p1.jpg", "bad.jpg"] }, {
+		children: {
+			"resize-image": payload => {
+				const { url, width } = payload as { url: string; width: number };
+				if (url === "bad.jpg" && width === 320) throw new Error("corrupt image");
+				return { url: `${url}@${width}` };
+			},
+			"notify-followers": () => null,
+		},
+	});
+
+	expect(result.error).toBeNull();
+	expect(result.output).toEqual({ thumbnails: ["p1.jpg@320"], cover: "p1.jpg@1200" });
+	expect(result.logs).toContainEqual(expect.objectContaining({ level: "warn", data: { failed: 1 } }));
+	expect(result.triggered.map(t => [t.mode, t.taskId])).toEqual([
+		["batchTriggerAndWait", "resize-image"],
+		["batchTriggerAndWait", "resize-image"],
+		["triggerAndWait", "resize-image"],
+		["trigger", "notify-followers"],
+	]);
 });
 ```
 
@@ -155,6 +227,25 @@ Critérios de match (todos opcionais, combinados com E):
 mais asserções a partir dele (`(await assertTriggered(engine, ...)).runId`); sem match, lança um
 `AssertionError` listando o que FOI disparado (limitado, payloads truncados, nunca um dump
 completo). `allTriggered(engine, match?)` devolve todos os matches, mais antigo primeiro.
+
+```ts
+const engine = createTestEngine({ tasks: [publishAlbum, resizeImage, notifyFollowers, syncCrm] });
+
+// Toda filha do batch de publishAlbum foi disparada, e ligada ao pai. Runs criadas no mesmo
+// milissegundo não têm ordem garantida, então compare-as como um conjunto.
+const parent = await engine.runInline(publishAlbum, { albumId: "a1", photos: ["p1.jpg", "p2.jpg"] });
+const thumbs = await allTriggered(engine, { task: resizeImage, payload: { width: 320 } });
+expect(thumbs.map(r => r.payload)).toHaveLength(2);
+expect(thumbs.map(r => r.payload)).toEqual(
+	expect.arrayContaining([{ url: "p1.jpg", width: 320 }, { url: "p2.jpg", width: 320 }]),
+);
+expect(thumbs.every(r => r.parentRunId === parent.runId)).toBe(true);
+
+// Uma sincronização por tenant foi enfileirada com a chave de concorrência certa, e nada para outro tenant.
+await engine.trigger(syncCrm, { tenantId: "42", since: "2026-01-01" }, { concurrencyKey: "tenant-42" });
+await assertTriggered(engine, { task: "sync-crm", concurrencyKey: "tenant-42", status: "queued" });
+await refuteTriggered(engine, { task: "sync-crm", concurrencyKey: "tenant-7" });
+```
 
 ## Quando usar cada abordagem
 
