@@ -181,9 +181,9 @@ transporte nesta sessão (números na tabela do `CLAUDE.md`, consistentes com os
   bench sem chave de dono sobrando, docs. Um bug de `src/` achado pelo bloco C: `start()` com o
   Postgres inacessível no modo Postgres lançava o erro cru do `pg` em vez de `MinitriggerError`
   (decisão 28(h)) — corrigido em `4b9e07e`. Relatórios em `.superpowers/review5/` (não versionado).
-- **Pendências abertas da quinta revisão (para o dono):** `docs/SPEC.md` decisão 16 (seção 2,
-  fixa) ainda diz que um pooler em modo transação faz o sistema "cair para o poll", sem citar que a
-  eleição de líder fica duplicada/instável (o README, `docs/pt` e o design spec já dizem); o
+- **Pendências abertas da quinta revisão (para o dono):** ~~decisão 16 da SPEC~~ — emendada com
+  aprovação do dono em 2026-09-27 (pooler em modo transação: além do poll, eleição de líder
+  duplicada/instável); o
   comentário da migration 009 e o tipo `SystemJobName` ainda citam um job `reconcile` que nunca é
   enfileirado (o dispatcher o trata como no-op; limpeza cosmética, não feita para não mexer em
   `src/` sem bug); a guarda de modo misto de uma engine só de disparo relê um marcador ausente a
