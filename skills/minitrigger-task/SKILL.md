@@ -164,7 +164,8 @@ across replays is fine.
 live with `engine.runs.readStream(runId, name)`. **Not memoized** — a replay streams again.
 Readers stop at the first end marker, so a retried attempt streaming under the **same** name is
 invisible to a reader that started earlier; use a per-attempt name (e.g. `` `answer-${ctx.run.attempt}` ``)
-if a stream must survive retries.
+if a stream must survive retries. **Not available with `transport: "postgres"`**: `ctx.stream`
+throws (fatal, no retry) and `runs.readStream` throws when called — there's no Redis in that mode.
 
 ### Retries
 

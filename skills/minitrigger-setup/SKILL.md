@@ -1,6 +1,6 @@
 ---
 name: minitrigger-setup
-description: Install and configure minitrigger (durable tasks/workflows for Node.js, built on BullMQ + Redis + Postgres) in an existing TypeScript or JavaScript project. Use when the user wants to add minitrigger, durable background jobs, workflow execution with replay/retries, or the outbox-style trigger pattern to a project, including plain Node, NestJS, Express, Fastify or Next.js apps.
+description: Install and configure minitrigger (durable tasks/workflows for Node.js, built on Postgres, with BullMQ + Redis by default or Postgres alone via transport: "postgres") in an existing TypeScript or JavaScript project. Use when the user wants to add minitrigger, durable background jobs, workflow execution with replay/retries, or the outbox-style trigger pattern to a project, including plain Node, NestJS, Express, Fastify or Next.js apps.
 when_to_use: "add minitrigger", "set up durable background jobs", "durable tasks with bullmq and postgres", "configure minitrigger in nestjs/express/nextjs", "wire up engine.start()/stop()"
 ---
 
@@ -33,28 +33,47 @@ pnpm add @rivia-labs/minitrigger bullmq ioredis pg
 pnpm add -D @types/pg   # optional, only if the project uses TypeScript
 ```
 
+With `transport: "postgres"` (see step 3), skip `bullmq`/`ioredis` entirely:
+
+```bash
+pnpm add @rivia-labs/minitrigger pg
+```
+
 Use `npm install`/`yarn add`/`bun add` instead of `pnpm add` to match the detected package
 manager — the package works the same way with any of them.
 
 `bullmq`, `ioredis` and `pg` are **peer dependencies**, never bundled — install them explicitly.
-Respect these ranges (do not let the package manager silently resolve outside them):
+`bullmq`/`ioredis` are **optional peers**: with `transport: "postgres"` the package never imports
+either (a dynamic `import()` only reached by the BullMQ backend), so a `ConfigError` at first use
+(not `createEngine()` itself) is the only symptom of installing `transport: "bullmq"` without
+them. Respect these ranges (do not let the package manager silently resolve outside them):
 
 | Package | Range | Why |
 |---|---|---|
-| `bullmq` | `^6.3.0` | — |
-| `ioredis` | `^5.11.1` | **Not 6.x** — BullMQ 6.3.x is tested against ioredis 5.11.1; ioredis 6's RESP3 default isn't handled by BullMQ's adapter. |
-| `pg` | `^8.13.0` | — |
+| `bullmq` | `^6.3.0` | Only for `transport: "bullmq"` (the default). |
+| `ioredis` | `^5.11.1` | Only for `transport: "bullmq"`. **Not 6.x** — BullMQ 6.3.x is tested against ioredis 5.11.1; ioredis 6's RESP3 default isn't handled by BullMQ's adapter. |
+| `pg` | `^8.13.0` | Always required, both transports. |
 | `@types/pg` | `^8.11.0` | Optional peer — only needed because minitrigger's public types reference `pg.Pool`. |
 
 ## 3. Infrastructure
 
-Requires **Postgres >= 13** and **Redis with `maxmemory-policy noeviction`**. BullMQ stores job
-state — including delayed jobs, which is everything `step.sleep`/retry backoff/scheduled runs
-rely on — as ordinary Redis keys; any other eviction policy lets Redis silently drop that state
-under memory pressure. `engine.start()` checks this automatically (see step 7) and warns or
-throws depending on how certain it can be.
+Requires **Postgres >= 13** always. **Redis is only needed with the default
+`transport: "bullmq"`** — ask whether the project wants to avoid standing up Redis: with
+`transport: "postgres"` (no `bullmq`/`ioredis` install, no `redis`/`prefix` config) the whole
+engine runs on Postgres alone (queue, delay, wake-up and the internal system queue), at the cost
+of `ctx.stream`/`runs.readStream`, `queue.rateLimit` and an approximate `globalConcurrency`
+(exact instead, in this mode) not being available — see the package's "Postgres-only mode" README
+section for the trade-offs and when to prefer it. Default to `transport: "bullmq"` unless the
+project asks to skip Redis, already has none, or explicitly wants the Postgres-only mode.
 
-Minimal local infra, if the project doesn't already have one:
+With `transport: "bullmq"`, Redis needs `maxmemory-policy noeviction`: BullMQ stores job state —
+including delayed jobs, which is everything `step.sleep`/retry backoff/scheduled runs rely on — as
+ordinary Redis keys; any other eviction policy lets Redis silently drop that state under memory
+pressure. `engine.start()` checks this automatically (see step 7) and warns or throws depending on
+how certain it can be.
+
+Minimal local infra, if the project doesn't already have one (omit the `redis` service entirely
+with `transport: "postgres"`):
 
 ```yaml
 # docker-compose.yml
@@ -87,6 +106,18 @@ export const engine = createEngine({
 	redis: process.env.REDIS_URL!,
 	schema: "myapp",   // must match ^[a-z_][a-z0-9_]{0,62}$
 	prefix: "myapp",   // BullMQ key prefix, same pattern
+	tasks,
+});
+```
+
+With `transport: "postgres"`, drop `redis`/`prefix` (both are a `ConfigError` in this mode) —
+NOTIFY channels derive from `schema` instead:
+
+```ts
+export const engine = createEngine({
+	postgres: process.env.DATABASE_URL!,
+	transport: "postgres",
+	schema: "myapp",
 	tasks,
 });
 ```

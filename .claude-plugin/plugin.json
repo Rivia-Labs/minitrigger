@@ -1,8 +1,8 @@
 {
   "name": "minitrigger",
   "displayName": "minitrigger",
-  "version": "0.1.0",
-  "description": "Skills to install minitrigger (durable tasks/workflows for Node.js on BullMQ + Redis + Postgres) in any project, refactor dual writes to the transactional outbox pattern, write and review tasks/steps, test them with the in-memory test engine, and debug stuck runs/queues/schedules.",
+  "version": "0.4.0",
+  "description": "Skills to install minitrigger (durable tasks/workflows for Node.js on Postgres, with BullMQ + Redis by default or Postgres alone via transport: \"postgres\") in any project, refactor dual writes to the transactional outbox pattern, write and review tasks/steps, test them with the in-memory test engine, and debug stuck runs/queues/schedules.",
   "license": "MIT",
   "author": {
     "name": "igorabreu29"
