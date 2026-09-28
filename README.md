@@ -250,7 +250,10 @@ check `.ok`.
 A run that loads data, asks a human for approval through a link, waits up to three days for the
 answer (without holding a worker), then pays after a cool-off period. Every side effect is inside a
 step, so a crash or a retry at any point replays the finished steps from Postgres instead of
-re-running them (the approver gets one email, the expense is paid once).
+re-running them. Steps are at-least-once, though: one interrupted mid-way (a crash after the email
+went out but before the step's result was saved) runs again, so make the side effects themselves
+idempotent where a duplicate matters (e.g. the payment provider's idempotency key, as in
+[Retries & backoff](#retries--backoff)).
 
 ```ts
 import { AbortTaskRunError, defineTask } from "@rivia-labs/minitrigger";
@@ -814,26 +817,37 @@ and resolves to `{ rows }`. For example, postgres.js without an ORM:
 import postgres from "postgres";
 import type { TransactionClient } from "@rivia-labs/minitrigger";
 
+// postgres.js serializes a value bound to a json/jsonb parameter itself (JSON.stringify, picked
+// from the type the server infers), but the engine already sends the payload as JSON text, so it
+// would be stored as a jsonb *string*. Pass json/jsonb values through as-is, as drizzle-orm does
+// for its own postgres.js client. This applies to every query on this client: use a dedicated
+// one for triggers, or send JSON.stringify(value) yourself for your own json/jsonb parameters.
 const sql = postgres(process.env.DATABASE_URL!);
+sql.options.serializers[114] = sql.options.serializers[3802] = (x: unknown) => x; // json, jsonb
 
 await sql.begin(async tx => {
-	const [order] = await tx`INSERT INTO orders (customer_id, total) VALUES (${customerId}, ${total}) RETURNING id`;
+	const [order] = await tx`
+		INSERT INTO orders (customer_id, total) VALUES (${customerId}, ${total}) RETURNING id`;
 	const client: TransactionClient = {
 		query: async (text, values = []) => ({ rows: await tx.unsafe(text, values as never[]) }),
 	};
-	await engine.trigger(sendReceipt, { orderId: order!.id }, { tx: client });
+	await engine.trigger(sendReceipt, { orderId: String(order!.id) }, { tx: client });
 });
 ```
 
 The engine only sends strings, numbers, booleans and `null` as values (the payload is sent as JSON
 text with an explicit `::jsonb` cast), and the run insert casts every placeholder explicitly, so a
-driver that types every bind parameter as `text` (like Prisma's raw queries) works too.
+driver that types every bind parameter as `text` (like Prisma's raw queries) works too. A driver
+that instead re-serializes each value according to the parameter type the server infers must have
+that disabled for json/jsonb, as above — otherwise the payload is JSON-encoded twice. `drizzleTx`
+(on either driver) and node-postgres need nothing extra.
 
 ##### Several triggers in one transaction
 
 Trigger as many runs as you need in the same transaction — of the same task or different ones.
-They commit together, and with `outbox.notify` at its default the whole transaction sends a single
-`NOTIFY`:
+They commit together. With `transport: "bullmq"` and `outbox.notify` at its default, the whole
+transaction sends a single `NOTIFY`; with `transport: "postgres"`, one per distinct queue of the
+runs it triggered (Postgres collapses identical notifications within a transaction):
 
 ```ts
 await dataSource.transaction(async manager => {
@@ -853,10 +867,11 @@ which runs one statement at a time anyway.
 ##### With `transport: "postgres"`
 
 `trigger(..., { tx })` works the same in [Postgres-only mode](#postgres-only-mode), and the
-adapters above are used unchanged (the same parameterized insert goes through them): the run row itself is the queue there, so the insert in your transaction is all
-there is — on commit, a `NOTIFY` wakes the queue's workers (the poll picks it up otherwise), and
-on rollback the row never existed. There is no separate outbox sweep in that mode, which is why
-the `outbox.*` options are rejected with `transport: "postgres"`.
+adapters above are used unchanged (the same parameterized insert goes through them). The run row
+itself is the queue there, so the insert in your transaction is all there is: on commit, a
+`NOTIFY` wakes the queue's workers (the poll picks it up otherwise), and on rollback the row never
+existed. There is no separate outbox sweep in that mode, which is why the `outbox.*` options are
+rejected with `transport: "postgres"`.
 
 ### Queues
 
@@ -909,7 +924,11 @@ For example, an admin script that holds outgoing email while the provider has an
 never starts workers; pausing still applies to every running process at once:
 
 ```ts
-const admin = createEngine({ postgres: process.env.DATABASE_URL!, redis: process.env.REDIS_URL!, tasks: [sendWelcome, sendDigest] });
+const admin = createEngine({
+	postgres: process.env.DATABASE_URL!,
+	redis: process.env.REDIS_URL!,
+	tasks: [sendWelcome, sendDigest],
+});
 
 const state = await admin.queues.pause("emails"); // { name: "emails", paused: true, updatedAt }
 // ...later, once the provider is back:
@@ -987,10 +1006,11 @@ export const chargeCard = defineTask({
 				body: JSON.stringify({ amount: invoice.amount }),
 				signal: ctx.signal, // aborted on cancel, maxDurationMs, shutdown
 			});
-			if (res.status >= 400 && res.status < 500) {
+			if (res.status >= 400 && res.status < 500 && res.status !== 408 && res.status !== 429) {
 				throw new AbortTaskRunError(`charge rejected (${res.status})`); // retrying won't help
 			}
-			if (!res.ok) throw new Error(`payments API ${res.status} (attempt ${ctx.run.attempt})`); // retried
+			// 5xx, 408 (timeout), 429 (rate limited): retried with backoff
+			if (!res.ok) throw new Error(`payments API ${res.status} (attempt ${ctx.run.attempt})`);
 			return (await res.json()) as { chargeId: string };
 		});
 	},
@@ -2431,35 +2451,6 @@ await engine.migrate();
 await engine.start();
 ```
 
-A fuller setup, with a shared `pg.Pool` and graceful shutdown. Everything else — `defineTask`,
-steps, `trigger` (including `{ tx }` with the ORM adapters), schedules, queues, events,
-`runs.subscribe` — is written exactly as in the BullMQ examples above:
-
-```ts
-import { createEngine, type PostgresEngineConfig } from "@rivia-labs/minitrigger";
-import { Pool } from "pg";
-
-// Your own pool: size it for the queues' concurrency + systemConcurrency + 5, and set a timeout.
-const pool = new Pool({ connectionString: process.env.DATABASE_URL, max: 40, connectionTimeoutMillis: 10_000 });
-
-const config: PostgresEngineConfig = {
-	transport: "postgres",
-	postgres: { pool },                       // never closed by the engine
-	schema: "jobs",
-	tasks: [approveExpense, publishAlbum, resizeImage, notifyFollowers],
-	polling: { intervalMs: 500, jitterMs: 50 }, // fallback when a NOTIFY is missed (default 1 000)
-};
-const engine = createEngine(config);
-
-await engine.migrate();
-await engine.start();
-
-process.once("SIGTERM", async () => {
-	await engine.stop(); // finishes or hands back running runs
-	await pool.end();
-});
-```
-
 Since 0.4.0, `transport: "postgres"` (decision 28 in `docs/SPEC.md`) runs the whole engine — queue,
 delay, wake-up, the internal `-system` queue, and pub/sub — directly on Postgres: no Redis, no
 BullMQ, and `bullmq`/`ioredis` don't need to be installed at all. `transport: "bullmq"` (the
@@ -2532,6 +2523,42 @@ overhead. Outside what's listed below, the two transports are equivalent: same `
   schedule doesn't exist. Missed ticks (no process running) are still not backfilled, same as
   BullMQ mode; a tick that has to retry (backoff) delays its own following ticks, since there's
   never more than one in flight for a given schedule.
+
+### Example: a full setup
+
+A fuller setup than the one at the top of this section, with a shared `pg.Pool` and graceful
+shutdown. Everything else — `defineTask`, steps, `trigger` (including `{ tx }` with the ORM
+adapters), schedules, queues, events, `runs.subscribe` — is written exactly as in the examples
+earlier in this README:
+
+```ts
+import { createEngine, type PostgresEngineConfig } from "@rivia-labs/minitrigger";
+import { Pool } from "pg";
+
+// Your own pool: size it for the queues' concurrency + systemConcurrency + 5, and set a timeout.
+const pool = new Pool({
+	connectionString: process.env.DATABASE_URL,
+	max: 40,
+	connectionTimeoutMillis: 10_000,
+});
+
+const config: PostgresEngineConfig = {
+	transport: "postgres",
+	postgres: { pool },                       // never closed by the engine
+	schema: "jobs",
+	tasks: [approveExpense, publishAlbum, resizeImage, notifyFollowers],
+	polling: { intervalMs: 500, jitterMs: 50 }, // fallback when a NOTIFY is missed (default 1 000)
+};
+const engine = createEngine(config);
+
+await engine.migrate();
+await engine.start();
+
+process.once("SIGTERM", async () => {
+	await engine.stop(); // finishes or hands back running runs
+	await pool.end();
+});
+```
 
 ### Latencies
 
