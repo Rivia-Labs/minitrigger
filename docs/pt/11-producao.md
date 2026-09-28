@@ -201,7 +201,17 @@ reenfileira toda run a partir de Postgres dentro de aproximadamente
   padrão de 7 campos que a regex antiga deixava passar agora falha na validação com
   `ConfigError`** em vez de só falhar depois, em silêncio, dentro do scheduler do próprio BullMQ
   (o BullMQ usa a mesma biblioteca internamente, então um padrão de 7 campos nunca rodou de fato —
-  isso só antecipa o erro, com mensagem clara).
+  isso só antecipa o erro, com mensagem clara). O `cron-parser` é fixado exatamente na versão que o
+  BullMQ fixa (`5.10.1`), então validação e scheduler do BullMQ sempre concordam. Conferido contra
+  o `cron-parser` 5.10.1:
+  - **Agora `ConfigError` no `defineTask`/`schedules.upsert`** (a regex antiga deixava passar; o
+    BullMQ já rejeitava, então nenhum deles rodou de fato): 7 campos (`0 0 * * * * 2026`), `LW` e
+    `15W` no dia do mês, `L` isolado no dia da semana (`0 0 * * L`; `5L`, "última sexta", passa),
+    valores fora da faixa (`0 0 32 * *`, `0 24 * * *`), datas impossíveis (`0 0 30 2 *`).
+  - **Agora aceitos** (a regex antiga rejeitava): `@daily`, `@hourly`, `@weekly` e os outros atalhos
+    `@`, e padrões de 3–4 campos. Cuidado com estes: o `cron-parser` os preenche pela direita (os
+    campos dados são os últimos: dia do mês/mês/dia da semana), então `* * 5` significa "a cada
+    minuto às sextas", raramente o que se queria — escreva os 5 campos.
 - **`EngineConfig` virou uma união discriminada** por `transport`
   (`{ transport?: "bullmq"; redis; prefix?; outbox? } | { transport: "postgres"; polling? }`), então
   o compilador agora pega `redis`/`prefix`/`outbox` junto com `transport: "postgres"` (ou `polling`

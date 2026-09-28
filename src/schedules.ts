@@ -57,7 +57,7 @@ function validateScheduleId(id: unknown): string {
 }
 
 /**
- * `cron-parser` (Task 6: now a direct dependency, `^5.10.1` -- the same version BullMQ 6.3.8
+ * `cron-parser` (Task 6: now a direct dependency, pinned to `5.10.1` -- the exact version BullMQ 6.3.8
  * already resolves transitively, `pnpm ls cron-parser` shows one copy) is the actual authority on
  * cron syntax in BOTH transports now: this calls {@link nextOccurrence} purely to validate `cron`
  * against `new Date()` (`tz` deliberately left `undefined` here -- timezone is validated

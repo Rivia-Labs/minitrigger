@@ -1382,6 +1382,16 @@ it("approves when the token resolves truthy", async () => {
   only failing later, silently, inside BullMQ's own scheduler (BullMQ uses the same library
   internally, so a 7-field pattern never actually ran on a schedule — this just surfaces the
   failure immediately, with a clear message, instead of a schedule that's silently never ticked).
+  `cron-parser` is pinned to exactly the version BullMQ pins (`5.10.1`), so validation and the
+  BullMQ scheduler always agree. Checked against `cron-parser` 5.10.1:
+  - **Now `ConfigError` at `defineTask`/`schedules.upsert`** (the old regex let them through;
+    BullMQ already rejected them, so none of them ever ran): 7 fields (`0 0 * * * * 2026`), `LW`
+    and `15W` in day-of-month, a standalone `L` in day-of-week (`0 0 * * L`; `5L`, "last Friday",
+    is fine), out-of-range values (`0 0 32 * *`, `0 24 * * *`), impossible dates (`0 0 30 2 *`).
+  - **Now accepted** (the old regex rejected them): `@daily`, `@hourly`, `@weekly` and the other
+    `@` shortcuts, and 3–4 field patterns. Careful with the latter: `cron-parser` fills them from
+    the right (the given fields are the last ones: day-of-month/month/day-of-week), so `* * 5`
+    means "every minute on Fridays", which is rarely what was meant — write all 5 fields.
 - **`EngineConfig` is now a discriminated union** on `transport`
   (`{ transport?: "bullmq"; redis; prefix?; outbox? } | { transport: "postgres"; polling? }`), so
   the compiler now catches `redis`/`prefix`/`outbox` paired with `transport: "postgres"` (or

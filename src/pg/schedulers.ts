@@ -8,7 +8,7 @@
  * instant" in BOTH transports: `src/schedules.ts#validateCronPattern` (used by every mode) calls
  * it just to validate a pattern/timezone pair (discarding the result), and Task 8's
  * `upsertJobScheduler`/tick handler for the Postgres backend call it to compute `run_after` for
- * the next `schedule-tick:<id>` row. `cron-parser` (`^5.10.1`, the exact version BullMQ 6.3.8
+ * the next `schedule-tick:<id>` row. `cron-parser` (pinned `5.10.1`, the exact version BullMQ 6.3.8
  * already resolves transitively -- `pnpm ls cron-parser` shows one copy) is a direct dependency
  * now, not merely BullMQ's implementation detail: the Postgres transport has no BullMQ to lean on.
  */
