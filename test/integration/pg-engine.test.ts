@@ -704,6 +704,9 @@ describe("engine with transport postgres", () => {
 			// Pending checkouts made by the RUN claim (`claimRuns` -> `boundedClaim` -> `checkOut` ->
 			// `pool.connect()`, all synchronous up to the connect): `pool.waitingCount` alone would
 			// also count a `-system` claim, a heartbeat or a leader query waiting for the connection.
+			// Failure mode: the stack check needs that chain to stay synchronous up to the connect. If
+			// an `await` is ever added before `pool.connect()`, `claimRuns` may drop out of the stack,
+			// nothing is counted and the `waitFor` below times out loudly (never a silent pass).
 			const pendingRunClaims = new Set<Promise<unknown>>();
 			const originalConnect = pool.connect.bind(pool) as (...args: unknown[]) => unknown;
 			(pool as { connect: (...args: unknown[]) => unknown }).connect = (...args: unknown[]) => {

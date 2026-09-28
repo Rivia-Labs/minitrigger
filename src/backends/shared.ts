@@ -84,7 +84,19 @@ export async function assertPostgresReachable(pool: Pool, timeoutMs: number): Pr
 	if (reached) return;
 	timedOut = true;
 	probe.catch(() => {});
+	const gotClient = client !== undefined;
 	if (client !== undefined) discard(client);
+	// No connection at all while the pool was full (or had checkouts queued): the database may be
+	// fine and every slot busy (an injected pool shared with the app, or slots held by abandoned
+	// connection attempts), so the message must not claim it is unreachable.
+	const poolMax = (pool.options as { max?: number }).max ?? 10;
+	if (!gotClient && (pool.totalCount >= poolMax || pool.waitingCount > 0)) {
+		throw new MinitriggerError(
+			`could not get a connection within ${timeoutMs} ms: Postgres unreachable or every ` +
+				`connection of the pool (max ${poolMax}) stayed busy; check config.postgres, the pool ` +
+				"size and what holds its connections, then call start() again"
+		);
+	}
 	throw new MinitriggerError(
 		`cannot reach Postgres within ${timeoutMs} ms (config.pool.connectionTimeoutMs, or the ` +
 			"injected pool's connectionTimeoutMillis); check config.postgres and that Postgres " +

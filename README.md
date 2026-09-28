@@ -1889,7 +1889,10 @@ when set), whether the engine created the pool or you injected one, with or with
 `connectionTimeoutMillis`: the check runs on its own timer, and a connection that only completes
 after it is destroyed, never kept in the pool. Nothing is left running, and `start()` can be
 called again once the database is back. BullMQ mode runs the same check right after the Redis
-`PING`. `stop()` resolves within its usual bounds with the database gone, whether `start()`
+`PING`. An injected pool without `connectionTimeoutMillis` still keeps one slot held by
+the abandoned connection attempt until the OS gives up on it (`pg-pool` cannot cancel a pending
+connect), so a small injected pool can keep failing `start()` in the meantime: set
+`connectionTimeoutMillis` on pools you inject. `stop()` resolves within its usual bounds with the database gone, whether `start()`
 failed or the engine was running (a run it could not hand back stays `running` until another
 engine's stall recovery).
 

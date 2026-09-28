@@ -116,7 +116,11 @@ reach Postgres", com o erro do driver em `cause`) em vez de travar — dentro de
 quando definido), seja o pool criado pelo engine ou injetado, com ou sem `connectionTimeoutMillis`:
 a checagem tem timer próprio, e uma conexão que só completa depois dele é destruída, nunca fica no
 pool. Nada fica rodando, e `start()` pode ser chamado de novo quando o banco voltar. O modo BullMQ
-faz a mesma checagem logo depois do `PING` do Redis. `stop()` resolve dentro dos limites de
+faz a mesma checagem logo depois do `PING` do Redis. Um pool injetado sem `connectionTimeoutMillis`
+ainda fica com uma vaga presa pela tentativa de conexão abandonada até o SO desistir dela (o
+`pg-pool` não consegue cancelar um connect pendente), então um pool injetado pequeno pode continuar
+fazendo o `start()` falhar enquanto isso: configure `connectionTimeoutMillis` nos pools que você
+injeta. `stop()` resolve dentro dos limites de
 sempre com o banco fora, tanto depois de um `start()` que falhou quanto com o engine rodando (uma
 run que ele não conseguiu devolver fica `running` até a recuperação de stall de outro engine).
 
