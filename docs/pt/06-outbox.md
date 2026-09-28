@@ -196,25 +196,38 @@ postgres.js sem ORM nenhum:
 import postgres from "postgres";
 import type { TransactionClient } from "@rivia-labs/minitrigger";
 
+// postgres.js serializa sozinho um valor vinculado a um parâmetro json/jsonb (JSON.stringify,
+// escolhido a partir do tipo que o servidor infere), mas o engine já manda o payload como texto
+// JSON, então ele seria armazenado como uma *string* jsonb. Passe valores json/jsonb direto,
+// como o próprio drizzle-orm faz para o client postgres.js dele. Isso vale para toda query nesse
+// client: use um dedicado para triggers, ou mande você mesmo JSON.stringify(valor) para os seus
+// próprios parâmetros json/jsonb.
 const sql = postgres(process.env.DATABASE_URL!);
+sql.options.serializers[114] = sql.options.serializers[3802] = (x: unknown) => x; // json, jsonb
 
 await sql.begin(async tx => {
-	const [order] = await tx`INSERT INTO orders (customer_id, total) VALUES (${customerId}, ${total}) RETURNING id`;
+	const [order] = await tx`
+		INSERT INTO orders (customer_id, total) VALUES (${customerId}, ${total}) RETURNING id`;
 	const client: TransactionClient = {
 		query: async (text, values = []) => ({ rows: await tx.unsafe(text, values as never[]) }),
 	};
-	await engine.trigger(sendReceipt, { orderId: order!.id }, { tx: client });
+	await engine.trigger(sendReceipt, { orderId: String(order!.id) }, { tx: client });
 });
 ```
 
 O engine só manda strings, números, booleanos e `null` como valores (o payload vai como texto JSON
 com `::jsonb` explícito), e o insert da run converte todo placeholder explicitamente, então um
 driver que tipa todo parâmetro vinculado como `text` (como as queries cruas do Prisma) também
-funciona.
+funciona. Um driver que em vez disso reserializa cada valor conforme o tipo que o servidor infere
+precisa ter isso desligado para json/jsonb, como acima — senão o payload é codificado como JSON
+duas vezes. `drizzleTx` (em qualquer um dos dois drivers) e o node-postgres não precisam de nada
+extra.
 
 **Vários triggers numa mesma transação.** Dispare quantas runs precisar na mesma transação — da
-mesma task ou de tasks diferentes. Elas comitam juntas, e com `outbox.notify` no padrão a
-transação inteira manda um único `NOTIFY`:
+mesma task ou de tasks diferentes. Elas comitam juntas. Com `transport: "bullmq"` e `outbox.notify`
+no padrão, a transação inteira manda um único `NOTIFY`; com `transport: "postgres"`, um por fila
+distinta entre as runs que ela disparou (o Postgres colapsa notificações idênticas dentro de uma
+transação):
 
 ```ts
 await dataSource.transaction(async manager => {

@@ -13,36 +13,6 @@ await engine.migrate();
 await engine.start();
 ```
 
-Uma configuração mais completa, com um `pg.Pool` compartilhado e shutdown gracioso. Tudo mais —
-`defineTask`, steps, `trigger` (inclusive `{ tx }` com os adaptadores de ORM), schedules, filas,
-eventos, `runs.subscribe` — é escrito exatamente como nos exemplos do modo BullMQ ao longo dos
-outros guias:
-
-```ts
-import { createEngine, type PostgresEngineConfig } from "@rivia-labs/minitrigger";
-import { Pool } from "pg";
-
-// Seu próprio pool: dimensione para a concorrência das filas + systemConcurrency + 5, com um timeout.
-const pool = new Pool({ connectionString: process.env.DATABASE_URL, max: 40, connectionTimeoutMillis: 10_000 });
-
-const config: PostgresEngineConfig = {
-	transport: "postgres",
-	postgres: { pool },                       // nunca fechado pelo engine
-	schema: "jobs",
-	tasks: [approveExpense, publishAlbum, resizeImage, notifyFollowers],
-	polling: { intervalMs: 500, jitterMs: 50 }, // fallback para quando um NOTIFY se perde (padrão 1 000)
-};
-const engine = createEngine(config);
-
-await engine.migrate();
-await engine.start();
-
-process.once("SIGTERM", async () => {
-	await engine.stop(); // termina ou devolve runs em execução
-	await pool.end();
-});
-```
-
 Desde a 0.4.0, `transport: "postgres"` (decisão 28 em `docs/SPEC.md`) roda o engine inteiro — fila,
 atraso, wake-up, a fila interna `-system` e pub/sub — só em cima do Postgres: sem Redis, sem
 BullMQ, e `bullmq`/`ioredis` nem precisam estar instalados. `transport: "bullmq"` (o padrão, sem
@@ -117,6 +87,42 @@ que está listado abaixo, os dois transportes são equivalentes: mesmo `defineTa
   em que o schedule não existe. Ticks perdidos (nenhum processo rodando) continuam sem backfill,
   igual ao modo BullMQ; um tick que precisa retentar (backoff) atrasa os seus próprios ticks
   seguintes, já que nunca há mais de um em voo do mesmo schedule.
+
+## Exemplo: uma configuração completa
+
+Uma configuração mais completa que a do topo desta seção, com um `pg.Pool` compartilhado e
+shutdown gracioso. Tudo mais — `defineTask`, steps, `trigger` (inclusive `{ tx }` com os
+adaptadores de ORM), schedules, filas, eventos, `runs.subscribe` — é escrito exatamente como nos
+exemplos anteriores deste guia:
+
+```ts
+import { createEngine, type PostgresEngineConfig } from "@rivia-labs/minitrigger";
+import { Pool } from "pg";
+
+// Seu próprio pool: dimensione para a concorrência das filas + systemConcurrency + 5, com timeout.
+const pool = new Pool({
+	connectionString: process.env.DATABASE_URL,
+	max: 40,
+	connectionTimeoutMillis: 10_000,
+});
+
+const config: PostgresEngineConfig = {
+	transport: "postgres",
+	postgres: { pool },                       // nunca fechado pelo engine
+	schema: "jobs",
+	tasks: [approveExpense, publishAlbum, resizeImage, notifyFollowers],
+	polling: { intervalMs: 500, jitterMs: 50 }, // fallback para quando um NOTIFY se perde (padrão 1 000)
+};
+const engine = createEngine(config);
+
+await engine.migrate();
+await engine.start();
+
+process.once("SIGTERM", async () => {
+	await engine.stop(); // termina ou devolve runs em execução
+	await pool.end();
+});
+```
 
 ## Latências
 

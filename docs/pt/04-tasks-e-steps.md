@@ -52,10 +52,11 @@ export const chargeCard = defineTask({
 				body: JSON.stringify({ amount: invoice.amount }),
 				signal: ctx.signal, // abortado em cancelamento, maxDurationMs, shutdown
 			});
-			if (res.status >= 400 && res.status < 500) {
+			if (res.status >= 400 && res.status < 500 && res.status !== 408 && res.status !== 429) {
 				throw new AbortTaskRunError(`charge rejected (${res.status})`); // retentar não ajudaria
 			}
-			if (!res.ok) throw new Error(`payments API ${res.status} (attempt ${ctx.run.attempt})`); // retentado
+			// 5xx, 408 (timeout), 429 (rate limited): retentado com backoff
+			if (!res.ok) throw new Error(`payments API ${res.status} (attempt ${ctx.run.attempt})`);
 			return (await res.json()) as { chargeId: string };
 		});
 	},

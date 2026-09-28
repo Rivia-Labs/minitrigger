@@ -49,8 +49,11 @@ dona dele já é terminal.
 Uma run que carrega dados, pede aprovação a um humano por um link, espera até três dias pela
 resposta (sem segurar um worker) e então paga depois de um período de espera. Todo efeito colateral
 está dentro de um step, então um crash ou uma retentativa a qualquer momento repete os steps já
-concluídos a partir do Postgres em vez de rodá-los de novo (o aprovador recebe um e-mail só, a
-despesa é paga uma vez só).
+concluídos a partir do Postgres em vez de rodá-los de novo. Steps são pelo menos uma vez, porém: um
+que é interrompido no meio do caminho (um crash depois do e-mail sair mas antes do resultado do
+step ser salvo) roda de novo, então torne os próprios efeitos colaterais idempotentes onde uma
+duplicata importa (por exemplo, a chave de idempotência do provedor de pagamento, como em
+[Retentativas e backoff](04-tasks-e-steps.md#exemplo-retentativas-e-aborttaskrunerror)).
 
 ```ts
 import { AbortTaskRunError, defineTask } from "@rivia-labs/minitrigger";

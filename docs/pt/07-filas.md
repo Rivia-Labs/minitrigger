@@ -216,7 +216,11 @@ incidente. Ele nunca inicia workers; pausar continua valendo para todo processo 
 hora:
 
 ```ts
-const admin = createEngine({ postgres: process.env.DATABASE_URL!, redis: process.env.REDIS_URL!, tasks: [sendWelcome, sendDigest] });
+const admin = createEngine({
+	postgres: process.env.DATABASE_URL!,
+	redis: process.env.REDIS_URL!,
+	tasks: [sendWelcome, sendDigest],
+});
 
 const state = await admin.queues.pause("emails"); // { name: "emails", paused: true, updatedAt }
 // ...mais tarde, quando o provedor voltar:
