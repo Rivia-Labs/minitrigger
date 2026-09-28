@@ -41,15 +41,17 @@ export const MIN_IDLE_SLEEP_MS = 5;
  */
 export const CLAIM_DRAIN_TIMEOUT_MS = 5_000;
 /**
- * Sustained rate limit of passes triggered by `wake()`: one per this interval, after a burst of
- * {@link WAKE_BURST} (GCRA). The wake channel is untrusted (decision 28(b)): without it, a flood
- * of NOTIFYs in separate transactions became one claim per notification per queue (review 5, A5).
- * Wakes over the limit collapse into one pass when it allows the next. The burst keeps legitimate
- * wake-ups close together (a trigger, then the token or child that resumes the run a few ms
- * later) undelayed; passes the loop runs itself (a freed slot, the poll timer) are not limited.
+ * Sustained rate limit of fruitless passes triggered by `wake()`: one per this interval, after a
+ * burst of {@link WAKE_BURST} (GCRA). The wake channel is untrusted (decision 28(b)): without it,
+ * a flood of NOTIFYs in separate transactions became one claim per notification per queue
+ * (review 5, A5). Only a wake-triggered pass that claimed nothing spends the budget: a forged
+ * flood brings no work, a legitimate wake does, so a pass that claimed a row never delays the
+ * next wake (charging every wake pass put 10+ ms on token resumes). Wakes over the limit
+ * collapse into one pass when it allows the next; passes the loop runs itself (a freed slot, the
+ * poll timer) are not limited.
  */
 export const MIN_WAKE_INTERVAL_MS = 15;
-/** Wake-triggered passes allowed back to back before {@link MIN_WAKE_INTERVAL_MS} applies. */
+/** Fruitless wake-triggered passes allowed back to back before {@link MIN_WAKE_INTERVAL_MS} applies. */
 export const WAKE_BURST = 4;
 
 export interface WorkerPolling {
@@ -163,8 +165,10 @@ function createClaimLoop<T>(spec: LoopSpec<T>): ClaimWorker<T> {
 	let timer: ReturnType<typeof setTimeout> | undefined;
 	/** When `timer` fires (clock of `now()`). */
 	let timerAt: number | undefined;
-	/** GCRA theoretical arrival time of the next wake-triggered pass. */
+	/** GCRA theoretical arrival time of the next fruitless wake-triggered pass. */
 	let wakeTat = Number.NEGATIVE_INFINITY;
+	/** The next pass is the one a `wake()` asked for (charged to `wakeTat` if it claims nothing). */
+	let wakeCaused = false;
 	/** A `wake()` arrived while a pass was in progress. */
 	let wakePending = false;
 	let current: Promise<void> | undefined;
@@ -203,15 +207,17 @@ function createClaimLoop<T>(spec: LoopSpec<T>): ClaimWorker<T> {
 		});
 	}
 
-	/** A wake-triggered pass: now if the rate limit allows it, else as soon as it does. */
+	/**
+	 * A wake-triggered pass: now if the rate limit allows it, else as soon as it does. The budget
+	 * is spent by the pass itself, and only if it claims nothing (see `loop()`).
+	 */
 	function wakeSoon(): void {
 		const at = now();
 		const allowedAt = wakeTat - (WAKE_BURST - 1) * MIN_WAKE_INTERVAL_MS;
 		const wait = allowedAt - at;
+		wakeCaused = true;
 		// A timer that fires sooner already covers this wake.
 		if (wait > 0 && timer !== undefined && timerAt !== undefined && timerAt <= at + wait) return;
-		const passAt = Math.max(at, allowedAt);
-		wakeTat = Math.max(wakeTat, passAt) + MIN_WAKE_INTERVAL_MS;
 		if (wait <= 0) {
 			clearTimeout(timer);
 			timer = undefined;
@@ -223,6 +229,29 @@ function createClaimLoop<T>(spec: LoopSpec<T>): ClaimWorker<T> {
 	}
 
 	async function loop(): Promise<void> {
+		const byWake = wakeCaused;
+		wakeCaused = false;
+		const startedAt = now();
+		let queried = false;
+		let claimed = 0;
+		try {
+			await claimPass(
+				() => {
+					queried = true;
+				},
+				n => {
+					claimed += n;
+				}
+			);
+		} finally {
+			// GCRA charge for a fruitless wake-triggered pass only (a thrown claim counts too).
+			if (byWake && queried && claimed === 0) {
+				wakeTat = Math.max(wakeTat, startedAt) + MIN_WAKE_INTERVAL_MS;
+			}
+		}
+	}
+
+	async function claimPass(onQuery: () => void, onClaimed: (n: number) => void): Promise<void> {
 		/** A row already due after the claim is claimed once more right away (review 5, A3). */
 		let reclaimed = false;
 		try {
@@ -231,7 +260,9 @@ function createClaimLoop<T>(spec: LoopSpec<T>): ClaimWorker<T> {
 				const free = concurrency - inFlight;
 				if (free <= 0) return; // the end of an execution calls pass()
 				wakePending = false;
+				onQuery();
 				const items = await spec.claim(free, remainingMs);
+				onClaimed(items.length);
 				// The backoff resets only once the whole pass succeeded: a failing nextDueInMs
 				// after a good claim is a failure too (review 5, A8).
 				if (items.length >= free) failures = 0;

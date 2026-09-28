@@ -323,6 +323,70 @@ describe("queue worker", () => {
 		worker.stopClaiming();
 	});
 
+	it("wakes whose pass claims work never spend the rate limit: each claims at once", async () => {
+		const c = fakeClaim();
+		const p = controlledProcess();
+		const { worker } = queueWorker(c.claim, p.process, {
+			concurrency: 100,
+			polling: { intervalMs: 60_000, jitterMs: 0 },
+		});
+		worker.start();
+		await flush();
+		expect(c.calls).toHaveLength(1);
+		// Far more legitimate wakes than the burst, back to back, each bringing a run.
+		for (let i = 0; i < WAKE_BURST * 5; i++) {
+			c.backlog.push(run(`r${i}`));
+			worker.wake();
+			await flush();
+			expect(c.calls).toHaveLength(i + 2);
+			expect(p.process).toHaveBeenCalledWith(expect.objectContaining({ id: `r${i}` }));
+		}
+		// Empty wakes still get their burst, then wait for the interval.
+		for (let i = 0; i < WAKE_BURST; i++) {
+			worker.wake();
+			await flush();
+		}
+		const afterBurst = c.calls.length;
+		expect(afterBurst).toBe(WAKE_BURST * 6 + 1);
+		worker.wake();
+		await flush();
+		expect(c.calls).toHaveLength(afterBurst);
+		await vi.advanceTimersByTimeAsync(MIN_WAKE_INTERVAL_MS);
+		expect(c.calls).toHaveLength(afterBurst + 1);
+		worker.stopClaiming();
+	});
+
+	it("a work-bearing wake between empty ones does not delay the next legitimate wake", async () => {
+		const c = fakeClaim();
+		const p = controlledProcess();
+		const { worker } = queueWorker(c.claim, p.process, {
+			concurrency: 100,
+			polling: { intervalMs: 60_000, jitterMs: 0 },
+		});
+		worker.start();
+		await flush();
+		// Exhaust the burst with empty wake passes.
+		for (let i = 0; i < WAKE_BURST; i++) {
+			worker.wake();
+			await flush();
+		}
+		const exhausted = c.calls.length;
+		// Budget spent: a new wake waits for the interval, even with work.
+		c.backlog.push(run("a"));
+		worker.wake();
+		await flush();
+		expect(c.calls).toHaveLength(exhausted);
+		await vi.advanceTimersByTimeAsync(MIN_WAKE_INTERVAL_MS);
+		expect(c.calls).toHaveLength(exhausted + 1);
+		// That pass claimed "a" and was not charged: the next work-bearing wake is not pushed back.
+		c.backlog.push(run("b"));
+		worker.wake();
+		await flush();
+		expect(c.calls).toHaveLength(exhausted + 2);
+		expect(p.process).toHaveBeenCalledWith(expect.objectContaining({ id: "b" }));
+		worker.stopClaiming();
+	});
+
 	it("wake() while sleeping claims right away and cancels the pending sleep", async () => {
 		const c = fakeClaim();
 		const p = controlledProcess();
