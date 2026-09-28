@@ -22,7 +22,8 @@
  *   read); then `store.runs.get(runId)` and the FULL {@link RunStatusMessage} (status, `updatedAt`,
  *   progress) -- all read from the database, never trusted from the notification -- is handed to
  *   every matching handler. A run that no longer exists, or a read failure (`logger.warn`,
- *   throttled), emits nothing.
+ *   throttled), emits nothing. Re-reads coalesce per run (review 5 item B4): while one is in
+ *   flight, more notifications for that id cost a single follow-up read (same for cancel).
  * - **cancel**: ids arriving within the same event-loop turn are grouped into one batch (no
  *   handlers registered, no read at all); each id is filtered by
  *   {@link CreatePgPubSubOptions.isActiveLocally} BEFORE any read (an id this process isn't running
@@ -142,30 +143,56 @@ export function createPgPubSub(options: CreatePgPubSubOptions): PubSub {
 		}
 	}
 
+	/**
+	 * Review 5 item B4: per-run status re-reads in flight. A notification for a run whose re-read
+	 * is in flight only marks it dirty (`true`); when that read ends, one more read follows (the
+	 * row may have changed after the first read's snapshot). 3 000 notifications for one run cost
+	 * two reads, not 3 000.
+	 */
+	const statusReads = new Map<string, boolean>();
+	/** The same for the cancel re-reads (an id is re-queued into the next batch when dirty). */
+	const cancelReads = new Map<string, boolean>();
+
 	function handleStatus(runId: string): void {
 		const handlers = statusHandlers.get(runId);
 		if (!handlers || handlers.size === 0) return; // No handler: skip the read entirely.
+		if (statusReads.has(runId)) {
+			statusReads.set(runId, true);
+			return;
+		}
+		statusReads.set(runId, false);
 		void (async () => {
-			let run: Awaited<ReturnType<Store["runs"]["get"]>>;
 			try {
-				run = await store.runs.get(runId);
-			} catch (error) {
-				warn("failed to re-read run for a status notification; ignoring", { error, runId });
-				return;
-			}
-			if (!run) return;
-			const message: RunStatusMessage = {
-				runId: run.id,
-				status: run.status,
-				updatedAt: run.updatedAt.toISOString(),
-				progress: run.progress,
-			};
-			const current = statusHandlers.get(runId);
-			if (!current) return;
-			for (const handler of current) {
-				safeCall(() => handler(message));
+				do {
+					statusReads.set(runId, false);
+					await readAndEmitStatus(runId);
+				} while (statusReads.get(runId) === true && !closed);
+			} finally {
+				statusReads.delete(runId);
 			}
 		})();
+	}
+
+	async function readAndEmitStatus(runId: string): Promise<void> {
+		let run: Awaited<ReturnType<Store["runs"]["get"]>>;
+		try {
+			run = await store.runs.get(runId);
+		} catch (error) {
+			warn("failed to re-read run for a status notification; ignoring", { error, runId });
+			return;
+		}
+		if (!run) return;
+		const message: RunStatusMessage = {
+			runId: run.id,
+			status: run.status,
+			updatedAt: run.updatedAt.toISOString(),
+			progress: run.progress,
+		};
+		const current = statusHandlers.get(runId);
+		if (!current) return;
+		for (const handler of current) {
+			safeCall(() => handler(message));
+		}
 	}
 
 	function scheduleCancel(runId: string): void {
@@ -205,16 +232,34 @@ export function createPgPubSub(options: CreatePgPubSubOptions): PubSub {
 			return;
 		}
 		if (localIds.length === 0) return; // Not run by this process: never even read.
-		const canceled: string[] = [];
+		// Review 5 item B4: an id whose re-read is in flight (an earlier batch) is only marked dirty.
+		const toRead: string[] = [];
 		for (const runId of localIds) {
-			let run: Awaited<ReturnType<Store["runs"]["get"]>>;
-			try {
-				run = await store.runs.get(runId);
-			} catch (error) {
-				warn("failed to re-read run for a cancel notification; ignoring", { error, runId });
-				continue;
+			if (cancelReads.has(runId)) cancelReads.set(runId, true);
+			else {
+				cancelReads.set(runId, false);
+				toRead.push(runId);
 			}
-			if (run?.status === "canceled") canceled.push(runId);
+		}
+		const canceled: string[] = [];
+		try {
+			for (const runId of toRead) {
+				let run: Awaited<ReturnType<Store["runs"]["get"]>>;
+				try {
+					run = await store.runs.get(runId);
+				} catch (error) {
+					warn("failed to re-read run for a cancel notification; ignoring", { error, runId });
+					continue;
+				}
+				if (run?.status === "canceled") canceled.push(runId);
+			}
+		} finally {
+			for (const runId of toRead) {
+				const dirty = cancelReads.get(runId) === true;
+				cancelReads.delete(runId);
+				// Already found canceled: nothing more a re-read could add.
+				if (dirty && !closed && !canceled.includes(runId)) scheduleCancel(runId);
+			}
 		}
 		if (canceled.length === 0) return;
 		for (const handler of cancelHandlers) {
