@@ -13,7 +13,7 @@ import { randomUUID } from "node:crypto";
 import net from "node:net";
 import { afterEach, describe, expect, it } from "vitest";
 import { createEngine, type Engine } from "../../src/engine.js";
-import { MinitriggerError } from "../../src/errors.js";
+import { ConfigError, MinitriggerError } from "../../src/errors.js";
 import { defineTask } from "../../src/task.js";
 import { type EngineOverrides, engineConfigFor } from "../helpers/engine-factory.js";
 import { useTestNamespace, waitFor } from "../helpers/namespace.js";
@@ -146,7 +146,11 @@ describe("transport postgres with the database unreachable (review 5, C1)", () =
 			const outcome = await settleWithin(engine.start(), 20_000);
 			const startMs = Date.now() - t0;
 			expect(outcome.kind).toBe("rejected");
-			if (outcome.kind === "rejected") expect(outcome.error).toBeInstanceOf(MinitriggerError);
+			if (outcome.kind === "rejected") {
+				expect(outcome.error).toBeInstanceOf(MinitriggerError);
+				// Decision 28(h): transient infrastructure, never ConfigError (a MinitriggerError subclass).
+				expect(outcome.error).not.toBeInstanceOf(ConfigError);
+			}
 			expect(startMs).toBeLessThan(15_000);
 
 			// Back up: the same engine starts (nothing half-started blocks it) and runs a task.
