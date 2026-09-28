@@ -239,6 +239,15 @@ function createClaimLoop<T>(spec: LoopSpec<T>): ClaimWorker<T> {
 				for (const item of items) launch(item);
 				if (stopped) return;
 				if (items.length < free) {
+					if (reclaimed && items.length === 0) {
+						// The row nextDueInMs called due is still not claimable (row-locked by
+						// another transaction, ...): it would keep answering 0, so sleep the poll
+						// interval instead of polling every MIN_IDLE_SLEEP_MS (NOTIFY still wakes).
+						failures = 0;
+						schedule(spec.polling.intervalMs);
+						if (!again) return;
+						continue;
+					}
 					if (spec.atCap?.()) {
 						failures = 0;
 						// A freed slot wakes us (onSlotFreed / the end of a local run).
@@ -338,12 +347,16 @@ function createClaimLoop<T>(spec: LoopSpec<T>): ClaimWorker<T> {
 			pass();
 		},
 		wake() {
-			if (!started || stopped || failures > 0) return; // backing off: the timer retries
+			if (!started || stopped) return;
 			if (concurrency - inFlight <= 0) return; // full: no query (an ending run calls pass())
 			if (current) {
-				wakePending = true; // collapsed into one pass after this one
+				// Collapsed into one pass after this one, also during the pass that recovers from
+				// a failure (`failures` is still > 0 until it succeeds): if that pass fails too,
+				// the catch drops it and the backoff stands.
+				wakePending = true;
 				return;
 			}
+			if (failures > 0) return; // backing off: the timer retries
 			wakeSoon();
 		},
 		setConcurrency(n) {
@@ -455,6 +468,18 @@ export function createSystemWorker(o: SystemWorkerOptions): SystemWorker {
 	const clock = clockOf(o);
 	const { logger, systemJobs } = o;
 
+	/**
+	 * Logs that precede a write: a throwing injected logger must not skip the write (the row would
+	 * stay locked until `lockMs` and repeat forever without `attempts` growing).
+	 */
+	const logBeforeWrite = (fn: () => void): void => {
+		try {
+			fn();
+		} catch {
+			// The write below matters more than the report.
+		}
+	};
+
 	const fenced = (jobId: string, ok: boolean): void => {
 		if (!ok) logger.debug({ jobId }, "system job lock lost; result discarded");
 	};
@@ -473,9 +498,11 @@ export function createSystemWorker(o: SystemWorkerOptions): SystemWorker {
 		} catch (error) {
 			// Validated before being written, so this should not happen; the reconciler recreates
 			// the row from `schedules`.
-			logger.error(
-				{ jobId: rec.jobId, cron: tick.cron, timezone: tick.timezone, err: error },
-				"schedule tick row has an invalid cron; removing it"
+			logBeforeWrite(() =>
+				logger.error(
+					{ jobId: rec.jobId, cron: tick.cron, timezone: tick.timezone, err: error },
+					"schedule tick row has an invalid cron; removing it"
+				)
 			);
 			await systemJobs.remove(rec.jobId, { evenIfLocked: true });
 			return;
@@ -497,9 +524,11 @@ export function createSystemWorker(o: SystemWorkerOptions): SystemWorker {
 		if (isTick) {
 			tick = parseScheduleTickData(rec.data);
 			if (!tick) {
-				logger.error(
-					{ jobId: rec.jobId, data: rec.data },
-					"schedule tick row has invalid data; removing it"
+				logBeforeWrite(() =>
+					logger.error(
+						{ jobId: rec.jobId, data: rec.data },
+						"schedule tick row has invalid data; removing it"
+					)
 				);
 				await systemJobs.remove(rec.jobId, { evenIfLocked: true });
 				return;
@@ -545,9 +574,11 @@ export function createSystemWorker(o: SystemWorkerOptions): SystemWorker {
 		// `fail()` deletes an exhausted row whatever its name: a tick decides exhaustion itself and
 		// moves on to the next occurrence instead of disappearing.
 		if (tick && rec.attempts + 1 >= rec.maxAttempts) {
-			logger.error(
-				{ jobId: rec.jobId, scheduleId: tick.scheduleId, err: error },
-				"schedule tick failed permanently; moving to the next occurrence"
+			logBeforeWrite(() =>
+				logger.error(
+					{ jobId: rec.jobId, scheduleId: tick.scheduleId, err: error },
+					"schedule tick failed permanently; moving to the next occurrence"
+				)
 			);
 			await rescheduleTick(rec, token, tick);
 			return;

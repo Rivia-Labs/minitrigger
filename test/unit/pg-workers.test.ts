@@ -217,22 +217,45 @@ describe("queue worker", () => {
 		worker.stopClaiming();
 	});
 
-	it("never spins: a 0 ms due delay re-claims once, then sleeps MIN_IDLE_SLEEP_MS", async () => {
+	it("never spins: a 0 ms due delay re-claims once; an empty re-claim sleeps intervalMs", async () => {
 		const c = fakeClaim();
 		const p = controlledProcess();
 		const { worker } = queueWorker(c.claim, p.process);
+		// Due "now" but never claimable (row-locked elsewhere): nextDueInMs keeps answering 0.
 		c.setNextDue(0);
 		worker.start();
 		await flush();
 		// Already due after the claim: one immediate re-claim (review 5, A3), never more.
 		expect(c.calls).toHaveLength(2);
-		await vi.advanceTimersByTimeAsync(MIN_IDLE_SLEEP_MS - 1);
+		expect(c.claim.nextDueInMs).toHaveBeenCalledTimes(1);
+		// The re-claim found nothing: poll interval, not MIN_IDLE_SLEEP_MS (fix round 1, finding 1).
+		await vi.advanceTimersByTimeAsync(999);
 		expect(c.calls).toHaveLength(2);
 		await vi.advanceTimersByTimeAsync(1);
 		expect(c.calls).toHaveLength(4);
-		// 100 ms later: at most two claims per MIN_IDLE_SLEEP_MS, not a hot loop.
-		await vi.advanceTimersByTimeAsync(100);
-		expect(c.calls.length).toBeLessThanOrEqual(4 + (2 * 100) / MIN_IDLE_SLEEP_MS);
+		worker.stopClaiming();
+	});
+
+	it("a re-claim that brought something but left free slots sleeps MIN_IDLE_SLEEP_MS", async () => {
+		const c = fakeClaim();
+		const p = controlledProcess();
+		const { worker } = queueWorker(c.claim, p.process, { concurrency: 3 });
+		const dues: Array<number | null> = [0, 0, null];
+		let first = true;
+		c.claim.nextDueInMs.mockImplementation(async () => {
+			if (first) c.backlog.push(run("late")); // came due after the first claim
+			first = false;
+			return dues.shift() ?? null;
+		});
+		worker.start();
+		await flush();
+		expect(c.calls).toHaveLength(2);
+		expect(p.process).toHaveBeenCalledWith(expect.objectContaining({ id: "late" }));
+		// Still something due after a productive re-claim: the short idle sleep, as before.
+		await vi.advanceTimersByTimeAsync(MIN_IDLE_SLEEP_MS - 1);
+		expect(c.calls).toHaveLength(2);
+		await vi.advanceTimersByTimeAsync(1);
+		expect(c.calls).toHaveLength(3);
 		worker.stopClaiming();
 	});
 
@@ -386,6 +409,55 @@ describe("queue worker", () => {
 		const before = c.calls.length;
 		await vi.advanceTimersByTimeAsync(1000);
 		expect(c.calls.length).toBe(before + 1);
+		worker.stopClaiming();
+	});
+
+	it("a wake() during the pass that recovers from a claim failure is not lost (fix round 1, finding 3)", async () => {
+		const c = fakeClaim();
+		const p = controlledProcess();
+		const { worker } = queueWorker(c.claim, p.process, {
+			polling: { intervalMs: 60_000, jitterMs: 0 },
+		});
+		c.failClaims(1);
+		worker.start();
+		await flush();
+		expect(c.calls).toHaveLength(1);
+		// The recovery pass (500 ms backoff) is in its claim when a wake arrives.
+		const gate = deferred();
+		c.holdClaims(gate.promise);
+		await vi.advanceTimersByTimeAsync(500);
+		expect(c.calls).toHaveLength(2);
+		worker.wake();
+		c.backlog.push(run("woken"));
+		c.holdClaims(undefined);
+		gate.resolve();
+		await flush();
+		// Collapsed into one pass right after the recovery pass, not after intervalMs.
+		expect(c.calls).toHaveLength(3);
+		expect(p.process).toHaveBeenCalledWith(expect.objectContaining({ id: "woken" }));
+		worker.stopClaiming();
+	});
+
+	it("a wake() during a claim that fails again does not bypass the backoff", async () => {
+		const c = fakeClaim();
+		const p = controlledProcess();
+		const { worker } = queueWorker(c.claim, p.process);
+		c.failClaims(2);
+		worker.start();
+		await flush();
+		const gate = deferred();
+		c.holdClaims(gate.promise);
+		await vi.advanceTimersByTimeAsync(500);
+		expect(c.calls).toHaveLength(2);
+		worker.wake();
+		c.holdClaims(undefined);
+		gate.resolve();
+		await flush();
+		expect(c.calls).toHaveLength(2);
+		await vi.advanceTimersByTimeAsync(999);
+		expect(c.calls).toHaveLength(2);
+		await vi.advanceTimersByTimeAsync(1);
+		expect(c.calls).toHaveLength(3);
 		worker.stopClaiming();
 	});
 
@@ -1031,6 +1103,49 @@ describe("system worker", () => {
 		expect(remaining?.()).toBe(CLAIM_DRAIN_TIMEOUT_MS);
 		gate.resolve([]);
 		await flush();
+	});
+
+	describe("a throwing logger never skips the write after it (fix round 1, finding 4)", () => {
+		const throwingLogger = (): EngineLogger => {
+			const boom = () => {
+				throw new Error("logger down");
+			};
+			return { debug: boom, info: boom, warn: boom, error: boom };
+		};
+
+		it("invalid tick data is still removed", async () => {
+			const s = fakeSystemJobs(new Date(T0));
+			s.backlog.push(
+				sysRecord({ jobId: "schedule-tick:daily", name: "schedule-tick", data: null as Json })
+			);
+			const w = systemWorker(s.store, async () => {}, { logger: throwingLogger() });
+			w.worker.start();
+			await flush();
+			expect(s.store.remove).toHaveBeenCalledWith("schedule-tick:daily", { evenIfLocked: true });
+			w.worker.stopClaiming();
+		});
+
+		it("a tick with an unparsable cron is still removed", async () => {
+			const s = fakeSystemJobs(new Date(T0));
+			s.backlog.push(tickRecord({}, { cron: "not a cron" }));
+			const w = systemWorker(s.store, async () => {}, { logger: throwingLogger() });
+			w.worker.start();
+			await flush();
+			expect(s.store.remove).toHaveBeenCalledWith("schedule-tick:daily", { evenIfLocked: true });
+			w.worker.stopClaiming();
+		});
+
+		it("an exhausted tick still moves to its next occurrence", async () => {
+			const s = fakeSystemJobs(new Date("2026-01-01T12:00:30.000Z"));
+			s.backlog.push(tickRecord({ attempts: 4, maxAttempts: 5 }));
+			const w = systemWorker(s.store, async () => Promise.reject(new Error("no task")), {
+				logger: throwingLogger(),
+			});
+			w.worker.start();
+			await flush();
+			expect(s.store.rescheduleTick).toHaveBeenCalledTimes(1);
+			w.worker.stopClaiming();
+		});
 	});
 
 	it("a bookkeeping write that throws is logged and does not stop the loop", async () => {
