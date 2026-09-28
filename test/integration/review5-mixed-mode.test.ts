@@ -156,9 +156,17 @@ describe("review 5 B1: mixed-mode guard on a trigger-only engine", () => {
 		const handle = await producer.trigger(task, undefined);
 		const engine = engineFor("bullmq", nsPg);
 		const before = await runCount(nsPg);
-		await expect(engine.runs.replay(handle.id)).rejects.toBeInstanceOf(ConfigError);
-		await expect(engine.queues.resume(queue)).rejects.toBeInstanceOf(ConfigError);
-		await expect(engine.schedules.delete("s1")).rejects.toBeInstanceOf(ConfigError);
+		// The mixed-mode refusal itself (mixedModeError), not some other ConfigError.
+		const mixed = /used by engines with transport "postgres"; mixed transports/;
+		for (const call of [
+			() => engine.runs.replay(handle.id),
+			() => engine.queues.resume(queue),
+			() => engine.schedules.delete("s1"),
+		]) {
+			const error = await call().catch((e: unknown) => e);
+			expect(error).toBeInstanceOf(ConfigError);
+			expect((error as Error).message).toMatch(mixed);
+		}
 		expect(await runCount(nsPg)).toBe(before);
 	});
 

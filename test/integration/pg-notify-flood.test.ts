@@ -75,15 +75,33 @@ describe("NOTIFY flood on the wake channel (A5)", () => {
 		await new Promise(resolve => setTimeout(resolve, 300));
 
 		const claimTimes: number[] = [];
+		/** Wall time of each whole claim transaction (BEGIN .. COMMIT/ROLLBACK). */
+		const claimLatencies: number[] = [];
+		const openTx = new WeakMap<Client, { begin: number; claim: boolean }>();
 		const original = Client.prototype.query;
 		vi.spyOn(Client.prototype, "query").mockImplementation(function (
 			this: Client,
 			...args: unknown[]
 		) {
-			if (typeof args[0] === "string" && args[0].includes("WITH picked")) {
+			const text = typeof args[0] === "string" ? args[0] : "";
+			if (text === "BEGIN") openTx.set(this, { begin: performance.now(), claim: false });
+			if (text.includes("WITH picked")) {
 				claimTimes.push(performance.now());
+				const tx = openTx.get(this);
+				if (tx) tx.claim = true;
 			}
-			return (original as (...a: unknown[]) => unknown).apply(this, args) as never;
+			const result = (original as (...a: unknown[]) => unknown).apply(this, args);
+			if (text === "COMMIT" || text === "ROLLBACK") {
+				const tx = openTx.get(this);
+				openTx.delete(this);
+				if (tx?.claim && result instanceof Promise) {
+					result.then(
+						() => claimLatencies.push(performance.now() - tx.begin),
+						() => {}
+					);
+				}
+			}
+			return result as never;
 		});
 
 		const flooder = new Client({ connectionString: ns.databaseUrl });
@@ -112,7 +130,24 @@ describe("NOTIFY flood on the wake channel (A5)", () => {
 		// Per queue, fruitless wake-triggered passes: a burst of WAKE_BURST, then one every
 		// MIN_WAKE_INTERVAL_MS; +2 per queue for a pass in flight at each edge of the window.
 		const windowBound = QUEUES * (WAKE_BURST + Math.ceil(WINDOW_MS / MIN_WAKE_INTERVAL_MS) + 2);
-		expect(densest, detail).toBeLessThanOrEqual(windowBound);
+		// Review 6 fix round 1: the window bound only tells the limiter apart from its absence when
+		// an unlimited loop could exceed it, i.e. when one claim takes less than WINDOW_MS / (per
+		// queue bound). On a host where a claim transaction is that slow, the unlimited rate is
+		// about the bound itself: the check is skipped (the rest stays as a smoke test) and the
+		// limiter's timing is pinned by the fake-clock test in test/unit/pg-workers.test.ts.
+		const perQueueBound = windowBound / QUEUES;
+		const sorted = [...claimLatencies].sort((a, b) => a - b);
+		const claimLatencyMs = sorted[Math.floor(sorted.length / 2)] ?? 0;
+		if (claimLatencyMs * perQueueBound <= WINDOW_MS) {
+			expect(densest, `${detail} claimLatencyMs=${claimLatencyMs.toFixed(2)}`).toBeLessThanOrEqual(
+				windowBound
+			);
+		} else {
+			console.warn(
+				`pg-notify-flood: median claim latency ${claimLatencyMs.toFixed(2)} ms is too slow for ` +
+					`the ${WINDOW_MS} ms window bound to tell the limiter apart; bound not asserted (${detail})`
+			);
+		}
 		// And the same rate over the whole flood.
 		const totalBound = QUEUES * (WAKE_BURST + elapsedMs / MIN_WAKE_INTERVAL_MS + 5);
 		expect(claims, detail).toBeLessThanOrEqual(totalBound);
