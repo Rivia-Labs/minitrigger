@@ -15,6 +15,8 @@ import { type TestNamespace, useTestNamespace } from "../helpers/namespace.js";
 const nsPg = useTestNamespace();
 const nsBull = useTestNamespace();
 const nsEmpty = useTestNamespace();
+/** Rolling upgrade: a 0.4 producer before any 0.4 engine ran migrate() (no `schema_meta` yet). */
+const nsNoMeta = useTestNamespace();
 
 const engines: Engine[] = [];
 const pools: Pool[] = [];
@@ -29,7 +31,7 @@ const t = (ns: TestNamespace, table: string) =>
 	`${escapeIdentifier(ns.schema)}.${escapeIdentifier(table)}`;
 
 beforeAll(async () => {
-	for (const ns of [nsPg, nsBull, nsEmpty]) {
+	for (const ns of [nsPg, nsBull, nsEmpty, nsNoMeta]) {
 		const engine = createEngine({
 			transport: "postgres",
 			postgres: ns.databaseUrl,
@@ -39,6 +41,7 @@ beforeAll(async () => {
 		await engine.migrate();
 		await engine.stop();
 	}
+	await nsNoMeta.pool.query(`DROP TABLE ${t(nsNoMeta, "schema_meta")}`);
 	await nsPg.pool.query(
 		`INSERT INTO ${t(nsPg, "schema_meta")} (key, value) VALUES ('transport', 'postgres')`
 	);
@@ -130,5 +133,25 @@ describe("review 5 B1: mixed-mode guard on a trigger-only engine", () => {
 		const { rows } = await nsEmpty.pool.query(`SELECT key FROM ${t(nsEmpty, "schema_meta")}`);
 		expect(rows).toEqual([]);
 		expect(await runCount(nsEmpty)).toBe(1);
+	});
+
+	it("review fix 1: no schema_meta table yet (not migrated to 009) is treated as an absent key", async () => {
+		const engine = engineFor("bullmq", nsNoMeta);
+		await engine.trigger(task, undefined);
+		await engine.trigger(task, undefined);
+		await expect(engine.tokens.complete(randomUUID(), 1)).resolves.toEqual({
+			completed: false,
+			reason: "not_found",
+		});
+		expect(await runCount(nsNoMeta)).toBe(2);
+	});
+
+	it("review fix 2: runs.cancel and runs.cancelMany are guarded too", async () => {
+		const producer = engineFor("postgres", nsPg);
+		const handle = await producer.trigger(task, undefined);
+		const engine = engineFor("bullmq", nsPg);
+		await expect(engine.runs.cancel(handle.id)).rejects.toBeInstanceOf(ConfigError);
+		await expect(engine.runs.cancelMany({ limit: 10 })).rejects.toBeInstanceOf(ConfigError);
+		expect((await producer.runs.get(handle.id))?.status).toBe("queued");
 	});
 });

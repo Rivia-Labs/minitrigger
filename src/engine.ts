@@ -1246,6 +1246,8 @@ export function createEngineCore(
 			assertNotClosed();
 			const runId = runIdOf(run);
 			if (!isUuid(runId)) return "not_found";
+			// Review 5 fix round 1: a cancel can re-enqueue a waiting parent (afterResolution).
+			await loadBackendForWrite();
 			const result = await store.runs.cancel(runId, "canceled via engine.runs.cancel()");
 			if (result.kind !== "canceled") return result.kind;
 
@@ -1272,10 +1274,10 @@ export function createEngineCore(
 
 		async cancelMany(filter: BatchRunsFilter): Promise<CancelManyResult> {
 			assertNotStopped();
-			const page = await store.runs.listBatchCandidates({
-				purpose: "cancel",
-				...validBatchFilter("runs.cancelMany", filter),
-			});
+			const valid = validBatchFilter("runs.cancelMany", filter);
+			// Review 5 fix round 1: like runs.cancel (a parent may be re-enqueued).
+			await loadBackendForWrite();
+			const page = await store.runs.listBatchCandidates({ purpose: "cancel", ...valid });
 			const perRun = await mapBounded(page.items, BATCH_CONCURRENCY, r => cancelOneOfBatch(r.id));
 			const canceled: string[] = [];
 			const failed: CancelManyResult["failed"] = [];

@@ -43,6 +43,9 @@ export async function assertSchemaTransport(
 	if (mode !== resolved.transport) throw mixedModeError(resolved, mode);
 }
 
+/** SQLSTATE `undefined_table`. */
+const UNDEFINED_TABLE = "42P01";
+
 /** How long "no engine recorded a transport yet" is trusted before the key is read again. */
 export const SCHEMA_TRANSPORT_UNSET_RECHECK_MS = 30_000;
 
@@ -51,28 +54,36 @@ export const SCHEMA_TRANSPORT_UNSET_RECHECK_MS = 30_000;
  * an engine that may never call `start()` (a trigger-only producer). Reads `schema_meta.transport`
  * -- never writes it, only `start()` does -- and throws the same `ConfigError` when another mode
  * recorded it. A match or a mismatch is final (the key never changes), so it costs one query per
- * engine; an absent key (no engine started yet) allows the write and is read again after
- * {@link SCHEMA_TRANSPORT_UNSET_RECHECK_MS}; a failed read is not memoized (the write fails).
+ * engine; an absent key (no engine started yet), or no `schema_meta` table at all (a schema not
+ * migrated to 009 yet), allows the write and is read again after
+ * {@link SCHEMA_TRANSPORT_UNSET_RECHECK_MS}; any other failed read is not memoized (the write
+ * fails).
  */
 export function createSchemaTransportGuard(
 	store: Pick<SqlStore, "meta">,
 	resolved: Pick<ResolvedConfig, "schema" | "transport">,
 	now: () => number = Date.now
 ): () => Promise<void> {
-	let settled: { ok: true } | { ok: false; error: ConfigError } | undefined;
+	let settled: { ok: true } | { ok: false; mode: string } | undefined;
 	let unsetUntil = 0;
 	let reading: Promise<void> | undefined;
 
 	async function read(): Promise<void> {
-		const mode = await store.meta.get("transport");
+		let mode: string | null;
+		try {
+			mode = await store.meta.get("transport");
+		} catch (error) {
+			// Review 5 fix round 1: a schema not migrated to 009 yet (rolling upgrade: a 0.4 producer
+			// deployed before the engine that runs migrate()) has no `schema_meta` table -- the same
+			// as an absent key, never a failed write.
+			if ((error as { code?: unknown } | null)?.code !== UNDEFINED_TABLE) throw error;
+			mode = null;
+		}
 		if (mode === null) {
 			unsetUntil = now() + SCHEMA_TRANSPORT_UNSET_RECHECK_MS;
 			return;
 		}
-		settled =
-			mode === resolved.transport
-				? { ok: true }
-				: { ok: false, error: mixedModeError(resolved, mode) };
+		settled = mode === resolved.transport ? { ok: true } : { ok: false, mode };
 	}
 
 	return async () => {
@@ -82,7 +93,8 @@ export function createSchemaTransportGuard(
 			});
 			await reading;
 		}
-		if (settled && !settled.ok) throw settled.error;
+		// A fresh error per throw, so its stack points at this caller.
+		if (settled && !settled.ok) throw mixedModeError(resolved, settled.mode);
 	};
 }
 

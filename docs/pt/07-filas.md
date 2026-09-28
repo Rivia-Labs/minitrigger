@@ -131,8 +131,8 @@ await engine.trigger(recalcClassification, { courseId }, {
 
 Debounce mantém uma run pendente por chave (com `transport: "postgres"`, uma run pendente já
 vencida e ainda não reivindicada pode coexistir brevemente com a run pendente da janela seguinte,
-ver acima); para também impedir que duas runs da mesma chave executem ao mesmo tempo, adicione uma chave de concorrência — juntos, os dois dão "um pendente + um
-rodando".
+ver acima); para também impedir que duas runs da mesma chave executem ao mesmo tempo, adicione
+uma chave de concorrência — juntos, os dois dão "um pendente + um rodando".
 
 ## Pausar, retomar e escalar filas
 
