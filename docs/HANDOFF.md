@@ -1,7 +1,8 @@
 # Handoff — estado do projeto e próximos passos
 
-Atualizado em 2026-09-28 (branch `chore/postgres-leftovers`, criada da `main` local: pontos
-deixados depois do merge do transporte Postgres; antes: 2026-09-27, quinta revisão externa). Leia
+Atualizado em 2026-09-28 (**0.4.0 publicada no npm** — `main` em `origin`, tag `v0.4.0`, GitHub
+Release com o `.tgz`; antes: pontos deixados pós-merge, sexta revisão externa, 2026-09-27 quinta
+revisão externa). Leia
 junto com `CLAUDE.md` (decisões e notas de implementação), `docs/SPEC.md` (fonte da verdade) e
 `docs/PLAN.md` (grafo de tarefas e modelos). O histórico da feature do transporte Postgres está nos
 commits do merge `79c0082` e em `docs/superpowers/{specs,plans}/2026-09-26-postgres-transport*.md`;
@@ -10,17 +11,22 @@ os registros da quinta revisão externa e desta rodada de pontos deixados ficam 
 
 ## Estado atual
 
-- **Fases 1 a 11 concluídas** (fase 11 — transporte Postgres, decisão 28 — mesclada na `main` local,
+- **Fases 1 a 11 concluídas** (fase 11 — transporte Postgres, decisão 28 — publicada na 0.4.0,
   ver abaixo). `pnpm check:pack` ok (última vez rodado); `examples/basic` roda de ponta a ponta.
 - **Terceira revisão externa (2026-09-25):** aplicada e commitada (ver `CLAUDE.md`, "Terceira
   revisão externa"); testes novos em `test/{unit,integration}/review3-{engine,io}.test.ts`.
 - **Quarta revisão externa (2026-09-25):** aplicada e commitada (testes em
   `test/{unit,integration}/review4-engine.test.ts`, `test/unit/run-task.test.ts`,
   `test/integration/review3-engine.test.ts`); ver `CLAUDE.md`, "Quarta revisão externa".
-- **Transporte Postgres (decisão 28) mesclado na `main` local** (merge `79c0082`), com a emenda da
-  decisão 16 aprovada pelo dono (`7643404`: pooler em modo transação deixa a eleição de líder
-  duplicada/instável). A `main` local está **à frente de `origin/main`** (não enviada) e a **0.4.0
-  ainda não foi publicada**: push e publicação dependem do dono.
+- **✅ v0.4.0 publicada no npm (2026-09-28)** como `@rivia-labs/minitrigger@0.4.0`, `latest`
+  (publicada às 03:22 UTC pelo dono, com 2FA; 73 arquivos, ~435 kB compactado, sem source maps).
+  Transporte Postgres (decisão 28) mesclado na `main` (`79c0082`), emenda da decisão 16
+  (`7643404`: pooler em modo transação deixa a eleição de líder duplicada/instável), pontos
+  deixados (`23d002f`) e sexta revisão externa (`40c07a4`). `main` enviada a `origin`; tag
+  `v0.4.0` e GitHub Release com `rivia-labs-minitrigger-0.4.0.tgz` (o mesmo arquivo publicado no
+  npm). Smoke pós-publicação: `npm install @rivia-labs/minitrigger@0.4.0 pg` (sem `bullmq`/
+  `ioredis`) carrega em ESM, CJS e `/testing`. Nos primeiros minutos o cache de metadados do npm
+  pode ainda não ver a versão (`ETARGET`); `npm install --prefer-online` resolve.
 - **Migration 008 (`idx_runs_active_created`):** índice parcial para `runs.cancelMany()`; ver
   `CLAUDE.md`. Migrations 001–008 congeladas depois da publicação da 0.3.0.
 - **Verificação completa (2026-09-25, antes do transporte Postgres):** `pnpm typecheck && pnpm lint
@@ -121,7 +127,7 @@ os registros da quinta revisão externa e desta rodada de pontos deixados ficam 
 1. ✅ **v0.3.0 publicado no npm** como `@rivia-labs/minitrigger` (tag `v0.3.0`, GitHub Release com o `.tgz`; `v0.2.0` e anteriores ficam só como a API antiga, sem escopo). Propostas da comparação com `@rivia-labs/oban-ts`, por valor: outbox transacional (`trigger(..., { tx })`), pacote `@rivia-labs/minitrigger` público (LICENSE MIT, subpath `/testing`, Node >= 22), gestão de filas e operações em lote, helpers de teste, telemetria (`durationMs`, `attachDefaultLogger`), skills de Claude Code e docs em PT.
 2. ✅ Adapters de ORM para o outbox (`/typeorm`, `/knex`, `/drizzle`, `/prisma`), testados contra TypeORM 1.1, Knex 3.3, Drizzle 0.45 (node-postgres e postgres.js) e Prisma 7.10.
 
-3. ✅ **Modo só-Postgres** (`transport: "postgres" | "bullmq"`, BullMQ continua padrão) — 13 tarefas + 5 revisões externas, decisão 28, migration 009; **mesclado na `main` local** (`79c0082`), ainda não enviado a `origin` nem publicado (0.4.0). Ver "Transporte Postgres (decisão 28, migration 009)" no `CLAUDE.md`, [Postgres-only mode](../README.md#postgres-only-mode) no README e `docs/pt/14-modo-postgres.md`. Meta de paridade de `pnpm bench` batida (Task 10d/14, tabela no `CLAUDE.md`) sem qualquer otimização — vazão do modo Postgres ficou acima do BullMQ, não só dentro de ±20%.
+3. ✅ **Modo só-Postgres** (`transport: "postgres" | "bullmq"`, BullMQ continua padrão) — 13 tarefas + 5 revisões externas, decisão 28, migration 009; ✅ **publicado na v0.4.0** (npm, 2026-09-28; merge `79c0082`). Ver "Transporte Postgres (decisão 28, migration 009)" no `CLAUDE.md`, [Postgres-only mode](../README.md#postgres-only-mode) no README e `docs/pt/14-modo-postgres.md`. Meta de paridade de `pnpm bench` batida (Task 10d/14, tabela no `CLAUDE.md`) sem qualquer otimização — vazão do modo Postgres ficou acima do BullMQ, não só dentro de ±20%.
 
 ### Auditoria externa (2026-09-25)
 
@@ -177,16 +183,13 @@ transporte nesta sessão (números na tabela do `CLAUDE.md`, consistentes com os
 
 **Estado depois do merge (2026-09-28):**
 
-- **Mesclado** na `main` local (`79c0082`) depois da quinta revisão externa, com a emenda da
-  decisão 16 (`7643404`). `package.json` já está em `0.4.0` (não falta subir a versão). **Falta
-  (depende do dono, aprovação já dada em 2026-09-28 para o `npm publish`):**
-  1. Push de `main` (com `chore/review6` e qualquer outro branch pendente mesclado nela) para
-     `origin`.
-  2. `pnpm check:pack` uma última vez contra o HEAD que vai ser publicado.
-  3. Tag `v0.4.0` (`git tag v0.4.0 && git push origin v0.4.0`).
-  4. GitHub Release com o `.tgz` gerado por `pnpm pack` anexado (como em v0.1.0/v0.2.0/v0.3.0).
-  5. `npm publish` — exige `npm login` na conta com acesso a `@rivia-labs/minitrigger`
-     (`publishConfig.access: "public"`, já configurado no `package.json`).
+- **Release 0.4.0 concluído (2026-09-28):** todos os passos feitos — `main` enviada a `origin`
+  (`40c07a4`), `pnpm check:pack` verde no HEAD publicado, tag `v0.4.0`, GitHub Release com o
+  `.tgz` de `pnpm pack` anexado e `npm publish ./rivia-labs-minitrigger-0.4.0.tgz --access public`
+  (o mesmo arquivo do GitHub Release; a conta exige 2FA, então o `npm publish` roda pelo dono).
+  Verificação final antes da tag: 124 arquivos de teste, 1879 passando + 14 pulados, 3 no
+  `flushall`; `pnpm skills:validate` ok. Próximo release: subir `version`, `pnpm check:pack`,
+  tag, `gh release create` com o `.tgz`, `npm publish` do mesmo `.tgz` (dono, 2FA).
 - **Pendências pós-revisão final resolvidas (2026-09-26):** os dois "minor (deferred)" das Tasks 9
   e 12 e as cinco pendências da revisão final (claim com `statement_timestamp()` e limitado pelo
   prazo do dreno, re-checagem que falha devolve a run com backoff, `reconnectNow()` do listener,
@@ -204,7 +207,7 @@ transporte nesta sessão (números na tabela do `CLAUDE.md`, consistentes com os
   de disparo relê um marcador ausente a cada 30 s (um produtor pode escrever por até 30 s depois
   de uma engine do outro modo iniciar).
 
-**Próximas ondas (depois do merge/publicação, se o dono priorizar):**
+**Próximas ondas (depois da 0.4.0, se o dono priorizar):**
 
 - Paridade de bench contínua: reexecutar `pnpm bench` nos dois modos a cada mudança relevante no
   executor/store, para pegar uma regressão de latência cedo.
