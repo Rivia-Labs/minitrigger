@@ -1661,8 +1661,11 @@ concern is specific to 005's two new indexes.
   (the subscriber) can still fail to become ready (Redis refusing new connections over
   `maxclients`, or dropped right after that first `PING`), which without this bound would hang
   `start()` forever (the subscriber's `maxRetriesPerRequest: null` retries indefinitely). Past 5 s,
-  `start()` rejects with a `ConfigError` naming the likely cause (check `maxclients`/`CLIENT LIST`
-  or the network) instead of hanging; fix it and call `start()` again.
+  `start()` rejects with a `MinitriggerError` (transient infrastructure, not `ConfigError`) naming
+  the likely cause (check `maxclients`/`CLIENT LIST` or the network) instead of hanging; fix it
+  and call `start()` again. Right after the `PING`, Postgres gets the same treatment: an
+  unreachable database rejects with a `MinitriggerError` ("cannot reach Postgres", the driver
+  error as `cause`) within `pool.connectionTimeoutMs`, never the raw `pg` error.
 - **Postgres is the source of truth.** `trigger()` does two non-atomic writes: insert the run in
   Postgres, then enqueue it in Redis. If the process dies between the two, the run exists but was
   never enqueued. This is recovered by the **reconciler**, which periodically re-enqueues
@@ -1880,10 +1883,16 @@ mode.
 
 Postgres is this mode's only dependency, so its reachability plays the role of Redis's `PING` in
 BullMQ mode: with the database unreachable, `start()` rejects with a `MinitriggerError` ("cannot
-reach Postgres", the driver error as `cause`) instead of hanging — within a few
-`pool.connectionTimeoutMs` with a pool the engine creates, or with an injected pool that sets
-`connectionTimeoutMillis` (without it, nothing bounds the connection attempt); nothing is left
-running, and `start()` can be called again once the database is back. `stop()` resolves within its usual bounds with the database gone, whether `start()`
+reach Postgres", the driver error as `cause`) instead of hanging — within
+`pool.connectionTimeoutMs` (default 10 s; for an injected pool, its own `connectionTimeoutMillis`
+when set), whether the engine created the pool or you injected one, with or without
+`connectionTimeoutMillis`: the check runs on its own timer, and a connection that only completes
+after it is destroyed, never kept in the pool. Nothing is left running, and `start()` can be
+called again once the database is back. BullMQ mode runs the same check right after the Redis
+`PING`. An injected pool without `connectionTimeoutMillis` still keeps one slot held by
+the abandoned connection attempt until the OS gives up on it (`pg-pool` cannot cancel a pending
+connect), so a small injected pool can keep failing `start()` in the meantime: set
+`connectionTimeoutMillis` on pools you inject. `stop()` resolves within its usual bounds with the database gone, whether `start()`
 failed or the engine was running (a run it could not hand back stays `running` until another
 engine's stall recovery).
 

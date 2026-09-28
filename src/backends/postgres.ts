@@ -21,6 +21,7 @@ import { createPgPublisher, createPgPubSub } from "../pg/pubsub.js";
 import { createPgTransport } from "../pg/transport.js";
 import { createSqlTxRunStore } from "../store/sql/index.js";
 import {
+	assertPostgresReachable,
 	assertSchemaTransport,
 	dedicatedClientConfig,
 	warnPoolSizing,
@@ -184,31 +185,22 @@ export function createPostgresBackend(ctx: BackendContext): BackendRuntime {
 	};
 
 	async function beforeStart(step: BackendStartStep): Promise<void> {
+		// Decision 28(h): Postgres is this mode's only dependency, and `checkEnvironment` only
+		// warns when it cannot run a check. An unreachable database is transient infrastructure:
+		// `MinitriggerError`, never the raw driver error nor `ConfigError`, bounded whatever the
+		// pool, and start() can be called again (shared with the BullMQ backend).
+		await assertPostgresReachable(
+			pool,
+			dedicatedClientConfig(resolved, pool).connectionTimeoutMillis ??
+				resolved.poolConnectionTimeoutMs
+		);
+		step.assertNotAbandoned();
 		// Decision 22 (amended): no Redis checks; Postgres version and pending migrations only.
 		await checkEnvironment({ pool, schema: resolved.schema, logger, autoMigrate: false });
-		step.assertNotAbandoned();
-		// Decision 28(h): Postgres is this mode's only dependency, and `checkEnvironment` only
-		// warns when it cannot run a check. An unreachable database (bounded by the pool's
-		// `connectionTimeoutMillis`) is transient infrastructure: `MinitriggerError`, never the raw
-		// driver error nor `ConfigError`, and start() can be called again.
-		await assertPostgresReachable();
 		step.assertNotAbandoned();
 		// Decision 15 amendment: the schema's transport marker (mixed modes refused).
 		await assertSchemaTransport(store, resolved);
 		step.assertNotAbandoned();
-	}
-
-	async function assertPostgresReachable(): Promise<void> {
-		try {
-			await pool.query("SELECT 1");
-		} catch (error) {
-			const reason = error instanceof Error ? error.message : String(error);
-			throw new MinitriggerError(
-				`cannot reach Postgres (${reason}); check config.postgres (host, port, credentials) ` +
-					"and that Postgres accepts connections, then call start() again",
-				{ cause: error }
-			);
-		}
 	}
 
 	/**

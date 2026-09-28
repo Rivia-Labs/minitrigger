@@ -132,7 +132,7 @@ export interface Transport {
 	/** Best-effort: ignores "locked" (job currently active) and "not found". */
 	removeRunJob(queue: string, runId: string, seq: number): Promise<void>;
 	enqueueSystem(
-		name: "waitpoint-expire" | "retention" | "reconcile" | string,
+		name: "waitpoint-expire" | "retention" | "schedule-tick" | string,
 		data: unknown,
 		opts?: EnqueueSystemOptions
 	): Promise<void>;

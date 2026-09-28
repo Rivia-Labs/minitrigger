@@ -467,7 +467,7 @@ describe("systemJobs", () => {
 
 	it("fail applies the backoff from the database clock", async () => {
 		const id = `job-${Date.now()}b`;
-		await store.systemJobs.upsert({ jobId: id, name: "reconcile", maxAttempts: 3 });
+		await store.systemJobs.upsert({ jobId: id, name: "retention", maxAttempts: 3 });
 		const job = await take(id);
 		expect(await store.systemJobs.fail(id, job?.lockedBy ?? "", 60_000)).toBe("retried");
 		expect(await take(id)).toBeUndefined();
@@ -477,7 +477,7 @@ describe("systemJobs", () => {
 
 	it("a lock that expired is claimable again, and the old holder's writes do not match", async () => {
 		const id = `job-${Date.now()}l`;
-		await store.systemJobs.upsert({ jobId: id, name: "reconcile" });
+		await store.systemJobs.upsert({ jobId: id, name: "retention" });
 		const firstClaim = await take(id, 1);
 		await new Promise(r => setTimeout(r, 20));
 		const second = await take(id);

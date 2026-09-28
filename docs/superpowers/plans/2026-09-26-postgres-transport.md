@@ -515,7 +515,7 @@ describe("systemJobs", () => {
 
 	it("a lock that expired is claimable again, and the old holder's writes do not match", async () => {
 		const id = `job-${Date.now()}l`;
-		await store.systemJobs.upsert({ jobId: id, name: "reconcile" });
+		await store.systemJobs.upsert({ jobId: id, name: "retention" });
 		const first = (await store.systemJobs.claim(10, 1)).find(j => j.jobId === id)!;
 		await new Promise(r => setTimeout(r, 20));
 		const second = (await store.systemJobs.claim(10, 5_000)).find(j => j.jobId === id)!;

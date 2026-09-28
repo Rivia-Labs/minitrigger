@@ -701,15 +701,38 @@ describe("engine with transport postgres", () => {
 				polling: { intervalMs: 60_000 },
 				reconciler: { intervalMs: 60_000 },
 			});
+			// Pending checkouts made by the RUN claim (`claimRuns` -> `boundedClaim` -> `checkOut` ->
+			// `pool.connect()`, all synchronous up to the connect): `pool.waitingCount` alone would
+			// also count a `-system` claim, a heartbeat or a leader query waiting for the connection.
+			// Failure mode: the stack check needs that chain to stay synchronous up to the connect. If
+			// an `await` is ever added before `pool.connect()`, `claimRuns` may drop out of the stack,
+			// nothing is counted and the `waitFor` below times out loudly (never a silent pass).
+			const pendingRunClaims = new Set<Promise<unknown>>();
+			const originalConnect = pool.connect.bind(pool) as (...args: unknown[]) => unknown;
+			(pool as { connect: (...args: unknown[]) => unknown }).connect = (...args: unknown[]) => {
+				// `pool.query()` checks out through `connect(callback)`: pass it through untouched.
+				if (args.length > 0) return originalConnect(...args);
+				const limit = Error.stackTraceLimit;
+				Error.stackTraceLimit = 50;
+				const stack = new Error().stack ?? "";
+				Error.stackTraceLimit = limit;
+				const checkout = originalConnect() as Promise<unknown>;
+				if (stack.includes("claimRuns")) {
+					pendingRunClaims.add(checkout);
+					const settle = () => pendingRunClaims.delete(checkout);
+					checkout.then(settle, settle);
+				}
+				return checkout;
+			};
 			await engine.start();
 			await sleep(300); // the startup passes (first claims, first leader tick) are over
 			const held = await pool.connect();
 			const trigger = makeEngine([task]); // its own pool: the insert and wake are not blocked
 			const handle = await trigger.trigger(task, undefined);
-			// Observable, not a fixed sleep: the wake reached the listener and a claim now waits for
-			// a checkout. Without this, stop() could run before any claim was stuck and the test
+			// Observable, not a fixed sleep: the wake reached the listener and the queue's run claim
+			// (not any other checkout) now waits for a connection. Without this, stop() could run before any claim was stuck and the test
 			// would pass without testing anything.
-			await waitFor(() => pool.waitingCount > 0, { timeoutMs: 10_000, intervalMs: 10 });
+			await waitFor(() => pendingRunClaims.size > 0, { timeoutMs: 10_000, intervalMs: 10 });
 
 			await engine.stop(); // gives up on the claim after its drain bound
 			// The engine's pool is being ended (as for a pool the engine owns): the claim gets the

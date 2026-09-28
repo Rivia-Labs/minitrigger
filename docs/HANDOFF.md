@@ -1,20 +1,25 @@
 # Handoff — estado do projeto e próximos passos
 
-Atualizado em 2026-09-27 (branch `feat/postgres-transport`, quinta revisão externa, blocos A/B/C
-aplicados; antes: 2026-09-26, Task 14 — documentação e handoff do transporte Postgres). Leia junto com `CLAUDE.md` (decisões e notas de implementação),
-`docs/SPEC.md` (fonte da verdade) e `docs/PLAN.md` (grafo de tarefas e modelos); para o histórico
-detalhado tarefa a tarefa desta feature (13 tarefas, quatro revisões externas), ver
-`.superpowers/sdd/2026-09-26-postgres-transport/progress.md`.
+Atualizado em 2026-09-28 (branch `chore/postgres-leftovers`, criada da `main` local: pontos
+deixados depois do merge do transporte Postgres; antes: 2026-09-27, quinta revisão externa). Leia
+junto com `CLAUDE.md` (decisões e notas de implementação), `docs/SPEC.md` (fonte da verdade) e
+`docs/PLAN.md` (grafo de tarefas e modelos). O histórico da feature do transporte Postgres está nos
+commits do merge `79c0082` e em `docs/superpowers/{specs,plans}/2026-09-26-postgres-transport*.md`;
+os registros da quinta revisão externa e desta rodada de pontos deixados ficam em
+`.superpowers/review5/` (não versionado).
 
 ## Estado atual
 
 - **Fases 1 a 10 concluídas.** `pnpm check:pack` ok (última vez rodado); `examples/basic` roda de ponta a ponta.
 - **Terceira revisão externa (2026-09-25):** aplicada e commitada (ver `CLAUDE.md`, "Terceira
   revisão externa"); testes novos em `test/{unit,integration}/review3-{engine,io}.test.ts`.
-- **Quarta revisão externa (2026-09-25):** aplicada, ainda não commitada nesta sessão (`src/engine.ts`,
-  `src/index.ts`, `src/telemetry.ts`, `src/testing/run-task.ts` + testes novos/ajustados em
+- **Quarta revisão externa (2026-09-25):** aplicada e commitada (testes em
   `test/{unit,integration}/review4-engine.test.ts`, `test/unit/run-task.test.ts`,
   `test/integration/review3-engine.test.ts`); ver `CLAUDE.md`, "Quarta revisão externa".
+- **Transporte Postgres (decisão 28) mesclado na `main` local** (merge `79c0082`), com a emenda da
+  decisão 16 aprovada pelo dono (`7643404`: pooler em modo transação deixa a eleição de líder
+  duplicada/instável). A `main` local está **à frente de `origin/main`** (não enviada) e a **0.4.0
+  ainda não foi publicada**: push e publicação dependem do dono.
 - **Migration 008 (`idx_runs_active_created`):** índice parcial para `runs.cancelMany()`; ver
   `CLAUDE.md`. Migrations 001–008 congeladas depois da publicação da 0.3.0.
 - **Verificação completa (2026-09-25, antes do transporte Postgres):** `pnpm typecheck && pnpm lint
@@ -38,6 +43,11 @@ detalhado tarefa a tarefa desta feature (13 tarefas, quatro revisões externas),
   `pg-resilience`, `pg-db-unreachable`, `migrate-009-precreated`) 3× seguidas verdes. Bench:
   Postgres 1629 runs/s, sleep p99 61 ms, token p50 8,4 ms; BullMQ 1353 runs/s, sleep p99 118 ms,
   token p99 5,0 ms (tabela no `CLAUDE.md`).
+- **Verificação completa (2026-09-28, pontos deixados pós-merge, branch `chore/postgres-leftovers`):**
+  `pnpm typecheck && pnpm lint && pnpm test && pnpm check:pack` verde — 121 arquivos, **1858 testes
+  passando + 14 pulados** (1872 coletados) em `unit`+`integration`, 3 no `flushall`; `check:pack`
+  PASS (inclusive o diretório sem Redis). Arquivos de teste alterados (`pg-engine`,
+  `pg-db-unreachable`) 3× seguidas verdes.
 
 ### O que existe (resumo)
 
@@ -100,7 +110,7 @@ detalhado tarefa a tarefa desta feature (13 tarefas, quatro revisões externas),
 1. ✅ **v0.3.0 publicado no npm** como `@rivia-labs/minitrigger` (tag `v0.3.0`, GitHub Release com o `.tgz`; `v0.2.0` e anteriores ficam só como a API antiga, sem escopo). Propostas da comparação com `@rivia-labs/oban-ts`, por valor: outbox transacional (`trigger(..., { tx })`), pacote `@rivia-labs/minitrigger` público (LICENSE MIT, subpath `/testing`, Node >= 22), gestão de filas e operações em lote, helpers de teste, telemetria (`durationMs`, `attachDefaultLogger`), skills de Claude Code e docs em PT.
 2. ✅ Adapters de ORM para o outbox (`/typeorm`, `/knex`, `/drizzle`, `/prisma`), testados contra TypeORM 1.1, Knex 3.3, Drizzle 0.45 (node-postgres e postgres.js) e Prisma 7.10.
 
-3. ✅ **Modo só-Postgres** (`transport: "postgres" | "bullmq"`, BullMQ continua padrão) — implementado no branch `feat/postgres-transport` (13 tarefas + 4 revisões externas, decisão 28, migration 009); ainda **não mesclado em `main` nem publicado**. Ver "Transporte Postgres (decisão 28, migration 009)" no `CLAUDE.md`, [Postgres-only mode](../README.md#postgres-only-mode) no README e `docs/pt/14-modo-postgres.md`. Meta de paridade de `pnpm bench` batida (Task 10d/14, tabela no `CLAUDE.md`) sem qualquer otimização — vazão do modo Postgres ficou acima do BullMQ, não só dentro de ±20%.
+3. ✅ **Modo só-Postgres** (`transport: "postgres" | "bullmq"`, BullMQ continua padrão) — 13 tarefas + 5 revisões externas, decisão 28, migration 009; **mesclado na `main` local** (`79c0082`), ainda não enviado a `origin` nem publicado (0.4.0). Ver "Transporte Postgres (decisão 28, migration 009)" no `CLAUDE.md`, [Postgres-only mode](../README.md#postgres-only-mode) no README e `docs/pt/14-modo-postgres.md`. Meta de paridade de `pnpm bench` batida (Task 10d/14, tabela no `CLAUDE.md`) sem qualquer otimização — vazão do modo Postgres ficou acima do BullMQ, não só dentro de ±20%.
 
 ### Auditoria externa (2026-09-25)
 
@@ -154,43 +164,27 @@ necessária), este arquivo e `CLAUDE.md` (bloco "Transporte Postgres (decisão 2
 linha de fase + tabela de benchmark dos dois transportes). Bench rodado uma vez para cada
 transporte nesta sessão (números na tabela do `CLAUDE.md`, consistentes com os da Task 10d).
 
-**Próximos passos antes do merge para `main`:**
+**Estado depois do merge (2026-09-28):**
 
-- **Mesclar o branch e publicar como 0.4.0** (ou a versão que estiver em `package.json` na hora),
-  depois de uma revisão final humana da branch inteira (13 tarefas de código + esta de docs) —
-  ainda não mesclado nesta sessão.
+- **Mesclado** na `main` local (`79c0082`) depois da quinta revisão externa, com a emenda da
+  decisão 16 (`7643404`). **Falta (depende do dono):** push de `main` para `origin` e publicação da
+  0.4.0 (subir `version`, `pnpm check:pack`, tag, release/npm).
 - **Pendências pós-revisão final resolvidas (2026-09-26):** os dois "minor (deferred)" das Tasks 9
-  e 12 (re-checagem que lança → `release`; teste do cancel forjado sincronizado) e as cinco
-  pendências da revisão final: claim grava `statement_timestamp()`; claim inteiro limitado pelo
-  prazo do dreno do `stop()` (checkout, `statement_timeout`, `ROLLBACK` em vez de `COMMIT`);
-  re-checagem que falha sempre devolve a run com backoff crescente, sem wake nem publicação, com
-  `error` throttled; `start()` repetido chama `reconnectNow()` do listener; `schedules.upsert`/
-  `delete` carregam o backend BullMQ antes de gravar. Emenda da decisão 28(e) (semente 1 do lock
-  do `globalConcurrency`, claim em transação curta com `statement_timeout`, `statement_timestamp()`)
-  aprovada pelo dono e aplicada na SPEC e no design spec. Detalhes no `CLAUDE.md` ("Transporte
-  Postgres").
+  e 12 e as cinco pendências da revisão final (claim com `statement_timestamp()` e limitado pelo
+  prazo do dreno, re-checagem que falha devolve a run com backoff, `reconnectNow()` do listener,
+  `schedules.upsert`/`delete` carregando o backend antes de gravar); emenda da decisão 28(e)
+  aprovada pelo dono. Detalhes no `CLAUDE.md` ("Transporte Postgres").
 - **Quinta revisão externa (2026-09-27) aplicada** em três blocos (notas "Quinta revisão externa,
-  bloco A/B/C" no `CLAUDE.md`): A — claim/workers do modo Postgres (checagem de pausa não
-  correlacionada, `nextDueInMs` com 0 = vencida, `onGlobalLimit`, limitador de wake que só cobra
-  passes de wake sem claim, prazo e `statement_timestamp()` no claim da `-system`, client mantido
-  depois de erro com ROLLBACK limpo, timers limitados, logger seguro); B — guarda de modo misto em
-  engine só de disparo, debounce vencido liberado só no modo Postgres, tipos de config exportados +
-  checagem do `redis` injetado, pub/sub Postgres agrupando releituras, `ctx.stream` fatal no modo
-  Postgres, `cron-parser` fixado; C — testes (banco inacessível no modo Postgres, migration 009 com
-  índices pré-criados, condições observáveis/limites mais largos em `pg-engine`/`pg-resilience`),
-  bench sem chave de dono sobrando, docs. Um bug de `src/` achado pelo bloco C: `start()` com o
-  Postgres inacessível no modo Postgres lançava o erro cru do `pg` em vez de `MinitriggerError`
-  (decisão 28(h)) — corrigido em `4b9e07e`. Relatórios em `.superpowers/review5/` (não versionado).
-- **Pendências abertas da quinta revisão (para o dono):** ~~decisão 16 da SPEC~~ — emendada com
-  aprovação do dono em 2026-09-27 (pooler em modo transação: além do poll, eleição de líder
-  duplicada/instável); o
-  comentário da migration 009 e o tipo `SystemJobName` ainda citam um job `reconcile` que nunca é
-  enfileirado (o dispatcher o trata como no-op; limpeza cosmética, não feita para não mexer em
-  `src/` sem bug); a guarda de modo misto de uma engine só de disparo relê um marcador ausente a
-  cada 30 s (um produtor pode escrever por até 30 s depois de uma engine do outro modo iniciar).
-- Itens "minor (deferred)" restantes no mesmo ledger (dezenas, a maioria cosmética ou de robustez
-  de teste, nenhum bloqueando o merge) — não repetidos aqui; ver o arquivo para a lista completa
-  tarefa por tarefa.
+  bloco A/B/C" no `CLAUDE.md`). Registros em `.superpowers/review5/` (não versionado).
+- **Pontos deixados pós-merge (2026-09-28, branch `chore/postgres-leftovers`)**, notas no
+  `CLAUDE.md` ("Pontos deixados pós-merge"): job `reconcile` morto removido (tipo, dispatcher,
+  comentário da migration 009, design spec; nenhuma versão publicada o enfileirava);
+  `start()` com o Postgres inacessível lança `MinitriggerError` também no modo BullMQ (checagem
+  compartilhada); a checagem é limitada por timer próprio mesmo com pool injetado sem
+  `connectionTimeoutMillis`; teste do pool saturado específico do claim de runs.
+- **Pendência aberta, documentada e mantida como está:** a guarda de modo misto de uma engine só
+  de disparo relê um marcador ausente a cada 30 s (um produtor pode escrever por até 30 s depois
+  de uma engine do outro modo iniciar).
 
 **Próximas ondas (depois do merge/publicação, se o dono priorizar):**
 

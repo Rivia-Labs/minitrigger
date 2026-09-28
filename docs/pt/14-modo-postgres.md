@@ -111,10 +111,16 @@ BullMQ.
 
 O Postgres é a única dependência deste modo, então a alcançabilidade dele faz o papel do `PING` do
 Redis no modo BullMQ: com o banco inacessível, `start()` rejeita com um `MinitriggerError` ("cannot
-reach Postgres", com o erro do driver em `cause`) em vez de travar — em no máximo alguns
-`pool.connectionTimeoutMs` com um pool criado pelo engine, ou com um pool injetado que define
-`connectionTimeoutMillis` (sem isso, nada limita a tentativa de conexão); nada fica rodando, e
-`start()` pode ser chamado de novo quando o banco voltar. `stop()` resolve dentro dos limites de
+reach Postgres", com o erro do driver em `cause`) em vez de travar — dentro de
+`pool.connectionTimeoutMs` (padrão 10 s; para um pool injetado, o `connectionTimeoutMillis` dele
+quando definido), seja o pool criado pelo engine ou injetado, com ou sem `connectionTimeoutMillis`:
+a checagem tem timer próprio, e uma conexão que só completa depois dele é destruída, nunca fica no
+pool. Nada fica rodando, e `start()` pode ser chamado de novo quando o banco voltar. O modo BullMQ
+faz a mesma checagem logo depois do `PING` do Redis. Um pool injetado sem `connectionTimeoutMillis`
+ainda fica com uma vaga presa pela tentativa de conexão abandonada até o SO desistir dela (o
+`pg-pool` não consegue cancelar um connect pendente), então um pool injetado pequeno pode continuar
+fazendo o `start()` falhar enquanto isso: configure `connectionTimeoutMillis` nos pools que você
+injeta. `stop()` resolve dentro dos limites de
 sempre com o banco fora, tanto depois de um `start()` que falhou quanto com o engine rodando (uma
 run que ele não conseguiu devolver fica `running` até a recuperação de stall de outro engine).
 
