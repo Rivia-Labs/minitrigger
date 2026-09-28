@@ -187,9 +187,28 @@ export function createPostgresBackend(ctx: BackendContext): BackendRuntime {
 		// Decision 22 (amended): no Redis checks; Postgres version and pending migrations only.
 		await checkEnvironment({ pool, schema: resolved.schema, logger, autoMigrate: false });
 		step.assertNotAbandoned();
+		// Decision 28(h): Postgres is this mode's only dependency, and `checkEnvironment` only
+		// warns when it cannot run a check. An unreachable database (bounded by the pool's
+		// `connectionTimeoutMillis`) is transient infrastructure: `MinitriggerError`, never the raw
+		// driver error nor `ConfigError`, and start() can be called again.
+		await assertPostgresReachable();
+		step.assertNotAbandoned();
 		// Decision 15 amendment: the schema's transport marker (mixed modes refused).
 		await assertSchemaTransport(store, resolved);
 		step.assertNotAbandoned();
+	}
+
+	async function assertPostgresReachable(): Promise<void> {
+		try {
+			await pool.query("SELECT 1");
+		} catch (error) {
+			const reason = error instanceof Error ? error.message : String(error);
+			throw new MinitriggerError(
+				`cannot reach Postgres (${reason}); check config.postgres (host, port, credentials) ` +
+					"and that Postgres accepts connections, then call start() again",
+				{ cause: error }
+			);
+		}
 	}
 
 	/**
