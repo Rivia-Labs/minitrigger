@@ -105,6 +105,139 @@ await prisma.$transaction(async tx => {
   injetado de um adjacente a essa barra. O SQL do próprio minitrigger nunca tem uma; isso só importa
   se você mandar outro SQL cru pelo mesmo `tx` embrulhado.
 
+### Mais exemplos: transação manual, Prisma, `pg` puro e várias runs
+
+Os exemplos abaixo assumem um único engine para o app inteiro (só disparando, ou iniciado — o
+caminho `tx` é o mesmo) e uma task como:
+
+```ts
+export const sendReceipt = defineTask({
+	id: "send-receipt",
+	run: async (payload: { orderId: string }) => { /* ... */ },
+});
+```
+
+Em todo caso abaixo, se a transação faz rollback (um erro lançado dentro do callback, um rollback
+explícito, um `COMMIT` que falha), **a run nunca existiu**: nenhuma linha, nenhum job, nenhum
+evento — não há nada para limpar. O engine precisa usar o mesmo banco que o ORM (qualquer conexão; a
+linha da run é escrita pela sua transação, não pelo pool do engine).
+
+**TypeORM com `QueryRunner`**, quando você mesmo controla a transação:
+
+```ts
+const runner = dataSource.createQueryRunner();
+await runner.connect();
+await runner.startTransaction();
+try {
+	const order = await runner.manager.save(Order, { customerId, total });
+	await engine.trigger(sendReceipt, { orderId: order.id }, { tx: typeormTx(runner) });
+	await runner.commitTransaction(); // só agora a run pode executar
+} catch (error) {
+	await runner.rollbackTransaction(); // a run some junto com o pedido
+	throw error;
+} finally {
+	await runner.release();
+}
+```
+
+`typeormTx(dataSource.manager)` (um manager fora de qualquer transação) lança `ConfigError` na
+hora, assim como um wrapper usado depois de `commitTransaction()`/`rollbackTransaction()`/
+`release()`: o estado da transação é checado a cada query, então uma run nunca faz autocommit em
+silêncio por conta própria.
+
+**knex com um objeto de transação** que você comita/desfaz você mesmo:
+
+```ts
+const trx = await knex.transaction();
+try {
+	const [order] = await trx("orders").insert({ customer_id: customerId, total }).returning("id");
+	await engine.trigger(sendReceipt, { orderId: order.id }, { tx: knexTx(trx) });
+	await trx.commit();
+} catch (error) {
+	await trx.rollback();
+	throw error;
+}
+```
+
+**Drizzle**, com rollback explícito (`tx.rollback()` lança; o pedido e a run desfazem juntos):
+
+```ts
+await db.transaction(async tx => {
+	const [order] = await tx.insert(orders).values({ customerId, total }).returning();
+	await engine.trigger(sendReceipt, { orderId: order!.id }, { tx: drizzleTx(tx, sql) });
+	if (order!.total > creditLimit) tx.rollback();
+});
+```
+
+**Prisma**, lembrando que o `timeout` da transação interativa (5 s por padrão) cobre também o
+trigger:
+
+```ts
+const order = await prisma.$transaction(
+	async tx => {
+		const order = await tx.order.create({ data: { customerId, total } });
+		await engine.trigger(sendReceipt, { orderId: order.id }, { tx: prismaTx(tx) });
+		return order;
+	},
+	{ timeout: 10_000 },
+);
+```
+
+Só a forma **interativa** funciona: `prisma.$transaction([...])` (a forma em array/lote) nunca
+entrega um client de transação, então não há nada para passar como `tx`.
+
+**`pg` puro, e qualquer outro driver.** Um `PoolClient`/`Client` do node-postgres com um `BEGIN`
+aberto já é um `tx` válido (ver o primeiro exemplo desta página). Para qualquer outro driver, passe
+um objeto cujo `query(text, values)` rode o statement (placeholders `$1..$n`, valores como
+parâmetros vinculados) **na conexão da transação** e resolva para `{ rows }`. Por exemplo,
+postgres.js sem ORM nenhum:
+
+```ts
+import postgres from "postgres";
+import type { TransactionClient } from "@rivia-labs/minitrigger";
+
+const sql = postgres(process.env.DATABASE_URL!);
+
+await sql.begin(async tx => {
+	const [order] = await tx`INSERT INTO orders (customer_id, total) VALUES (${customerId}, ${total}) RETURNING id`;
+	const client: TransactionClient = {
+		query: async (text, values = []) => ({ rows: await tx.unsafe(text, values as never[]) }),
+	};
+	await engine.trigger(sendReceipt, { orderId: order!.id }, { tx: client });
+});
+```
+
+O engine só manda strings, números, booleanos e `null` como valores (o payload vai como texto JSON
+com `::jsonb` explícito), e o insert da run converte todo placeholder explicitamente, então um
+driver que tipa todo parâmetro vinculado como `text` (como as queries cruas do Prisma) também
+funciona.
+
+**Vários triggers numa mesma transação.** Dispare quantas runs precisar na mesma transação — da
+mesma task ou de tasks diferentes. Elas comitam juntas, e com `outbox.notify` no padrão a
+transação inteira manda um único `NOTIFY`:
+
+```ts
+await dataSource.transaction(async manager => {
+	const order = await manager.save(Order, { customerId, total, items });
+	const tx = typeormTx(manager); // um wrapper por transação já basta
+	await engine.trigger(sendReceipt, { orderId: order.id }, { tx });
+	await engine.trigger(reserveStock, { orderId: order.id }, { tx });
+	for (const item of items) {
+		await engine.trigger(notifyWarehouse, { orderId: order.id, sku: item.sku }, { tx });
+	}
+});
+```
+
+Dispare um depois do outro (`await` em cada um), não com `Promise.all`: eles compartilham uma única
+conexão, que roda um statement por vez de qualquer forma.
+
+**Com `transport: "postgres"`.** `trigger(..., { tx })` funciona igual em
+[14. Modo Postgres](14-modo-postgres.md), e os adaptadores acima são usados sem mudança (o mesmo
+insert parametrizado passa por eles): a própria linha da run é a fila nesse modo, então o insert na
+sua transação é tudo o que existe — no commit, um `NOTIFY` acorda os workers da fila (o poll pega
+de qualquer forma), e no rollback a linha nunca existiu. Não há uma varredura de outbox separada
+nesse modo, e é por isso que as opções `outbox.*` são rejeitadas com `transport: "postgres"`.
+
 ## NOTIFY/LISTEN + varredura de 2s como rede de segurança
 
 Nada é enfileirado antes do seu `COMMIT`. O insert também agenda um `NOTIFY` (entregue só no

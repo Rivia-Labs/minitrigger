@@ -30,6 +30,42 @@ Uma task genérica (`<T extends Json>`) não consegue ter seu parâmetro de tipo
 unknown` explícito é tratada como "sem payload" (`trigger(task)` chamável sem segundo argumento) —
 use um tipo nomeado, mesmo que permissivo, se precisar que `trigger()` exija um argumento.
 
+### Exemplo: retentativas e `AbortTaskRunError`
+
+Uma divisão comum: falhas transitórias lançam um erro normal (retentado com backoff), falhas
+permanentes lançam `AbortTaskRunError`. Uma retentativa reexecuta a função, então steps que já
+tiveram sucesso não são refeitos:
+
+```ts
+import { AbortTaskRunError, defineTask } from "@rivia-labs/minitrigger";
+
+export const chargeCard = defineTask({
+	id: "charge-card",
+	retry: { maxAttempts: 6, backoff: { type: "exponential", baseMs: 5_000, maxMs: 10 * 60_000 } },
+	maxDurationMs: 60_000,
+	run: async (payload: { invoiceId: string }, ctx) => {
+		const invoice = await ctx.step.run("load-invoice", () => loadInvoice(payload.invoiceId));
+		return ctx.step.run("charge", async () => {
+			const res = await fetch("https://payments.example.com/charges", {
+				method: "POST",
+				headers: { "idempotency-key": invoice.id }, // o provedor deduplica uma chamada retentada
+				body: JSON.stringify({ amount: invoice.amount }),
+				signal: ctx.signal, // abortado em cancelamento, maxDurationMs, shutdown
+			});
+			if (res.status >= 400 && res.status < 500) {
+				throw new AbortTaskRunError(`charge rejected (${res.status})`); // retentar não ajudaria
+			}
+			if (!res.ok) throw new Error(`payments API ${res.status} (attempt ${ctx.run.attempt})`); // retentado
+			return (await res.json()) as { chargeId: string };
+		});
+	},
+});
+```
+
+O `fn` de um step que lança não é memoizado: a próxima tentativa o roda de novo, então os efeitos
+colaterais dentro dele precisam ser idempotentes do outro lado (como o header `idempotency-key`
+acima).
+
 ## `ctx` (segundo argumento de `run`)
 
 ```ts

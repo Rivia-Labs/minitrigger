@@ -44,6 +44,65 @@ const outcome = await engine.tokens.complete(tokenId, { approved: true });
 devolve `not_found`; `run_finished` acontece quando o token já tinha expirado (`timed_out`) e a run
 dona dele já é terminal.
 
+### Exemplo: um fluxo de aprovação
+
+Uma run que carrega dados, pede aprovação a um humano por um link, espera até três dias pela
+resposta (sem segurar um worker) e então paga depois de um período de espera. Todo efeito colateral
+está dentro de um step, então um crash ou uma retentativa a qualquer momento repete os steps já
+concluídos a partir do Postgres em vez de rodá-los de novo (o aprovador recebe um e-mail só, a
+despesa é paga uma vez só).
+
+```ts
+import { AbortTaskRunError, defineTask } from "@rivia-labs/minitrigger";
+
+type Decision = { approved: boolean; note: string };
+
+export const approveExpense = defineTask({
+	id: "approve-expense",
+	retry: { maxAttempts: 5, backoff: { type: "exponential", baseMs: 2_000, maxMs: 60_000 } },
+	run: async (payload: { expenseId: string; approver: string }, ctx) => {
+		const expense = await ctx.step.run("load", () => db.expenses.find(payload.expenseId));
+		if (!expense) throw new AbortTaskRunError(`expense ${payload.expenseId} not found`); // sem retentativa
+
+		const token = await ctx.step.createToken("approval", { timeout: "3d" });
+		await ctx.step.run("email-approver", () =>
+			mailer.send(payload.approver, `https://app.example.com/approve?token=${token.id}`),
+		);
+
+		const decision = await ctx.step.waitForToken<Decision>(token); // suspende: não ocupa slot de worker
+		if (!decision.ok) {
+			// decision.error.name === "Timeout": ninguém respondeu dentro de 3 dias
+			await ctx.step.run("escalate", () => mailer.send("finance@example.com", `stuck: ${expense.id}`));
+			return { status: "escalated" as const };
+		}
+		if (!decision.output.approved) return { status: "rejected" as const, note: decision.output.note };
+
+		await ctx.step.sleep("cool-off", "1h"); // durável: sobrevive a restarts e deploys
+		const payment = await ctx.step.run("pay", () => payments.pay(expense.id, expense.amount));
+		ctx.logger.info("expense paid", { paymentId: payment.id });
+		return { status: "paid" as const, paymentId: payment.id };
+	},
+});
+```
+
+O handler do link completa o token a partir de qualquer processo (um engine que nunca chamou
+`start()` já basta):
+
+```ts
+// ex.: POST /approve?token=...
+async function handleApproval(tokenId: string, approved: boolean, note: string) {
+	const outcome = await engine.tokens.complete(tokenId, { approved, note });
+	if (!outcome.completed) {
+		// "not_found" | "completed" (já respondido) | "timed_out" | "run_finished"
+		return { status: 409, body: { reason: outcome.reason } };
+	}
+	return { status: 204 };
+}
+```
+
+`tokens.complete` só registra o output e faz a run ficar devida; um worker a pega na hora. Completar
+duas vezes é inofensivo (`reason: "completed"`), então o handler pode ser retentado pelo client.
+
 ## Subtasks
 
 ```ts
@@ -74,6 +133,55 @@ const results = await ctx.step.batchTriggerAndWait("archive-all", archiveArticle
 
 O resultado de uma filha (`triggerAndWait`/`batchTriggerAndWait`) é lido direto de `runs`/
 `waitpoints` quando o pai retoma — não é copiado para dentro de `steps.output`.
+
+### Exemplo: subtasks
+
+```ts
+import { AbortTaskRunError, defineTask } from "@rivia-labs/minitrigger";
+
+export const resizeImage = defineTask({
+	id: "resize-image",
+	queue: { name: "images", concurrency: 8 },
+	run: async (payload: { url: string; width: number }) => ({ url: await resize(payload.url, payload.width) }),
+});
+
+export const notifyFollowers = defineTask({
+	id: "notify-followers",
+	run: async (payload: { albumId: string }) => { /* ... */ },
+});
+
+export const publishAlbum = defineTask({
+	id: "publish-album",
+	run: async (payload: { albumId: string; photos: string[] }, ctx) => {
+		// Fan-out: uma run filha por foto; o pai suspende e retoma exatamente uma vez.
+		const thumbs = await ctx.step.batchTriggerAndWait(
+			"thumbnails",
+			resizeImage,
+			payload.photos.map(url => ({ url, width: 320 })),
+			{ timeout: "30m" },
+		);
+		// Um WaitResult por payload, na mesma ordem. Uma filha falha ou expirada nunca lança aqui.
+		const ok = thumbs.flatMap(r => (r.ok ? [r.output.url] : []));
+		const failed = thumbs.filter(r => !r.ok).length;
+		if (failed > 0) ctx.logger.warn("some thumbnails failed", { failed });
+
+		const cover = await ctx.step.triggerAndWait("cover", resizeImage, {
+			url: payload.photos[0] ?? "",
+			width: 1200,
+		});
+		// Um replay devolve a mesma falha memoizada, então retentar o pai não ajudaria: aborte.
+		if (!cover.ok) throw new AbortTaskRunError(`cover failed: ${cover.error.message}`);
+
+		// Fire-and-forget: a filha roda por conta própria, o pai não espera por ela.
+		await ctx.step.trigger("notify", notifyFollowers, { albumId: payload.albumId });
+		return { thumbnails: ok, cover: cover.output.url };
+	},
+});
+```
+
+Cada filha é uma run comum (visível em `runs.list()` com `parentRunId` setado, retentada pela sua
+própria política de `retry`); o pai só vê o resultado final dela. Cancelar o pai cancela suas
+filhas pendentes.
 
 ## Timeout de batch: só as filhas ainda pendentes são canceladas
 
@@ -120,6 +228,26 @@ const { retried, skipped, hasMore, nextCursor } = await engine.runs.retryFailed(
 	createdFrom: new Date(Date.now() - 24 * 3_600_000),
 	limit: 100,
 });
+```
+
+Uma varredura noturna que retenta toda run `send-email` falhada do último dia, página por página
+(segura de rodar duas vezes: uma run já retentada nunca é candidata de novo):
+
+```ts
+import type { BatchRunsFilter } from "@rivia-labs/minitrigger";
+
+const filter: BatchRunsFilter = {
+	taskId: "send-email",
+	createdFrom: new Date(Date.now() - 24 * 3_600_000),
+	limit: 200,
+};
+let page = await engine.runs.retryFailed(filter);
+for (;;) {
+	for (const { runId, newRunId } of page.retried) console.log(`retentada ${runId} como ${newRunId}`);
+	for (const { runId, reason } of page.skipped) console.warn(`pulada ${runId}: ${reason}`);
+	if (!page.hasMore || !page.nextCursor) break;
+	page = await engine.runs.retryFailed({ ...filter, cursor: page.nextCursor });
+}
 ```
 
 - Filtro: `taskId?`, `queue?`, `createdFrom?` (inclusivo), `createdTo?` (exclusivo), `cursor?`, e um
