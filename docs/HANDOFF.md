@@ -1,7 +1,7 @@
 # Handoff — estado do projeto e próximos passos
 
-Atualizado em 2026-09-26 (branch `feat/postgres-transport`, Task 14 — documentação e handoff do
-transporte Postgres). Leia junto com `CLAUDE.md` (decisões e notas de implementação),
+Atualizado em 2026-09-27 (branch `feat/postgres-transport`, quinta revisão externa, blocos A/B/C
+aplicados; antes: 2026-09-26, Task 14 — documentação e handoff do transporte Postgres). Leia junto com `CLAUDE.md` (decisões e notas de implementação),
 `docs/SPEC.md` (fonte da verdade) e `docs/PLAN.md` (grafo de tarefas e modelos); para o histórico
 detalhado tarefa a tarefa desta feature (13 tarefas, quatro revisões externas), ver
 `.superpowers/sdd/2026-09-26-postgres-transport/progress.md`.
@@ -31,6 +31,13 @@ detalhado tarefa a tarefa desta feature (13 tarefas, quatro revisões externas),
   && pnpm test && pnpm check:pack` verde — **1780 testes passando + 14 pulados** (106 arquivos) em
   `unit`+`integration`, 3 no `flushall`; `pg-engine` e `pg-resilience` 3× seguidas verdes.
   `pnpm bench -- --transport postgres`: 1360 runs/s, sleep p99 29 ms, token p99 10,1 ms.
+- **Verificação completa (2026-09-27, fim do bloco C da quinta revisão externa):** `pnpm typecheck
+  && pnpm lint && pnpm test && pnpm check:pack` verde — 121 arquivos, **1851 testes passando + 14
+  pulados** (1865 coletados) em `unit`+`integration`, 3 no `flushall`; `check:pack` PASS (inclusive
+  o diretório sem Redis). Arquivos de teste alterados/novos do bloco C (`pg-engine`,
+  `pg-resilience`, `pg-db-unreachable`, `migrate-009-precreated`) 3× seguidas verdes. Bench:
+  Postgres 1629 runs/s, sleep p99 61 ms, token p50 8,4 ms; BullMQ 1353 runs/s, sleep p99 118 ms,
+  token p99 5,0 ms (tabela no `CLAUDE.md`).
 
 ### O que existe (resumo)
 
@@ -49,7 +56,7 @@ detalhado tarefa a tarefa desta feature (13 tarefas, quatro revisões externas),
 | Modo de teste / helpers          | `src/testing/{test-engine,memory-transport,memory-pubsub,helpers,run-task}.ts`, subpath `@rivia-labs/minitrigger/testing` |
 | Telemetria                       | `src/telemetry.ts` (`attachDefaultLogger`), `durationMs`/`startedAt` em `src/executor/notify.ts`/`src/engine.ts` |
 | Controle de filas / lote         | `engine.queues.*`, `runs.cancelMany`/`retryFailed` em `src/engine.ts`; `queue_state` (migration 007) |
-| Transporte Postgres (decisão 28) | `src/backends/{postgres,bullmq,shared,types}.ts` (fábricas de backend + `import()` dinâmico do BullMQ), `src/pg/{listener,notify-batcher,pubsub,schedulers,transport,workers}.ts`, `src/store/sql/{claim,system-jobs,schema-meta}.ts`, migration 009; ver "Transporte Postgres (decisão 28, migration 009)" no `CLAUDE.md` |
+| Transporte Postgres (decisão 28) | `src/backends/{postgres,bullmq,lazy,shared,types}.ts` (fábricas de backend + `import()` dinâmico do BullMQ via `lazy.ts`), `src/pg/{listener,notify-batcher,pubsub,schedulers,transport,workers}.ts`, `src/store/sql/{claim,system-jobs,schema-meta}.ts`, migration 009; ver "Transporte Postgres (decisão 28, migration 009)" no `CLAUDE.md` |
 | Testes                           | `test/unit`, `test/integration`, `test/integration-flushall`, `test/helpers` (namespace por arquivo, suíte de contrato de store, `engineConfigFor` parametrizado por transporte), `test/{unit,integration}/review3-{engine,io}.test.ts` (terceira revisão externa); testes do transporte Postgres espalhados por `test/unit`/`test/integration` (`describe.each(["bullmq","postgres"])` na maior parte dos arquivos compartilhados) e casos dedicados de resiliência Postgres |
 | Docs                             | `README.md` (seção "Postgres-only mode", "Upgrading to 0.4.0"), `docs/pt/*` (inclui `14-modo-postgres.md`), `examples/basic` |
 
@@ -162,6 +169,25 @@ transporte nesta sessão (números na tabela do `CLAUDE.md`, consistentes com os
   do `globalConcurrency`, claim em transação curta com `statement_timeout`, `statement_timestamp()`)
   aprovada pelo dono e aplicada na SPEC e no design spec. Detalhes no `CLAUDE.md` ("Transporte
   Postgres").
+- **Quinta revisão externa (2026-09-27) aplicada** em três blocos (notas "Quinta revisão externa,
+  bloco A/B/C" no `CLAUDE.md`): A — claim/workers do modo Postgres (checagem de pausa não
+  correlacionada, `nextDueInMs` com 0 = vencida, `onGlobalLimit`, limitador de wake que só cobra
+  passes de wake sem claim, prazo e `statement_timestamp()` no claim da `-system`, client mantido
+  depois de erro com ROLLBACK limpo, timers limitados, logger seguro); B — guarda de modo misto em
+  engine só de disparo, debounce vencido liberado só no modo Postgres, tipos de config exportados +
+  checagem do `redis` injetado, pub/sub Postgres agrupando releituras, `ctx.stream` fatal no modo
+  Postgres, `cron-parser` fixado; C — testes (banco inacessível no modo Postgres, migration 009 com
+  índices pré-criados, condições observáveis/limites mais largos em `pg-engine`/`pg-resilience`),
+  bench sem chave de dono sobrando, docs. Um bug de `src/` achado pelo bloco C: `start()` com o
+  Postgres inacessível no modo Postgres lançava o erro cru do `pg` em vez de `MinitriggerError`
+  (decisão 28(h)) — corrigido em `4b9e07e`. Relatórios em `.superpowers/review5/` (não versionado).
+- **Pendências abertas da quinta revisão (para o dono):** `docs/SPEC.md` decisão 16 (seção 2,
+  fixa) ainda diz que um pooler em modo transação faz o sistema "cair para o poll", sem citar que a
+  eleição de líder fica duplicada/instável (o README, `docs/pt` e o design spec já dizem); o
+  comentário da migration 009 e o tipo `SystemJobName` ainda citam um job `reconcile` que nunca é
+  enfileirado (o dispatcher o trata como no-op; limpeza cosmética, não feita para não mexer em
+  `src/` sem bug); a guarda de modo misto de uma engine só de disparo relê um marcador ausente a
+  cada 30 s (um produtor pode escrever por até 30 s depois de uma engine do outro modo iniciar).
 - Itens "minor (deferred)" restantes no mesmo ledger (dezenas, a maioria cosmética ou de robustez
   de teste, nenhum bloqueando o merge) — não repetidos aqui; ver o arquivo para a lista completa
   tarefa por tarefa.
