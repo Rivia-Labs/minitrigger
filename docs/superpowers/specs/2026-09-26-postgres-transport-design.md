@@ -102,7 +102,9 @@ client do líder (keepalive TCP, reconexão com backoff 0,5–30 s, fechamento l
 sem `outbox`, que não existe nesse modo). O listener do outbox do modo BullMQ (decisão 26) é
 reescrito sobre o mesmo cliente genérico, sem mudar de comportamento. Um pooler em modo transação (PgBouncer) quebra
 `LISTEN` e o advisory lock de sessão do líder: as duas conexões dedicadas devem apontar direto
-para o Postgres, ou o sistema cai para o poll (decisão 22).
+para o Postgres, ou o sistema cai para o poll (decisão 22) e a eleição de líder deixa de ser
+confiável (o lock fica na conexão de servidor que o tomou: líderes duplicados ou instáveis, às
+vezes nenhum; não é um "sem líder" limpo, e nenhum autoteste detecta isso).
 
 **Decisão 21 — acrescentar:** No modo Postgres, o sync declarativo grava a linha em `schedules` e
 faz o upsert do `schedule-tick` em `system_jobs` (no-op para o tick pendente quando `cron` e
