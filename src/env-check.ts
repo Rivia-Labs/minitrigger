@@ -56,7 +56,11 @@ export interface EnvCheckReport {
 
 export interface CheckEnvironmentOptions {
 	pool: PgQueryClient;
-	redis: RedisConfigClient;
+	/**
+	 * Omitted with `transport: "postgres"` (decision 22 amendment): there is no Redis, and the
+	 * `redis-eviction-policy` check is skipped entirely (it does not appear in the report).
+	 */
+	redis?: RedisConfigClient;
 	/** Postgres schema pending migrations are checked against. */
 	schema: string;
 	/** Receives one `warn` call per {@link EnvCheckWarning}. Omit to only get them in the returned report. */
@@ -96,7 +100,14 @@ export async function checkEnvironment(options: CheckEnvironmentOptions): Promis
 			check: "postgres-version",
 			run: () => checkPostgresVersion(pool, minPostgresVersionNum),
 		},
-		{ check: "redis-eviction-policy", run: () => checkRedisEvictionPolicy(redis) },
+		...(redis === undefined
+			? []
+			: [
+					{
+						check: "redis-eviction-policy" as const,
+						run: () => checkRedisEvictionPolicy(redis),
+					},
+				]),
 		{
 			check: "pending-migrations",
 			run: () => checkPendingMigrations(pool, schema, { autoMigrate }),

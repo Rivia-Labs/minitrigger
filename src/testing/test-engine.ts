@@ -32,7 +32,7 @@
  * `tickSchedule` or `trigger` is called (mirrors `engine.start()`'s one-time sync); a fresh engine's
  * `schedules.list()` sees them without triggering or draining anything first.
  */
-import { DelayedError, type Job } from "bullmq";
+import type { Job } from "bullmq";
 import { type EngineConfig, resolveConfig } from "../config.js";
 import {
 	createEngineCore,
@@ -47,6 +47,7 @@ import {
 } from "../engine.js";
 import { ConfigError, MinitriggerError } from "../errors.js";
 import { createSystemDispatcher, executeRun } from "../executor/index.js";
+import { SystemJobDelayed } from "../executor/system.js";
 import { SCHEDULE_TICK_JOB_NAME } from "../queue/ids.js";
 import type { RunJobData } from "../queue/transport.js";
 import { buildRegistry } from "../registry.js";
@@ -262,7 +263,7 @@ export function createTestEngine(config: TestEngineConfig): TestEngine {
 		try {
 			await processSystem(job.name, job.data, bullJob);
 		} catch (error) {
-			if (!(error instanceof DelayedError)) {
+			if (!(error instanceof SystemJobDelayed)) {
 				logger.error({ err: error, job: job.name, jobId: job.id }, "system job failed");
 				if (job.name === SCHEDULE_TICK_JOB_NAME) scheduleTickErrors.set(job.id, error);
 			}

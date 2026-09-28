@@ -1,5 +1,9 @@
 # 11. Produção
 
+> Este guia descreve `transport: "bullmq"` (o padrão). Para os equivalentes em `transport:
+> "postgres"` (conexões, PgBouncer, líder/reconciler, visibilidade de `NOTIFY`, autovacuum de
+> `system_jobs`), ver [14. Modo Postgres](14-modo-postgres.md).
+
 ## Checagens de ambiente no `start()`
 
 `engine.start()` roda `checkEnvironment()` antes de iniciar qualquer worker: versão do servidor
@@ -30,15 +34,18 @@ causa provável (checar `maxclients`/`CLIENT LIST` ou a rede) em vez de travar; 
 
 O pool precisa de `max >= concorrência total dos workers + 5` (as próprias queries de bookkeeping
 do engine precisam de folga além do que seus workers consomem; essa folga fixa de `+5` não vem de
-`systemConcurrency` — a conta é só `max(10, soma da concorrência das filas de task + 5)`, nunca
-soma a concorrência do worker `-system`, mesmo os dois tendo o mesmo valor padrão). Além do pool,
-todo engine **iniciado** segura **até duas** conexões dedicadas fora dele (eleição de líder e o
-`LISTEN` do outbox) — menos enquanto uma delas ainda está conectando ou em backoff depois de cair,
-e momentaneamente menos se uma delas falha ao (re)conectar —, então dimensione `max_connections`
+`systemConcurrency`). No modo BullMQ a conta é `max(10, soma da concorrência das filas de task +
+5)`, sem somar a concorrência do worker `-system` (os jobs dele rodam num worker do BullMQ e
+dividem a folga de `+5`). No modo Postgres o worker `-system` reivindica e roda seus jobs neste
+pool, então a conta é `max(10, soma da concorrência das filas de task + systemConcurrency + 5)`.
+Além do pool, todo engine **iniciado** segura **até duas** conexões dedicadas fora dele (eleição
+de líder e uma conexão `LISTEN`: a do outbox no modo BullMQ, a de wake/status/cancel no modo
+Postgres) — menos enquanto uma delas ainda está conectando ou em backoff depois de cair, e
+momentaneamente menos se uma delas falha ao (re)conectar —, então dimensione `max_connections`
 para `processos × (pool.max + 2)`. Um pool que o engine cria já recebe esse tamanho por padrão (no
-mínimo 10) e um `connectionTimeoutMillis` de 10 s (`pool.connectionTimeoutMs`). Se você aumentar
-`systemConcurrency` bem além do padrão, dimensione o `pool.max` por conta própria — o aviso do
-`start()` não considera isso.
+mínimo 10) e um `connectionTimeoutMillis` de 10 s (`pool.connectionTimeoutMs`). No modo BullMQ,
+se você aumentar `systemConcurrency` bem além do padrão, dimensione o `pool.max` por conta
+própria — o aviso do `start()` não considera isso.
 
 Se você injeta seu próprio `pg.Pool`, dimensione-o da mesma forma e configure um
 `connectionTimeoutMillis`: `start()` avisa quando ele é menor do que as filas iniciadas precisam ou
@@ -154,6 +161,115 @@ da linha (a fonte para `engine.runs.subscribe`).
 **O Redis pode ser apagado.** Depois de um `FLUSHALL` (ou qualquer job perdido), o reconciliador
 reenfileira toda run a partir de Postgres dentro de aproximadamente
 `reconciler.graceMs + reconciler.intervalMs`.
+
+## Upgrade 0.3.0 para 0.4.0
+
+- **Novo: `transport: "postgres"`** (decisão 28) — opt-in; `transport: "bullmq"` continua o padrão e
+  não exige nenhuma mudança. Ver [14. Modo Postgres](14-modo-postgres.md).
+- **Migration `009_postgres_transport`** adiciona duas tabelas novas, sempre vazias e instantâneas
+  de criar (`system_jobs`, `schema_meta`), e dois índices em `runs`, ambos `CREATE INDEX IF NOT
+  EXISTS` simples (mesmo trade-off de sempre da decisão 16: um lock `SHARE` em `runs` pelo tempo do
+  build). Só importam se você for rodar `transport: "postgres"` — um engine `"bullmq"` nunca
+  reivindica por eles —, mas `engine.migrate()` os constrói de qualquer forma (schema é código
+  compartilhado). Numa tabela `runs` grande, pré-construa os dois índices `CONCURRENTLY` sob os
+  mesmos nomes primeiro, fora de uma transação, contra o schema alvo, antes de `engine.migrate()`:
+
+  ```sql
+  SET search_path TO "<schema>";
+  CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_runs_claim ON runs (queue, run_after)
+    WHERE status IN ('queued', 'waiting');
+  CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_runs_running_queue ON runs (queue)
+    WHERE status = 'running';
+
+  -- Precisa devolver indisvalid = t para os dois; se f (build interrompido), DROP INDEX
+  -- CONCURRENTLY e reconstrua antes de rodar engine.migrate().
+  SELECT indexrelid::regclass::text AS index_name, indisvalid FROM pg_index
+  WHERE indexrelid IN (
+    '"<schema>".idx_runs_claim'::regclass,
+    '"<schema>".idx_runs_running_queue'::regclass
+  );
+  ```
+
+  `engine.migrate()` depois vê os dois índices já existentes e só cria `system_jobs`/`schema_meta`
+  e registra a versão 9.
+- **`bullmq` e `ioredis` agora são peers opcionais.** Nada muda para um deployment
+  `transport: "bullmq"` existente — continue instalando os dois como antes. O que mudou por baixo:
+  a entrada principal e `/testing` não importam mais nenhum dos dois estaticamente no carregamento
+  do módulo; o backend BullMQ carrega sob demanda (`import()` dinâmico) na primeira vez que um
+  engine realmente precisa dele. Se não estiverem instalados, esse primeiro uso (não o
+  `createEngine()` em si) lança `ConfigError` mandando instalar `bullmq` e `ioredis`. Isso inclui
+  `engine.schedules.upsert()`/`delete()`: o backend carrega depois da validação da entrada e antes
+  da escrita no Postgres, então um peer ausente é `ConfigError` sem nada gravado (e não uma linha
+  de schedule cujo scheduler do BullMQ nunca é criado).
+- **Cron agora é validado pelo próprio `cron-parser`**, não uma regex própria, em
+  `defineTask({ schedule })` e `engine.schedules.upsert()`, nos dois transportes. `cron-parser`
+  reconhece 5 ou 6 campos separados por espaço (um campo de segundos opcional no começo); **um
+  padrão de 7 campos que a regex antiga deixava passar agora falha na validação com
+  `ConfigError`** em vez de só falhar depois, em silêncio, dentro do scheduler do próprio BullMQ
+  (o BullMQ usa a mesma biblioteca internamente, então um padrão de 7 campos nunca rodou de fato —
+  isso só antecipa o erro, com mensagem clara). O `cron-parser` é fixado exatamente na versão que o
+  BullMQ fixa (`5.10.1`), então validação e scheduler do BullMQ sempre concordam. Conferido contra
+  o `cron-parser` 5.10.1:
+  - **Agora `ConfigError` no `defineTask`/`schedules.upsert`** (a regex antiga deixava passar; o
+    BullMQ já rejeitava, então nenhum deles rodou de fato): 7 campos (`0 0 * * * * 2026`), `LW` e
+    `15W` no dia do mês, `L` isolado no dia da semana (`0 0 * * L`; `5L`, "última sexta", passa),
+    valores fora da faixa (`0 0 32 * *`, `0 24 * * *`), datas impossíveis (`0 0 30 2 *`).
+  - **Agora aceitos** (a regex antiga rejeitava): `@daily`, `@hourly`, `@weekly` e os outros atalhos
+    `@`, e padrões de 3–4 campos. Cuidado com estes: o `cron-parser` os preenche pela direita (os
+    campos dados são os últimos: dia do mês/mês/dia da semana), então `* * 5` significa "a cada
+    minuto às sextas", raramente o que se queria — escreva os 5 campos.
+  - **Continua rejeitado:** um padrão vazio ou só com espaços continua `ConfigError`, como na regex
+    antiga. O `cron-parser` sozinho leria `""` como "a cada minuto", então a biblioteca rejeita
+    antes de chamá-lo.
+- **`EngineConfig` virou uma união discriminada** por `transport`
+  (`{ transport?: "bullmq"; redis; prefix?; outbox? } | { transport: "postgres"; polling? }`), então
+  o compilador agora pega `redis`/`prefix`/`outbox` junto com `transport: "postgres"` (ou `polling`
+  sem ele) — antes eram campos opcionais soltos, checados só em runtime. Se você monta a config aos
+  poucos com spread (ex.: `{ ...base, transport: "postgres" }`), o TypeScript alarga o literal de
+  volta para `"bullmq" | "postgres"` a menos que você o fixe — escreva
+  `{ ...base, transport: "postgres" as const }` (ou dê a `base` um tipo mais estreito) para o
+  resultado continuar casando exatamente com um membro da união.
+
+  Alguns padrões da 0.3.x que tratavam `EngineConfig` como um tipo de objeto só deixam de
+  compilar. Cada um tem correção de uma palavra: use o novo `BullmqEngineConfig`
+  (= `CommonConfig & BullmqTransportConfig`, também exportado, como `PostgresEngineConfig`), ou o
+  equivalente `Extract<EngineConfig, { transport?: "bullmq" }>`:
+
+  | Código 0.3.x | Erro na 0.4 | Escreva |
+  |---|---|---|
+  | `interface AppConfig extends EngineConfig` | TS2312 (não estende união) | `extends BullmqEngineConfig` |
+  | `Omit<EngineConfig, "tasks">` e depois `createEngine({ ...base, tasks })` | TS2345/TS2379 | `Omit<BullmqEngineConfig, "tasks">` |
+  | overrides `Partial<EngineConfig>` espalhados no `createEngine` | TS2379/TS2322 | `Partial<BullmqEngineConfig>` |
+  | `config.redis` usado como sempre presente | TS18048 | tipe `config` como `BullmqEngineConfig` |
+  | `config.redis.connection` usado como `Redis` do ioredis | TS2740 (`RedisLike` é estrutural) | `BullmqEngineConfig<Redis>` |
+
+  `redis.connection` continua sendo um `Redis` do ioredis: como `RedisLike` é só um tipo
+  estrutural (para os tipos públicos nunca importarem `ioredis`), um `Cluster` ou um objeto feito à
+  mão agora passam no tipo e são rejeitados em runtime com `ConfigError` quando o backend BullMQ
+  carrega (primeiro uso), em vez de falhar lá dentro do BullMQ. `Cluster` nunca foi suportado.
+- **O Redis conecta sob demanda com `transport: "bullmq"`.** O engine não abre mais nenhuma conexão
+  Redis no `createEngine()`: a primeira conexão abre no primeiro uso (tipicamente `engine.start()`,
+  ou um `trigger()`/`runs.subscribe()` mais cedo, num engine só de disparo que nunca chama
+  `start()`). Uma string de conexão malformada ou um Redis inacessível agora aparece como erro
+  dessa primeira chamada, não do `createEngine()` em si.
+- **Debounce com `transport: "postgres"`: uma run pendente já vencida deixa de absorver
+  triggers** — ver [07. Filas](07-filas.md#debounce). `transport: "bullmq"` não muda em relação a
+  0.3.x: uma run debounced continua colapsável até um worker de fato adquiri-la, não importa
+  quanto tempo depois do próprio prazo `delay`/`maxDelay` isso leve.
+- **Guarda de transporte misto, e mover um schema entre transportes** — ver
+  [14. Modo Postgres](14-modo-postgres.md#guarda-de-modo-misto-e-mover-um-schema-entre-transportes).
+  Resumo: `schema_meta` (nova nesta migration) passa a gravar qual transporte um schema usa, e um
+  `start()` com o outro transporte no mesmo schema é `ConfigError`. Engines que nunca chamam
+  `start()` (produtores só de disparo) só leem o marcador e recusam suas escritas com o mesmo
+  `ConfigError`. Engines em 0.3.x e anteriores
+  nunca gravaram esse marcador, então mover um schema existente para `transport: "postgres"` exige
+  atualizar todo engine dele para 0.4.0+ primeiro (procedimento completo na seção linkada).
+- **Checar tipos com `skipLibCheck: false` pode exigir `@types/node`.** O próprio `.d.ts` do `pg`
+  (já necessário via o peer opcional `@types/pg`) referencia tipos do Node; com `skipLibCheck:
+  false` eles também são checados, não só ignorados. O próprio `scripts/check-pack.mjs`, na sua
+  checagem com `skipLibCheck: false`, instala `@types/pg` e `@types/node` por esse motivo — faça o
+  mesmo se seu build usa `skipLibCheck: false` e você não estava puxando `@types/node`
+  transitivamente antes.
 
 ## Upgrade 0.2.0 para 0.3.0
 

@@ -129,11 +129,14 @@ Todos os erros acima estendem `MinitriggerError`. Ver [12. Troubleshooting](12-t
 | Opção | Padrão | Guia |
 |---|---|---|
 | `postgres` | — | [03](03-configuracao.md#conexão-schema-e-prefix) |
-| `redis` | — | [03](03-configuracao.md#conexão-schema-e-prefix) |
+| `transport` | `"bullmq"` | [03](03-configuracao.md#conexão-schema-e-prefix), [14](14-modo-postgres.md) |
+| `redis` | — (só `transport: "bullmq"`) | [03](03-configuracao.md#conexão-schema-e-prefix) |
+| `polling.intervalMs` | `1 000` (só `transport: "postgres"`) | [14](14-modo-postgres.md#como-funciona) |
+| `polling.jitterMs` | `50` (só `transport: "postgres"`) | [14](14-modo-postgres.md#como-funciona) |
 | `schema` | `"minitrigger"` | [03](03-configuracao.md#conexão-schema-e-prefix) |
-| `prefix` | `"minitrigger"` | [03](03-configuracao.md#conexão-schema-e-prefix), [08](08-agendamentos.md#prefix-precisa-ser-único-por-schema) |
+| `prefix` | `"minitrigger"` (só `transport: "bullmq"`) | [03](03-configuracao.md#conexão-schema-e-prefix), [08](08-agendamentos.md#prefix-precisa-ser-único-por-schema) |
 | `tasks` | — | [04](04-tasks-e-steps.md) |
-| `pool.max` | concorrência total das filas + 5 (mín. 10) | [03](03-configuracao.md#pool-de-conexões), [11](11-producao.md#dimensionamento-do-pool) |
+| `pool.max` | concorrência total das filas + 5 (mín. 10; + `systemConcurrency` com `transport: "postgres"`) | [03](03-configuracao.md#pool-de-conexões), [11](11-producao.md#dimensionamento-do-pool), [14](14-modo-postgres.md#conexões-por-engine) |
 | `pool.connectionTimeoutMs` | `10 000` | [03](03-configuracao.md#pool-de-conexões) |
 | `heartbeatIntervalMs` | `10 000` | [03](03-configuracao.md#heartbeat-stall-e-shutdown) |
 | `heartbeatTimeoutMs` | `2 000` | [03](03-configuracao.md#heartbeat-stall-e-shutdown) |
@@ -147,10 +150,10 @@ Todos os erros acima estendem `MinitriggerError`. Ver [12. Troubleshooting](12-t
 | `reconciler.intervalMs` | `15 000` | [03](03-configuracao.md#reconciliador), [11](11-producao.md#líder-e-reconciliador) |
 | `reconciler.graceMs` | `30 000` | [03](03-configuracao.md#reconciliador) |
 | `reconciler.batchSize` | `100` | [03](03-configuracao.md#reconciliador) |
-| `outbox.pollIntervalMs` | `2 000` | [06](06-outbox.md#configuração-outbox) |
-| `outbox.batchSize` | `500` | [06](06-outbox.md#configuração-outbox) |
-| `outbox.reconnectMaxMs` | `30 000` | [06](06-outbox.md#configuração-outbox) |
-| `outbox.notify` | `true` | [06](06-outbox.md#configuração-outbox) |
+| `outbox.pollIntervalMs` | `2 000` (só `transport: "bullmq"`) | [06](06-outbox.md#configuração-outbox) |
+| `outbox.batchSize` | `500` (só `transport: "bullmq"`) | [06](06-outbox.md#configuração-outbox) |
+| `outbox.reconnectMaxMs` | `30 000` (só `transport: "bullmq"`) | [06](06-outbox.md#configuração-outbox) |
+| `outbox.notify` | `true` (só `transport: "bullmq"`) | [06](06-outbox.md#configuração-outbox) |
 | `limits.maxPayloadBytes` | `1 MB` | [04](04-tasks-e-steps.md#serialização) |
 | `limits.maxStepOutputBytes` | `256 KB` | [04](04-tasks-e-steps.md#serialização) |
 | `limits.maxLogEntryBytes` | `16 KB` | [04](04-tasks-e-steps.md#serialização), [09](09-observabilidade.md#logs) |
@@ -158,7 +161,7 @@ Todos os erros acima estendem `MinitriggerError`. Ver [12. Troubleshooting](12-t
 | `limits.maxInlineStepOutputBytes` | `16 MB` | [03](03-configuracao.md#limites-de-payloadoutputlogprogresso) |
 | `logging.minLevel` | `"info"` | [03](03-configuracao.md#logging), [09](09-observabilidade.md#logs) |
 | `logging.mirror` | `true` | [03](03-configuracao.md#logging), [09](09-observabilidade.md#logs) |
-| `systemConcurrency` | `5` | [03](03-configuracao.md#outros) |
+| `systemConcurrency` | `5` | [03](03-configuracao.md#outros), [14](14-modo-postgres.md) |
 | `logger` | console, só warn/error | [03](03-configuracao.md#logging) |
 
 `Duration` (usado em vários campos) aceita um número de milissegundos ou uma string como `"5m"`,
@@ -188,6 +191,7 @@ O que falta:
 | `Json`, `Serializable<T>` | Um valor JSON simples; a checagem em tempo de compilação usada por `defineTask`/`trigger`/`ctx.progress.set`/etc. para rejeitar um tipo de payload/output que não é serializável em JSON — ver [Serialização](04-tasks-e-steps.md#serialização). |
 | `Duration`, `parseDuration` | O tipo `number \| "5m"` aceito por `delay`/`maxDurationMs`/etc., e a função que o interpreta. |
 | `BackoffOptions`, `RetryOptions` | Formato de `defineTask({ retry })` — ver [05. Espera](05-espera.md). |
+| `BullmqTransportConfig`, `PostgresTransportConfig`, `RedisLike` | Os dois membros da união discriminada `EngineConfig` (`transport: "bullmq" \| "postgres"`); `RedisLike` é o formato estrutural mínimo que um `redis.connection` injetado precisa satisfazer (tipos públicos não importam `ioredis`) — ver [14. Modo Postgres](14-modo-postgres.md). |
 
 ## Testing subpath (`@rivia-labs/minitrigger/testing`)
 

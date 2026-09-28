@@ -15,13 +15,20 @@ publicado.)
 
 | Pacote | Faixa de versão | Por quê |
 |---|---|---|
-| `bullmq` | `^6.3.0` | — |
-| `ioredis` | `^5.11.1` | **Não use 6.x**: o BullMQ 6.3.x é testado contra o `ioredis` 5.11.1, e o adapter dele não trata o RESP3, que é o padrão do `ioredis` 6.x. |
+| `bullmq` | `^6.3.0` | Peer opcional — só necessário com `transport: "bullmq"` (o padrão); ver [14. Modo Postgres](14-modo-postgres.md). |
+| `ioredis` | `^5.11.1` | Peer opcional, mesma condição do `bullmq`. **Não use 6.x**: o BullMQ 6.3.x é testado contra o `ioredis` 5.11.1, e o adapter dele não trata o RESP3, que é o padrão do `ioredis` 6.x. |
 | `pg` | `^8.13.0` | — |
 | `@types/pg` | `^8.11.0` | Peer opcional — só necessário porque os tipos públicos referenciam `pg.Pool`. |
 
+**`bullmq`/`ioredis` são peers opcionais**, necessários só com `transport: "bullmq"` — pule os dois
+para `transport: "postgres"` (ver [14. Modo Postgres](14-modo-postgres.md)). O pacote nunca importa
+nenhum dos dois no carregamento do módulo; com `transport: "bullmq"` e algum faltando, a primeira
+operação que precisa dele (não o `createEngine()` em si) lança `ConfigError` mandando instalar
+`bullmq` e `ioredis`.
+
 Requisitos adicionais: **Node.js >= 22** e **Postgres >= 13** (checados por `checkEnvironment()` /
-`engine.start()`), além de **Redis com `maxmemory-policy noeviction`** (próxima seção).
+`engine.start()`), além de, com `transport: "bullmq"`, **Redis com `maxmemory-policy noeviction`**
+(próxima seção).
 
 ## Infraestrutura mínima
 
@@ -69,8 +76,8 @@ autenticação do GitHub — baixe o tarball com o GitHub CLI (logado com acesso
 partir do disco:
 
 ```bash
-gh release download v0.3.0 -R igorabreu29/minitrigger -p "*.tgz"
-pnpm add ./rivia-labs-minitrigger-0.3.0.tgz bullmq ioredis pg
+gh release download v0.4.0 -R igorabreu29/minitrigger -p "*.tgz"
+pnpm add ./rivia-labs-minitrigger-0.4.0.tgz bullmq ioredis pg
 pnpm add -D @types/pg
 ```
 
@@ -98,7 +105,7 @@ enquanto/se o repositório for privado; um repositório público não precisa de
 isso.
 
 ```bash
-pnpm add github:igorabreu29/minitrigger#v0.3.0 bullmq ioredis pg
+pnpm add github:igorabreu29/minitrigger#v0.4.0 bullmq ioredis pg
 ```
 
 O `dist/` está no `.gitignore` e só é produzido pelo script `prepare` do próprio minitrigger, e o

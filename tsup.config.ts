@@ -21,6 +21,15 @@ export default defineConfig({
 	format: ["esm", "cjs"],
 	target: "node22",
 	platform: "node",
+	// tsup already externalizes every package.json `dependencies`/`peerDependencies` entry by
+	// default (verified against `dist/`: `pg`/`cron-parser` show up as `require("pg")`/`from "pg"`
+	// in the chunks that use them, never bundled inline, and `bullmq`/`ioredis` only inside the
+	// dynamically-imported `bullmq-*` chunk). This list makes that explicit and future-proof
+	// against a tsup upgrade changing the default, or a `noExternal` added later by mistake:
+	// `bullmq`/`ioredis` (optional peers, decision 14 amendment) must never end up bundled into
+	// the main entry/`/testing`/adapters, and `pg`/`cron-parser` (peer + direct dependency) must
+	// stay a single copy shared with whatever version the consumer's app already has.
+	external: ["bullmq", "ioredis", "pg", "cron-parser"],
 	// tsup 8.5.1 vendors rollup-plugin-dts, which always sets `baseUrl`; TS 6 turns that
 	// deprecation into a hard error, so it is silenced for the d.ts build only.
 	dts: { compilerOptions: { ignoreDeprecations: "6.0" } },

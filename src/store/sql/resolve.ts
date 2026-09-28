@@ -25,6 +25,16 @@ export function nowPlusMs(param: string): string {
 	return `now() + ${param}::float8 * interval '1 millisecond'`;
 }
 
+/**
+ * `min(run_after) - now()` in whole milliseconds (rounded up, never negative) as `float8`, or NULL
+ * over no row: the wake-up delay of the Postgres transport's claim loops, computed on the database
+ * clock (decision 17). Use as a select expression over rows filtered with `run_after > now()`.
+ */
+export const DELAY_UNTIL_MIN_RUN_AFTER =
+	// `greatest` ignores NULL arguments, so the NULL of an empty set needs its own branch.
+	"CASE WHEN min(run_after) IS NULL THEN NULL " +
+	"ELSE greatest(0, ceil(extract(epoch from (min(run_after) - now())) * 1000)) END::float8";
+
 /** jsonb parameters are always sent as JSON text (pg would turn JS arrays into PG arrays). */
 export function jsonParam(value: Json | SerializedError | null): string {
 	return JSON.stringify(value ?? null);
@@ -48,6 +58,13 @@ export const RUN_COLUMNS =
 	"id, task_id, queue, payload, status, output, error, attempt, max_attempts, execution_id, " +
 	"enqueue_seq, heartbeat_at, run_after, parent_run_id, parent_waitpoint_id, parent_step_name, " +
 	"batch_index, started_at, finished_at, created_at, updated_at, progress, debounce_key, concurrency_key";
+
+/** RUN_COLUMNS with an alias prefix: required in `UPDATE ... FROM` (the other relation also has `id`). */
+export function qualifiedRunColumns(alias: string): string {
+	return RUN_COLUMNS.split(",")
+		.map(column => `${alias}.${column.trim()}`)
+		.join(", ");
+}
 
 export interface RunRow {
 	id: string;

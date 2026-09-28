@@ -26,6 +26,7 @@ import { escapeIdentifier, type Pool } from "pg";
 import type { EngineLogger } from "./config.js";
 import { ConfigError } from "./errors.js";
 import { childTaskSpec, enqueue, type RunNotifier, taskQueueName } from "./executor/index.js";
+import { nextOccurrence } from "./pg/schedulers.js";
 import type { JobSchedulerInfo, Transport } from "./queue/transport.js";
 import { getTask, type Registry } from "./registry.js";
 import type { Json, ScheduleRecord, ScheduleSource, Store } from "./store/types.js";
@@ -56,29 +57,35 @@ function validateScheduleId(id: unknown): string {
 }
 
 /**
- * `cron-parser` (via BullMQ's `upsertJobScheduler`) is the actual authority on cron syntax --
- * minitrigger does not depend on it directly (it is a transitive dependency of `bullmq`, not
- * resolvable as a direct import under pnpm's strict `node_modules`, and adding it as a second,
- * separately-versioned cron parser would risk disagreeing with BullMQ's own). This only rejects
- * the obviously malformed (wrong shape, illegal characters) before touching Postgres or Redis, so
- * `schedules.upsert()`/`defineTask({ schedule })` sync fail fast and locally for a typo'd pattern;
- * a pattern that passes this but is still invalid cron surfaces as a `upsertJobScheduler` rejection
- * (logged, decision 8: Postgres already has the row, the reconciler keeps retrying the BullMQ side).
+ * `cron-parser` (Task 6: now a direct dependency, pinned to `5.10.1` -- the exact version BullMQ 6.3.8
+ * already resolves transitively, `pnpm ls cron-parser` shows one copy) is the actual authority on
+ * cron syntax in BOTH transports now: this calls {@link nextOccurrence} purely to validate `cron`
+ * against `new Date()` (`tz` deliberately left `undefined` here -- timezone is validated
+ * separately by {@link validateTimezone}, via `Intl`, before this ever runs; combining the two
+ * isn't needed just to reject a syntactically malformed pattern). The result is discarded. A
+ * pattern the old hand-rolled regex let through but `cron-parser` rejects (e.g. a 7-field pattern
+ * -- cron-parser only recognizes 5 or 6 fields, an optional leading seconds field) now fails right
+ * here, before touching Postgres or Redis, instead of surfacing later as an opaque
+ * `upsertJobScheduler`/Postgres-transport rejection.
+ *
+ * The empty/whitespace-only case is rejected explicitly, before delegating to `cron-parser` at
+ * all (fix round 1, controller ruling): `cron-parser` treats `""` as `"0 * * * * *"` (once a
+ * minute) rather than throwing, which would otherwise silently turn a blank cron field into a
+ * surprising schedule instead of the loud `ConfigError` the old regex gave. `nextOccurrence`
+ * ({@link nextOccurrence}, `src/pg/schedulers.ts`) carries the same guard, so a caller reaching it
+ * directly (Task 8's Postgres-backend scheduler) gets the identical rejection.
  */
-const CRON_FIELD_PATTERN = /^[\d*/,\-A-Za-z?LW#]+$/;
-
 function validateCronPattern(cron: unknown): string {
 	if (typeof cron !== "string") {
 		throw new ConfigError(`schedule cron must be a string, got ${JSON.stringify(cron)}`);
 	}
 	const trimmed = cron.trim();
-	const fields = trimmed.length === 0 ? [] : trimmed.split(/\s+/);
-	if (fields.length < 5 || fields.length > 7 || !fields.every(f => CRON_FIELD_PATTERN.test(f))) {
+	if (trimmed.length === 0) {
 		throw new ConfigError(
-			`schedule cron "${cron}" does not look like a valid cron pattern ` +
-				"(expected 5-7 whitespace-separated fields)"
+			`schedule cron must not be empty or whitespace-only, got ${JSON.stringify(cron)}`
 		);
 	}
+	nextOccurrence(trimmed, undefined, new Date());
 	return trimmed;
 }
 
@@ -169,6 +176,12 @@ export interface SchedulesApiDeps {
 	assertNotStopped?: () => void;
 	/** Throws only once the engine is fully stopped (list calls it; it works while stopping). */
 	assertNotClosed?: () => void;
+	/**
+	 * Runs after validation, before the Postgres write of `upsert`/`delete`: loads a backend
+	 * loaded on demand, so a missing optional peer is a `ConfigError` with nothing written (the
+	 * scheduler sync after the write only warns).
+	 */
+	beforeWrite?: () => Promise<void>;
 }
 
 export function createSchedulesApi(deps: SchedulesApiDeps): EngineSchedules {
@@ -190,6 +203,7 @@ export function createSchedulesApi(deps: SchedulesApiDeps): EngineSchedules {
 			label: `payload of schedule "${id}"`,
 			maxBytes: maxPayloadBytes,
 		});
+		await deps.beforeWrite?.();
 
 		const result = await store.schedules.upsert(
 			{
@@ -220,6 +234,7 @@ export function createSchedulesApi(deps: SchedulesApiDeps): EngineSchedules {
 	async function del(id: string): Promise<boolean> {
 		assertNotStopped();
 		if (typeof id !== "string") return false;
+		await deps.beforeWrite?.();
 		const deleted = await store.schedules.delete(id);
 		if (deleted) {
 			try {

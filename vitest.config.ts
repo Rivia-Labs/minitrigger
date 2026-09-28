@@ -24,6 +24,9 @@ export default defineConfig({
 				test: {
 					name: "integration",
 					include: ["test/integration/**/*.test.ts"],
+					// Transports the parameterized suites run on (`test/helpers/engine-factory.ts`):
+					// `MT_TRANSPORTS=postgres pnpm test:integration` narrows them to one.
+					env: { MT_TRANSPORTS: process.env["MT_TRANSPORTS"] ?? "bullmq,postgres" },
 					globalSetup: ["test/helpers/global-setup.ts"],
 					testTimeout: 30_000,
 					hookTimeout: 30_000,

@@ -47,7 +47,38 @@ export interface ExecutorDeps {
 	notify?: RunNotifier;
 	/** Redis Streams transport behind `ctx.stream` (Phase 7). Absent => `ctx.stream` rejects. */
 	streams?: Pick<Streams, "pipe">;
+	/**
+	 * Throttles the `error` logged when a Postgres-transport claimed run fails before it starts
+	 * (one per engine, see {@link createLogThrottle}). Absent => every failure is logged.
+	 */
+	claimFailureLog?: LogThrottle;
 }
+
+/** At most one log line per `intervalMs`; the next one carries how many were suppressed. */
+export interface LogThrottle {
+	take(): { log: true; suppressed: number } | { log: false };
+}
+
+export function createLogThrottle(intervalMs: number, now: () => number = Date.now): LogThrottle {
+	let lastAt: number | undefined;
+	let suppressed = 0;
+	return {
+		take() {
+			const at = now();
+			if (lastAt !== undefined && at - lastAt < intervalMs) {
+				suppressed++;
+				return { log: false };
+			}
+			lastAt = at;
+			const count = suppressed;
+			suppressed = 0;
+			return { log: true, suppressed: count };
+		},
+	};
+}
+
+/** Window of {@link ExecutorDeps.claimFailureLog} in `createEngineCore`. */
+export const CLAIM_FAILURE_LOG_INTERVAL_MS = 10_000;
 
 /** What the after-commit helpers need: enqueue a run, remove a `-system` job, log. */
 export interface EnqueueDeps {
@@ -65,6 +96,13 @@ export interface RunJob {
 	 * `acquireWithConcurrencyLimit`; unknown or omitted => plain `acquire`.
 	 */
 	queue?: string;
+	/**
+	 * Postgres transport: the run as `store.claim.claimRuns` returned it, already `running` under
+	 * its DB-generated `executionId`. The executor skips `acquire`; a keyed run goes through
+	 * `recheckConcurrencyLimit` instead (decision 25), and a `limited` result is NOT enqueued (the
+	 * queue's poll finds the run at its new `run_after`). Never set by the BullMQ transport.
+	 */
+	claimed?: RunRecord;
 }
 
 /**
@@ -95,17 +133,41 @@ type Outcome =
  */
 export async function executeRun(deps: ExecutorDeps, job: RunJob): Promise<void> {
 	const log = deps.config.logger;
-	const executionId = randomUUID();
 
 	let run: RunRecord | null;
+	let executionId: string;
+	// Postgres transport: set once the claimed run's execution id is known, so a failure of the
+	// concurrency re-check can hand the run back instead of leaving it `running` until stall
+	// recovery (which would spend an attempt, or fail a run on its last one).
+	let claimedExecutionIdForRelease: string | undefined;
 	try {
 		const limit =
 			job.queue === undefined
 				? undefined
 				: deps.registry.queues.get(job.queue)?.concurrencyKey?.limit;
-		if (limit === undefined) {
+		if (job.claimed) {
+			run = job.claimed;
+			executionId = claimedExecutionId(job.claimed);
+			claimedExecutionIdForRelease = executionId;
+			if (run.concurrencyKey !== null) {
+				const check = await deps.store.runs.recheckConcurrencyLimit(
+					run.id,
+					executionId,
+					limit === undefined ? {} : { limit }
+				);
+				if (check.kind === "limited") {
+					// Decision 25: back to `queued` with a backoff `run_after`; no attempt spent, nothing
+					// published, nothing enqueued (the queue's poll finds it at the new `run_after`).
+					log.debug({ runId: run.id }, "concurrency key at its limit; run requeued with backoff");
+					return;
+				}
+				run = check.kind === "ok" ? check.run : null;
+			}
+		} else if (limit === undefined) {
+			executionId = randomUUID();
 			run = await deps.store.runs.acquire(job.runId, executionId, job.seq);
 		} else {
+			executionId = randomUUID();
 			const acquired = await deps.store.runs.acquireWithConcurrencyLimit(
 				job.runId,
 				executionId,
@@ -124,6 +186,22 @@ export async function executeRun(deps: ExecutorDeps, job: RunJob): Promise<void>
 			run = acquired.kind === "acquired" ? acquired.run : null;
 		}
 	} catch (error) {
+		if (job.claimed && claimedExecutionIdForRelease !== undefined) {
+			// Repeats every time the run is claimed while the cause lasts: throttled, and the release
+			// backs off (growing delay) instead of making the run due again right away.
+			const throttle = deps.claimFailureLog?.take() ?? { log: true, suppressed: 0 };
+			const fields = { runId: job.runId, err: error };
+			if (throttle.log) {
+				log.error(
+					throttle.suppressed > 0 ? { ...fields, suppressed: throttle.suppressed } : fields,
+					"concurrency re-check of a claimed run failed; released with backoff"
+				);
+			} else {
+				log.debug(fields, "concurrency re-check of a claimed run failed; released with backoff");
+			}
+			await releaseClaimedAfterError(deps, job.claimed, claimedExecutionIdForRelease);
+			return;
+		}
 		log.error({ runId: job.runId, seq: job.seq, err: error }, "failed to acquire run");
 		return;
 	}
@@ -161,6 +239,46 @@ export async function executeRun(deps: ExecutorDeps, job: RunJob): Promise<void>
 		);
 	} finally {
 		deps.active.delete(state);
+	}
+}
+
+/** The execution id a Postgres-transport claim wrote (`gen_random_uuid()`); never null there. */
+function claimedExecutionId(run: RunRecord): string {
+	if (run.executionId === null) {
+		throw new MinitriggerError(`claimed run ${run.id} has no execution id`);
+	}
+	return run.executionId;
+}
+
+/**
+ * Postgres transport: the claim moved the run to `running`, but the executor failed before running
+ * it (e.g. the concurrency re-check threw). Best-effort `release` with backoff (no attempt spent;
+ * `run_after` grows like a `limited` re-check, see `RunStore.release`): the failure may repeat on
+ * every claim, so the run must not become due again right away. Like a `limited` result, nothing
+ * is published (the run was never announced as started) and nothing is enqueued (no immediate
+ * wake: the queue's poll finds it at its new `run_after`). A run left `running` by a failed
+ * release is still recovered by the stall reconciler.
+ */
+async function releaseClaimedAfterError(
+	deps: ExecutorDeps,
+	run: RunRecord,
+	executionId: string
+): Promise<void> {
+	const log = deps.config.logger;
+	const fields = { runId: run.id, taskId: run.taskId };
+	try {
+		const result = await deps.store.runs.release({ runId: run.id, executionId }, { backoff: true });
+		if (result.kind === "released") {
+			log.debug(
+				{ ...fields, delayMs: result.enqueue.delayMs },
+				"claimed run released with backoff after an error before it started"
+			);
+		}
+	} catch (error) {
+		log.error(
+			{ ...fields, err: error },
+			"failed to release a claimed run; the stall reconciler will recover it"
+		);
 	}
 }
 
@@ -756,7 +874,19 @@ async function streamTo(
 	if (typeof name !== "string" || name.length === 0) {
 		throw new ConfigError("ctx.stream: name must be a non-empty string");
 	}
-	if (!deps.streams) throw new MinitriggerError("ctx.stream is not available in this engine");
+	if (!deps.streams) {
+		if (deps.config.transport !== "postgres") {
+			throw new MinitriggerError("ctx.stream is not available in this engine");
+		}
+		// Review 5 item B5: a code bug like an invalid step argument -- fatal (no retry, even when
+		// the task catches it), instead of a retryable error that burns every attempt.
+		const error = new ConfigError(
+			'ctx.stream is not available with transport "postgres" (decision 28(f)); use ' +
+				'transport "bullmq" for Redis Streams'
+		);
+		state.markFatal(error);
+		throw error;
+	}
 	// `ctx.signal` ends the stream (with an error end marker) if the attempt is aborted or
 	// finishes while the source is still producing, so readers never block forever.
 	await deps.streams.pipe(state.runId, name, source, { signal: state.signal });

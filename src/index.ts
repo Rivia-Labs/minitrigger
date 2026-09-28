@@ -1,4 +1,15 @@
-export type { EngineConfig, EngineLimits, EngineLogFn, EngineLogger } from "./config.js";
+export type {
+	BullmqEngineConfig,
+	BullmqTransportConfig,
+	CommonConfig,
+	EngineConfig,
+	EngineLimits,
+	EngineLogFn,
+	EngineLogger,
+	PostgresEngineConfig,
+	PostgresTransportConfig,
+	RedisLike,
+} from "./config.js";
 export {
 	type BatchRunError,
 	type BatchRunsFilter,

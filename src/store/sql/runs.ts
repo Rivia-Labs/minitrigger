@@ -10,6 +10,8 @@ import type {
 	NewRun,
 	NewRunDebounce,
 	Ownership,
+	RecheckConcurrencyLimitResult,
+	ReleaseRunResult,
 	RunStatus,
 	RunStore,
 	SerializedError,
@@ -118,12 +120,15 @@ export function createRunStore(exec: SqlExecutor, ctx: SqlContext): RunStore {
 			input.maxAttempts,
 			input.delayMs,
 			input.concurrencyKey ?? null,
-			outbox !== undefined,
+			// `pending: false` (transport "postgres", decision 28(j)): claimable right after commit.
+			outbox !== undefined && outbox.pending !== false,
 		];
 		// `::text`: pg_notify returns `void`, which some ORM raw-query paths cannot deserialize
 		// (Prisma: "Failed to deserialize column of type 'void'"); the column is never read.
 		const notify = sendNotify
-			? `, pg_notify($${params.push(outbox.channel)}::text, '')::text AS notified`
+			? `, pg_notify($${params.push(outbox.channel)}::text, ${
+					outbox.payload === undefined ? "''" : `$${params.push(outbox.payload)}::text`
+				})::text AS notified`
 			: "";
 		const insertRun = (source: string) =>
 			`INSERT INTO ${runs} (id, task_id, queue, payload, status, attempt, max_attempts,
@@ -183,13 +188,22 @@ export function createRunStore(exec: SqlExecutor, ctx: SqlContext): RunStore {
 		input: NewRun,
 		debounce: NewRunDebounce
 	): Promise<CreateOnce> {
-		const { rows: found } = await db.query<{ id: string; enqueue_seq: number }>(
-			`SELECT id, enqueue_seq FROM ${runs}
+		const { rows: found } = await db.query<{ id: string; enqueue_seq: number; due: boolean }>(
+			`SELECT id, enqueue_seq, run_after <= now() AS due FROM ${runs}
 			 WHERE task_id = $1 AND debounce_key = $2 AND status = 'queued'
 			 FOR UPDATE`,
 			[input.taskId, debounce.key]
 		);
-		const existing = found[0];
+		let existing = found[0];
+		if (existing?.due && debounce.releaseDue === true) {
+			// Decision 24 (Postgres transport only, review 5 item B2): a pending run already due (its delay/maxDelay deadline reached) no longer
+			// absorbs triggers. Its key is released (nothing else on the row changes, so the run keeps
+			// its payload, run_after and seq) and this trigger opens a new window below. Otherwise a
+			// key triggered faster than acquisition keeps the row locked by collapses and a
+			// `SKIP LOCKED` claim (decision 28(a)) never gets it.
+			await db.query(`UPDATE ${runs} SET debounce_key = NULL WHERE id = $1`, [existing.id]);
+			existing = undefined;
+		}
 		if (existing) {
 			// Audit item 1: `enqueue_seq` (and thus `updated_at`'s worth of rescheduling) only
 			// advances when the recomputed `run_after` actually differs from the locked row's
@@ -603,6 +617,57 @@ export function createRunStore(exec: SqlExecutor, ctx: SqlContext): RunStore {
 			});
 		},
 
+		recheckConcurrencyLimit(runId, executionId, options) {
+			return atomic(exec, async (db): Promise<RecheckConcurrencyLimitResult> => {
+				const { rows: locked } = await db.query<{
+					queue: string;
+					concurrency_key: string | null;
+					concurrency_waits: number;
+				}>(
+					`SELECT queue, concurrency_key, concurrency_waits FROM ${runs}
+					 WHERE ${OWNED} FOR UPDATE`,
+					[runId, executionId]
+				);
+				const target = locked[0];
+				if (!target) return { kind: "lost" };
+				if (options.limit !== undefined && target.concurrency_key !== null) {
+					// Same lock key as acquireWithConcurrencyLimit: claim re-checks and BullMQ-style
+					// acquisitions of one key serialize against each other.
+					await db.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [
+						`${ctx.schema}:${target.queue}:${target.concurrency_key}`,
+					]);
+					const { rows: counted } = await db.query<{ n: number }>(
+						`SELECT count(*)::int AS n FROM ${runs}
+						 WHERE queue = $1 AND concurrency_key = $2 AND status = 'running' AND id <> $3`,
+						[target.queue, target.concurrency_key, runId]
+					);
+					if ((counted[0]?.n ?? 0) >= options.limit) {
+						// Backoff from the PRE-increment waits; the claim never reset them, so it keeps
+						// growing across claims (time from the DB, decision 17).
+						const delayMs = concurrencyLimitedDelayMs(target.concurrency_waits);
+						await db.query(
+							`UPDATE ${runs}
+							 SET status = 'queued', execution_id = NULL, run_after = ${nowPlusMs("$2")},
+							     concurrency_waits = concurrency_waits + 1, updated_at = now()
+							 WHERE id = $1`,
+							[runId, delayMs]
+						);
+						return { kind: "limited" };
+					}
+				}
+				const { rows } = await db.query<RunRow>(
+					`UPDATE ${runs}
+					 SET concurrency_waits = 0, started_at = coalesce(started_at, now())
+					 WHERE id = $1
+					 RETURNING ${RUN_COLUMNS}`,
+					[runId]
+				);
+				const row = rows[0];
+				if (!row) throw new Error("recheckConcurrencyLimit: locked run disappeared");
+				return { kind: "ok", run: mapRun(row) };
+			});
+		},
+
 		async heartbeat(runId, executionId, timeoutMs) {
 			if (exec.kind === "tx") {
 				throw new Error("heartbeat must not run inside a StoreTx (SET LOCAL would leak)");
@@ -658,7 +723,31 @@ export function createRunStore(exec: SqlExecutor, ctx: SqlContext): RunStore {
 			return { kind: "retrying", attempt: row.attempt, enqueue: mapEnqueue(row) };
 		},
 
-		async release(owner) {
+		async release(owner, options) {
+			if (options?.backoff) {
+				return atomic(exec, async (db): Promise<ReleaseRunResult> => {
+					const { rows: locked } = await db.query<{ concurrency_waits: number }>(
+						`SELECT concurrency_waits FROM ${runs} WHERE ${OWNED} FOR UPDATE`,
+						[owner.runId, owner.executionId]
+					);
+					const target = locked[0];
+					if (!target) return { kind: "lost" };
+					// Same growing delay as a `limited` re-check, from the PRE-increment waits (time
+					// itself from the DB, decision 17).
+					const { rows } = await db.query<EnqueueRow>(
+						`UPDATE ${runs}
+						 SET status = 'queued', execution_id = NULL, run_after = ${nowPlusMs("$2")},
+						     concurrency_waits = concurrency_waits + 1,
+						     enqueue_seq = enqueue_seq + 1, updated_at = now()
+						 WHERE id = $1
+						 RETURNING ${ENQUEUE_RETURNING}`,
+						[owner.runId, concurrencyLimitedDelayMs(target.concurrency_waits)]
+					);
+					const row = rows[0];
+					if (!row) throw new MinitriggerError("release: locked run disappeared");
+					return { kind: "released", enqueue: mapEnqueue(row) };
+				});
+			}
 			const { rows } = await direct(exec).query<EnqueueRow>(
 				`UPDATE ${runs}
 				 SET status = 'queued', execution_id = NULL, run_after = now(),

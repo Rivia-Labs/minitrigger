@@ -75,6 +75,10 @@ const harness: StoreHarness = {
 			sets.push(`status = $${values.length}`);
 		}
 		if (patch.executionId === null) sets.push("execution_id = NULL");
+		else if (patch.executionId !== undefined) {
+			values.push(patch.executionId);
+			sets.push(`execution_id = $${values.length}`);
+		}
 		if (patch.runAfter === null) sets.push("run_after = NULL");
 		if (sets.length === 0) return;
 		await ns.pool.query(`UPDATE ${ctx.t("runs")} SET ${sets.join(", ")} WHERE id = $1`, values);

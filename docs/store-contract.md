@@ -111,7 +111,7 @@ NULL), now())`, status stays `waiting`, return `EnqueueRequest`. Otherwise retur
 | `heartbeat`                      | 6          | Own tx: `BEGIN; SET LOCAL statement_timeout = <int ms>; UPDATE runs SET heartbeat_at=now() WHERE id AND execution_id AND status='running'; COMMIT`. Never `SET` without `LOCAL`; do not touch `updated_at`. Not on `StoreTx`.                                                                                                                                                                                                                                                                                                                                                                                                                                       |
 | `complete` / `fail`              | 5, 10      | Lock parent (if `parent_waitpoint_id`), then guarded `UPDATE runs SET status, output/error, finished_at=now(), run_after=NULL, execution_id=NULL`; then own pending waitpoints → `timed_out` (`expireJobsToRemove`); then child resolution.                                                                                                                                                                                                                                                                                                                                                                                                                         |
 | `retry`                          | 4, 17      | Guarded `UPDATE ... status='queued', attempt=attempt+1, error, execution_id=NULL, run_after=now()+backoff, enqueue_seq=enqueue_seq+1 RETURNING` → enqueue.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
-| `release`                        | 20         | Guarded `UPDATE ... status='queued', execution_id=NULL, run_after=now(), enqueue_seq+1`; attempt unchanged.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
+| `release`                        | 20         | Guarded `UPDATE ... status='queued', execution_id=NULL, run_after=now(), enqueue_seq+1`; attempt unchanged. `{ backoff: true }` (Postgres claim whose concurrency re-check threw): `FOR UPDATE`, then `run_after = now() + concurrencyLimitedDelayMs(concurrency_waits)` (pre-increment) and `concurrency_waits + 1`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
 | `setProgress`                    | 23         | Guarded (like `heartbeat`, but `updated_at` DOES change, unlike `heartbeat`): `UPDATE runs SET progress=$3::jsonb, updated_at=now() WHERE <ownership guard> RETURNING updated_at`. Overwrites the whole value (never merged); unaffected by any other transition, so it survives retry/resume untouched. |
 | `suspend`                        | 3, 2       | `SELECT ... FROM runs WHERE id AND execution_id AND status='running' FOR UPDATE` (none → lost); then, in this tx: blocking waitpoint → `waiting, run_after NULL, seq+1` (no enqueue; the bump makes a stale redelivery of `${id}-${oldSeq}` a no-op in `acquire`); else `max(wake_at) > now()` over waiting sleeps → `waiting, seq+1, run_after=max`; else `queued, seq+1, run_after=now()`. Always `execution_id NULL`.                                                                                                                                                                                                                                            |
 | `cancel`                         | 5, 10, Ph6 | Lock root's parent, root, then iteratively `SELECT id FROM runs WHERE parent_run_id = ANY($ids) ORDER BY id FOR UPDATE` (walk through terminal nodes too); non-terminal → `canceled, execution_id NULL, run_after NULL, finished_at now(), error {name:'Canceled', message, retryable:false}`. Then (waitpoint rows last) `UPDATE waitpoints SET status='timed_out', resolved_at=now() WHERE run_id = ANY(canceled ids) AND status='pending' RETURNING id, expires_at IS NOT NULL` → `expireJobsToRemove` (ids with `expires_at`; caller removes `wp-${id}-expire`). Child resolution for the root only. Return root first.                                         |
@@ -125,8 +125,14 @@ NULL), now())`, status stays `waiting`, return `EnqueueRequest`. Otherwise retur
 
 **Debounced create** (dec. 24; `NewRun.delayMs` ignored, `idempotency` together with `debounce`
 throws). Loop (bounded; exhausted → `MinitriggerError`, not a plain `Error`), each attempt one tx:
-`SELECT id, enqueue_seq FROM runs WHERE task_id AND debounce_key AND status='queued' FOR UPDATE`.
-Found → `UPDATE runs SET run_after = least(now()+delay, debounce_deadline), payload = CASE last
+`SELECT id, enqueue_seq, run_after <= now() AS due FROM runs WHERE task_id AND debounce_key AND
+status='queued' FOR UPDATE`. Found but **due** (its delay/`maxDelay` deadline already reached, not
+acquired yet) → it no longer absorbs triggers: `UPDATE runs SET debounce_key = NULL WHERE id` (only
+the key; payload, `run_after`, `enqueue_seq`, `updated_at` untouched, no enqueue) and the trigger
+continues as "Not found" below, opening a new pending run with its own window. Without this, a key
+triggered faster than acquisition keeps the due row locked by collapses and the Postgres transport's
+`SKIP LOCKED` claim never gets it; the memory store applies the same rule (`runAfter <= now`).
+Found (not due) → `UPDATE runs SET run_after = least(now()+delay, debounce_deadline), payload = CASE last
 THEN $new ELSE payload END, enqueue_seq = CASE WHEN least(now()+delay, debounce_deadline) IS
 DISTINCT FROM run_after THEN enqueue_seq+1 ELSE enqueue_seq END, updated_at = now() RETURNING`
 (the `enqueue_seq`/`run_after` comparison reads the row as it stood BEFORE this UPDATE, simultaneous-
@@ -305,3 +311,69 @@ Adds `idx_runs_active_created ON runs (created_at, id) WHERE status IN ('queued'
 status list and orders by `(created_at, id)` ascending: keep both in sync, or the planner falls
 back to walking `idx_runs_created` through the finished history. `IF NOT EXISTS`, so a copy
 pre-built `CONCURRENTLY` under the same name is kept.
+
+## Postgres transport (migration 009, decision 28)
+
+SQL store only: `createSqlStore` returns `SqlStore extends Store` with three pool-bound
+repositories that are not part of `StoreTx` and have no memory-store counterpart.
+
+### RunClaimStore (`store.claim`, `src/store/sql/claim.ts`)
+
+| Method      | SQL shape |
+| ----------- | --------- |
+| `claimRuns({ queue, limit })` | One claim statement in a short transaction whose only other statement is `SET LOCAL statement_timeout = 1500` (`CLAIM_STATEMENT_TIMEOUT_MS`: a claim can never commit after the worker's 5 s drain bound; a timeout is a failed claim, rolled back). With `remainingMs` (set by the worker's `drain()`): after the pool checkout, if less than `MIN_CLAIM_STATEMENT_TIMEOUT_MS` (50 ms) is left, no BEGIN and `[]`; every statement's timeout is `min(1500, time left)` (a new `SET LOCAL` only when that is lower than the one in force); past the deadline before `COMMIT`, `ROLLBACK` and `[]`: `WITH picked AS (SELECT r.id ... WHERE queue=$1 AND status IN ('queued','waiting') AND run_after <= statement_timestamp() (not `now()`, frozen at the BEGIN) AND NOT outbox_pending AND queue not paused ORDER BY run_after, created_at, id LIMIT $2 FOR UPDATE OF r SKIP LOCKED) UPDATE runs r SET status='running', execution_id=gen_random_uuid(), heartbeat_at=statement_timestamp(), started_at=<below>, debounce_key=NULL, updated_at=statement_timestamp() FROM picked RETURNING r.*` (written times also from `statement_timestamp()`: a run inserted or re-queued after the BEGIN never gets an older `updated_at`) (columns qualified with `r.`; result re-sorted by `(run_after, created_at, id)`). `limit <= 0` → `[]` without a query. |
+| `claimRuns({ ..., globalConcurrency })` | Short transaction (`SET LOCAL statement_timeout = 1500`, `CLAIM_STATEMENT_TIMEOUT_MS`): `pg_advisory_xact_lock(hashtextextended('<schema>:<queue>:global', 1))` (seed 1, so no decision-25 key `schema:queue:<concurrencyKey>` hashed with seed 0 can collide, `concurrencyKey: "global"` included), then `count(*)` of the queue's `running` rows (fresh READ COMMITTED snapshot), then the same claim with `LIMIT least(limit, globalConcurrency - running)`; nothing claimed when that is `<= 0`. Exact across processes. |
+| `nextDueInMs(queue)` | `greatest(0, ceil(extract(epoch from (min(run_after) - now())) * 1000))` over the queue's `queued`/`waiting` rows with `run_after IS NOT NULL AND NOT outbox_pending`, with the claim's uncorrelated pause check (`NOT EXISTS (SELECT 1 FROM queue_state q WHERE q.queue = $1 AND q.paused)`: a paused queue answers null; resume notifies), or null: the delay is computed on the DB clock (decision 17). Rows already due count: `0` means a row the claim could take is due now (it came due after the claim statement read the queue), and the worker re-claims once right away. A due row the claim still skips (row-locked by another transaction) also answers `0`; when that immediate re-claim brings nothing, the worker sleeps `polling.intervalMs` instead of polling fast. |
+
+Mirrors `acquire` with two deliberate differences: `enqueue_seq` is unchanged (there is no job to
+fence; `release`/`retry`/`suspend` still bump it) and `concurrency_waits` is NOT reset (the
+decision 25 backoff grows from it; the concurrency-key re-check resets it on `ok`).
+`started_at = CASE WHEN concurrency_key IS NULL THEN coalesce(started_at, statement_timestamp()) ELSE started_at
+END`: a run with a concurrency key only "starts" after the re-check says `ok`. The returned
+`runAfter` is the pre-claim value (the `UPDATE` does not touch it).
+
+Invariant used by the claim (already true before this migration): `waiting` + `run_after` set =
+ready to resume at `run_after`; `waiting` + `run_after NULL` = blocked on waitpoints, never
+claimed. A `waiting` run whose only pending waitpoint is a token that is not awaited yet has
+`run_after` set (decision 3) and is claimed.
+
+Lock order: with `globalConcurrency`, the queue's advisory xact lock first, then row locks via
+`SKIP LOCKED`. The claim never WAITS on a row lock, so it cannot form a cycle with the
+parent -> run -> descendants -> waitpoints order; the advisory key is one bigint, outside the
+`(hashtext(schema), 1|2)` space of decision 16 (like the decision 25 lock).
+
+Indexes: `idx_runs_claim ON runs (queue, run_after) WHERE status IN ('queued','waiting')` and
+`idx_runs_running_queue ON runs (queue) WHERE status = 'running'` (the `globalConcurrency` count),
+both `IF NOT EXISTS` so they can be pre-built `CONCURRENTLY`.
+
+### SystemJobStore (`store.systemJobs`, `src/store/sql/system-jobs.ts`)
+
+`system_jobs (job_id PK, name, data jsonb, run_after, attempts, max_attempts, locked_until,
+locked_by uuid, created_at)`, index `idx_system_jobs_due (run_after)`.
+
+| Method | SQL shape |
+| ------ | --------- |
+| `upsert` | `INSERT ... VALUES (..., now() + delayMs, maxAttempts) ON CONFLICT (job_id) DO NOTHING` (BullMQ jobId semantics: re-add is a no-op). Defaults: `data {}`, `delayMs 0`, `maxAttempts 1`. |
+| `upsertScheduleTick` | `INSERT (name 'schedule-tick', max_attempts 5) ON CONFLICT DO UPDATE SET data, run_after, attempts=0, locked_until/locked_by=NULL WHERE data->>'cron' or data->>'timezone' IS DISTINCT FROM EXCLUDED RETURNING (xmax = 0)`: `created` / `updated` / `unchanged` (no row). Same pattern is a no-op, so a restart never skips a due, unprocessed tick; a changed pattern releases the lock and the worker on the old tick loses its fencing. |
+| `claim(limit, lockMs, remainingMs?)` | In the same bounded transaction as the run claim (`SET LOCAL statement_timeout`, drain deadline via `remainingMs`): `WITH picked AS (SELECT job_id WHERE run_after <= statement_timestamp() AND (locked_until IS NULL OR locked_until <= statement_timestamp()) ORDER BY run_after LIMIT $1 FOR UPDATE SKIP LOCKED) UPDATE ... SET locked_until = statement_timestamp() + lockMs, locked_by = gen_random_uuid()` (`statement_timestamp()`, not `now()`, which is frozen at the BEGIN: a job due after the BEGIN would be skipped and the lock would start in the past). An expired lock is claimable again with a new token. |
+| `complete` | `DELETE ... WHERE job_id=$1 AND locked_by=$2`. |
+| `delay` | `run_after = now() + delayMs`, lock released; fenced. |
+| `fail` | Two CTEs with disjoint predicates over one snapshot: `DELETE ... WHERE attempts + 1 >= max_attempts` (`exhausted`) and `UPDATE SET attempts+1, run_after = now() + backoffMs, lock released WHERE attempts + 1 < max_attempts` (`retried`); neither matched = `lost`. Never a DELETE and an UPDATE on the same row in one statement (the second would be silently ignored). |
+| `rescheduleTick` | `run_after = $3, attempts = 0, data = jsonb_set(data, '{prevMillis}', ...)`, lock released; fenced. |
+| `remove` | Without `evenIfLocked`: `AND (locked_until IS NULL OR locked_until <= now())` (never removes an active job, like BullMQ). `evenIfLocked` removes a scheduler row even mid-tick. |
+| `get` / `listByName` | Plain reads (`listByName` ordered by `run_after, job_id`). |
+| `nextDueInMs` | Delay until `min(run_after) WHERE run_after > now()` (indexed), computed in SQL on the DB clock (decision 17); a lock that expires later is found by the regular poll. |
+| `now` | `SELECT now()` (decision 17). |
+
+Fencing: every write after a claim matches `job_id AND locked_by`. A token that is not a UUID
+never matches (checked in JS, no query). A worker whose lock expired and was re-claimed by
+another gets `false`/`"lost"` and must drop its result; handlers are idempotent (expiry re-checks
+the waitpoint, retention is `SKIP LOCKED`, a repeated tick hits the `__schedule:id:ts` key).
+
+### SchemaMetaStore (`store.meta`, `src/store/sql/schema-meta.ts`)
+
+`schema_meta (key PK, value, updated_at)`. `get` is a plain lookup. `setIfAbsent`: `INSERT ...
+ON CONFLICT (key) DO NOTHING RETURNING value` (waits for a concurrent inserter to commit); when
+nothing was inserted, the effective value is re-read in a NEW statement (a read inside the same
+statement would use the snapshot from before the concurrent commit). The existing value always
+wins.

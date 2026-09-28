@@ -274,6 +274,17 @@ export interface NewRun {
 		 * near-instant delivery. `outbox_pending` is set either way, so the poll always finds it.
 		 */
 		notify?: boolean;
+		/**
+		 * The NOTIFY payload (default `''`). `transport: "postgres"` passes the run's queue: the
+		 * wake channel's payload is a hint of which queue to claim (decision 28(b)).
+		 */
+		payload?: string;
+		/**
+		 * `outbox_pending` of the inserted row (default `true`). `false` with `transport:
+		 * "postgres"` (decision 28(j)): the committed row is claimable right away (there is no
+		 * outbox sweep in that mode; `true` would leave the run unclaimable forever).
+		 */
+		pending?: boolean;
 	};
 }
 
@@ -293,6 +304,14 @@ export interface NewRunDebounce {
 	payload: "last" | "first";
 	/** Cap on how far the run can be postponed from its first trigger; null = no cap. */
 	maxDelayMs: number | null;
+	/**
+	 * Review 5 item B2 (`transport: "postgres"` only): a pending run of the key that is already due
+	 * no longer absorbs triggers; its key is released and this trigger opens a new run. Needed by
+	 * the `SKIP LOCKED` claim (decision 28(a)): collapses would otherwise keep the row locked under
+	 * a fast burst and no run of the key would ever be claimed. Absent/false (BullMQ): a due pending
+	 * run still collapses, one pending run per key.
+	 */
+	releaseDue?: boolean;
 }
 
 export type CreateRunResult =
@@ -350,6 +369,18 @@ export function concurrencyLimitedDelayMs(waitsBeforeThisAttempt: number): numbe
 	);
 	return base + Math.floor(Math.random() * Math.min(CONCURRENCY_LIMITED_JITTER_MS, base));
 }
+
+/** Options of {@link RunStore.recheckConcurrencyLimit}; no `limit` = the queue has none here. */
+export interface RecheckConcurrencyLimitOptions {
+	limit?: number;
+}
+
+export type RecheckConcurrencyLimitResult =
+	| { kind: "ok"; run: RunRecord }
+	/** Over the limit: the run is back in `queued` with a backoff `run_after` (nothing to enqueue). */
+	| { kind: "limited" }
+	/** This execution no longer owns the run. */
+	| { kind: "lost" };
 
 export type AcquireWithLimitResult =
 	| { kind: "acquired"; run: RunRecord }
@@ -437,6 +468,10 @@ export type FailRunResult =
 	| Lost;
 export type RetryRunResult = { kind: "retrying"; attempt: number; enqueue: EnqueueRequest } | Lost;
 export type ReleaseRunResult = { kind: "released"; enqueue: EnqueueRequest } | Lost;
+export interface ReleaseOptions {
+	/** See {@link RunStore.release}. */
+	backoff?: boolean;
+}
 export type SetProgressResult = { kind: "ok"; updatedAt: Date } | Lost;
 
 export type CancelRunResult =
@@ -614,6 +649,23 @@ export interface RunStore {
 	): Promise<AcquireWithLimitResult>;
 
 	/**
+	 * Decision 25 after a Postgres-transport claim (`RunClaimStore.claimRuns` already moved the run
+	 * to `running` without checking the key). One transaction: `SELECT queue, concurrency_key,
+	 * concurrency_waits ... WHERE id AND execution_id AND status = 'running' FOR UPDATE` (none →
+	 * `lost`). With `limit` and a key: the same advisory lock as {@link acquireWithConcurrencyLimit},
+	 * then `count(*)` of the key's OTHER `running` runs; `>= limit` → back to `queued`,
+	 * `execution_id = NULL`, `run_after = now() + concurrencyLimitedDelayMs(concurrency_waits)`,
+	 * `concurrency_waits + 1` (`enqueue_seq`, `attempt` and `started_at` untouched) → `limited`.
+	 * Otherwise `concurrency_waits = 0`, `started_at = coalesce(started_at, now())` → `ok` with the
+	 * updated record. No `limit` → always `ok`.
+	 */
+	recheckConcurrencyLimit(
+		runId: string,
+		executionId: string,
+		options: RecheckConcurrencyLimitOptions
+	): Promise<RecheckConcurrencyLimitResult>;
+
+	/**
 	 * Decision 6. Own short transaction: `SET LOCAL statement_timeout = timeoutMs`,
 	 * then `UPDATE runs SET heartbeat_at = now() WHERE id AND execution_id AND
 	 * status='running'` touching ONLY `heartbeat_at` (HOT; no `updated_at`).
@@ -648,8 +700,12 @@ export interface RunStore {
 	/**
 	 * Graceful-stop hand-back (decision 20). Guarded update: `queued`,
 	 * `execution_id = NULL`, `run_after = now()`, `enqueue_seq + 1`, attempt unchanged.
+	 * With `{ backoff: true }` (a Postgres-transport claim whose pre-start step failed, e.g. the
+	 * concurrency re-check threw): `run_after = now() + concurrencyLimitedDelayMs(concurrency_waits)`
+	 * (PRE-increment value) and `concurrency_waits + 1`, so a failure that repeats backs off like
+	 * a `limited` result instead of looping (reset by the next `ok` re-check or acquisition).
 	 */
-	release(owner: Ownership): Promise<ReleaseRunResult>;
+	release(owner: Ownership, options?: ReleaseOptions): Promise<ReleaseRunResult>;
 
 	/**
 	 * `ctx.progress.set` (decision 23). Guarded single-statement update, like {@link heartbeat}
@@ -1151,6 +1207,122 @@ export interface QueueStateStore {
 	get(queue: string): Promise<QueueStateRecord | null>;
 	/** Every row, `ORDER BY queue`. Rows are few (one per queue ever paused). */
 	list(): Promise<QueueStateRecord[]>;
+}
+
+// ---------------------------------------------------------------------------
+// Postgres transport (decision 28, migration 009) -- SQL store only
+// ---------------------------------------------------------------------------
+
+export interface ClaimRunsInput {
+	queue: string;
+	limit: number;
+	/** `undefined` = no global limit. With a limit, claims are serialized per queue (exact). */
+	globalConcurrency?: number;
+	/**
+	 * Milliseconds left before this claim must be over, or `undefined` for no deadline. Read at
+	 * every step, because `stop()` sets the deadline (its claim drain bound) while a claim may
+	 * already be in flight: past it (or under the minimum statement timeout), nothing is claimed
+	 * -- after the connection checkout, before each statement, and before `COMMIT` (rolled back).
+	 */
+	remainingMs?: () => number | undefined;
+	/**
+	 * With `globalConcurrency`: called when the global limit bounded this claim (the queue is at
+	 * its global cap once the claim commits). The worker then sleeps `polling.intervalMs` instead
+	 * of waking at every due run it could not claim anyway; a freed slot wakes it (`onSlotFreed`).
+	 */
+	onGlobalLimit?: () => void;
+}
+
+/**
+ * The run claim of the Postgres transport: `queued`/`waiting` runs whose `run_after` is due are
+ * moved to `running` in one statement (`FOR UPDATE SKIP LOCKED`), writing what `acquire` writes
+ * except `enqueue_seq` (unchanged: there is no job to fence) and `concurrency_waits` (not reset:
+ * the concurrency-key re-check does that). See docs/store-contract.md "Postgres transport".
+ */
+export interface RunClaimStore {
+	/** Claimed runs ordered by `(run_after, created_at, id)`; `runAfter` is the pre-claim value. */
+	claimRuns(input: ClaimRunsInput): Promise<RunRecord[]>;
+	/**
+	 * Milliseconds until the queue's earliest `run_after` (only `queued`/`waiting`), computed
+	 * against the database clock (decision 17): 0 when a row is already due (it came due after
+	 * the claim read the queue, or another claim holds its lock), null when nothing is scheduled
+	 * or the queue is paused.
+	 */
+	nextDueInMs(queue: string): Promise<number | null>;
+}
+
+export interface ScheduleTickData {
+	scheduleId: string;
+	cron: string;
+	timezone?: string;
+	schema: string;
+	prevMillis: number;
+}
+
+export interface SystemJobRecord {
+	jobId: string;
+	name: string;
+	data: Json;
+	runAfter: Date;
+	attempts: number;
+	maxAttempts: number;
+	/** Token of the current claim (fencing); `null` outside a claim. */
+	lockedBy: string | null;
+}
+
+export interface SystemJobStore {
+	/** Inserts if absent (BullMQ jobId semantics: re-adding is a no-op). */
+	upsert(input: {
+		jobId: string;
+		name: string;
+		data?: Json;
+		delayMs?: number;
+		maxAttempts?: number;
+	}): Promise<void>;
+	/** Cron tick: creates, or rewrites only when `cron`/`timezone` changed (releases the lock). */
+	upsertScheduleTick(input: {
+		jobId: string;
+		data: ScheduleTickData;
+		runAt: Date;
+	}): Promise<"created" | "updated" | "unchanged">;
+	/**
+	 * Claims due jobs: `locked_until = now() + lockMs`, fresh `locked_by`. `remainingMs` bounds
+	 * the claim like {@link ClaimRunsInput.remainingMs}: past it, nothing is claimed.
+	 */
+	claim(
+		limit: number,
+		lockMs: number,
+		remainingMs?: () => number | undefined
+	): Promise<SystemJobRecord[]>;
+	/** Every write below matches `job_id` AND `locked_by`; `false`/`"lost"` = lock lost. */
+	complete(jobId: string, lockedBy: string): Promise<boolean>;
+	delay(jobId: string, lockedBy: string, delayMs: number): Promise<boolean>;
+	/** attempts+1; below max → `run_after = now() + backoffMs`; otherwise deleted. */
+	fail(
+		jobId: string,
+		lockedBy: string,
+		backoffMs: number
+	): Promise<"retried" | "exhausted" | "lost">;
+	/** Tick done or exhausted: next occurrence in place, `attempts = 0`, lock released. */
+	rescheduleTick(
+		jobId: string,
+		lockedBy: string,
+		next: { runAt: Date; prevMillis: number }
+	): Promise<boolean>;
+	/** By default never deletes a locked (active) job, like BullMQ. `evenIfLocked` removes a scheduler. */
+	remove(jobId: string, options?: { evenIfLocked?: boolean }): Promise<boolean>;
+	get(jobId: string): Promise<SystemJobRecord | null>;
+	listByName(name: string): Promise<SystemJobRecord[]>;
+	/** Milliseconds until the next future `run_after`, against the database clock (decision 17). */
+	nextDueInMs(): Promise<number | null>;
+	/** The database's `now()` (decision 17), to compute cron occurrences. */
+	now(): Promise<Date>;
+}
+
+export interface SchemaMetaStore {
+	get(key: string): Promise<string | null>;
+	/** Writes if absent; returns the effective value (the existing one wins, re-read after a race). */
+	setIfAbsent(key: string, value: string): Promise<string>;
 }
 
 // ---------------------------------------------------------------------------

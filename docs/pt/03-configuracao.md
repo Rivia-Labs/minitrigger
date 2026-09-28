@@ -16,14 +16,22 @@ await engine.migrate();
 await engine.start();
 ```
 
+## Transporte
+
+| Opção | Padrão | Notas |
+|---|---|---|
+| `transport` | `"bullmq"` | `"bullmq"` (Redis + BullMQ, o de sempre) ou `"postgres"` (sem Redis nenhum, decisão 28) — união discriminada: `redis`/`prefix`/`outbox` só existem com `"bullmq"`; `polling` só com `"postgres"`. Ver [14. Modo Postgres](14-modo-postgres.md). |
+| `polling.intervalMs` | `1 000` | Só `transport: "postgres"`. Teto do poll adaptativo para um `NOTIFY` perdido (wake, status, cancel). Mínimo 100. |
+| `polling.jitterMs` | `50` | Só `transport: "postgres"`. Jitter somado ao poll acima, para diluir um rebanho de trovão causado por `NOTIFY`s. Mínimo 0. |
+
 ## Conexão, schema e prefix
 
 | Opção | Padrão | Notas |
 |---|---|---|
 | `postgres` | — | String de conexão, ou `{ pool }` com um `pg.Pool` já existente (nunca fechado pelo engine). |
-| `redis` | — | String de conexão, ou `{ connection }` com uma instância `ioredis` já existente (só usada para produtores não bloqueantes; workers/subscribers sempre recebem um `duplicate()`). |
+| `redis` | — | Só `transport: "bullmq"` (`ConfigError` com `"postgres"`). String de conexão, ou `{ connection }` com uma instância `ioredis` já existente (só usada para produtores não bloqueantes; workers/subscribers sempre recebem um `duplicate()`). |
 | `schema` | `"minitrigger"` | Schema Postgres. Precisa casar com `^[a-z_][a-z0-9_]{0,62}$`. |
-| `prefix` | `"minitrigger"` | Prefixo de chave do BullMQ. Mesmo padrão de `schema`. |
+| `prefix` | `"minitrigger"` | Só `transport: "bullmq"` (`ConfigError` com `"postgres"`: os canais de `NOTIFY` derivam de `schema`). Prefixo de chave do BullMQ. Mesmo padrão de `schema`. |
 | `tasks` | — | Array de tasks criadas com `defineTask`. |
 
 **`prefix` precisa ser único por schema.** Toda estrutura do Redis (filas de task, a fila interna
@@ -37,12 +45,14 @@ schema no mesmo prefix lança `ConfigError`. Detalhes e o footgun completo em
 
 | Opção | Padrão | Notas |
 |---|---|---|
-| `pool.max` | concorrência total das filas de task + 5 (no mínimo 10) | Só usado quando o engine cria o próprio pool (string em `postgres`). `start()` avisa quando está abaixo disso para as filas iniciadas. |
+| `pool.max` | concorrência total das filas de task + 5 (no mínimo 10; + `systemConcurrency` com `transport: "postgres"`) | Só usado quando o engine cria o próprio pool (string em `postgres`). `start()` avisa quando está abaixo disso para as filas iniciadas. |
 | `pool.connectionTimeoutMs` | `10 000` | `connectionTimeoutMillis` do pool próprio do engine: uma query esperando mais que isso por uma conexão livre falha (um heartbeat que falhe só gera um aviso). |
 
 **Fórmula de dimensionamento:** por padrão, `pool.max = max(10, soma da concorrência de todas as
 filas de task + 5)`. Os 5 extras são folga para as queries de bookkeeping do próprio engine (além
-do que os seus workers consomem).
+do que os seus workers consomem). Com `transport: "postgres"`, some também `systemConcurrency`: o
+worker interno da `-system` roda contra esse mesmo pool nesse modo, em vez de um worker BullMQ
+separado — ver [14. Modo Postgres](14-modo-postgres.md#conexões-por-engine).
 
 Além do pool, todo engine **iniciado** (`start()` chamado) segura **duas** conexões dedicadas fora
 dele: uma para eleição de líder e outra para o `LISTEN` do outbox. Então, para dimensionar
@@ -84,6 +94,10 @@ pool da sua aplicação — veja [11. Produção](11-producao.md).
 | `reconciler.batchSize` | `100` | Linhas tratadas por caso do reconciliador em cada tick. |
 
 ## Outbox (trigger transacional)
+
+Só `transport: "bullmq"` — com `transport: "postgres"`, `outbox` é `ConfigError` (o trigger
+transacional já escreve direto na linha que o claim lê, decisão 28(j); ver
+[14. Modo Postgres](14-modo-postgres.md)).
 
 | Opção | Padrão | Notas |
 |---|---|---|
@@ -127,7 +141,7 @@ Ver [09. Observabilidade](09-observabilidade.md).
 | Opção | Padrão | Notas |
 |---|---|---|
 | `idempotencyKeyTtl` | `"7d"` | TTL padrão para uma chave de idempotência do usuário; não pode exceder `retention.days`. |
-| `systemConcurrency` | `5` | Concorrência do worker interno da fila `${prefix}-system` (ticks, expirações, retenção). |
+| `systemConcurrency` | `5` | Concorrência do worker interno da fila `${prefix}-system` (ticks, expirações, retenção). Com `transport: "postgres"`, esse worker reivindica linhas da tabela `system_jobs` contra o pool em vez de uma fila BullMQ separada. |
 
 `Duration` (usado por vários campos, como `idempotencyKeyTtl`, e por `step.sleep`/`delay`/timeouts)
 aceita um número de milissegundos ou uma string como `"5m"`, `"2d"`, `"1.5h"` (unidades: `ms`, `s`,

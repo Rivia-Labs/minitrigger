@@ -49,7 +49,9 @@ describe("migrate()", () => {
 				"run_logs",
 				"runs",
 				"schedules",
+				"schema_meta",
 				"schema_migrations",
+				"system_jobs",
 				"steps",
 				"waitpoints",
 			].sort()
@@ -80,6 +82,13 @@ describe("migrate()", () => {
 			"WHERE (status = 'pending'::text)"
 		);
 		expect(byName.get("idx_runs_created")).toContain("(created_at DESC, id DESC)");
+		expect(byName.get("idx_runs_claim")).toMatch(
+			/\(queue, run_after\) WHERE \(status = ANY \(ARRAY\['queued'::text, 'waiting'::text\]\)\)/
+		);
+		expect(byName.get("idx_runs_running_queue")).toMatch(
+			/\(queue\) WHERE \(status = 'running'::text\)/
+		);
+		expect(byName.get("idx_system_jobs_due")).toContain("(run_after)");
 		expect(byName.get("idx_runs_active_created")).toMatch(
 			/\(created_at, id\) WHERE \(status = ANY \(ARRAY\['queued'::text, 'running'::text, 'waiting'::text\]\)\)/
 		);

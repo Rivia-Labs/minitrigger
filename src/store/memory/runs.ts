@@ -9,6 +9,7 @@ import type {
 	NewRun,
 	NewRunDebounce,
 	Ownership,
+	RecheckConcurrencyLimitResult,
 	RecoverStalledResult,
 	RunStore,
 	SerializedError,
@@ -136,6 +137,17 @@ function createDebounced(tx: MemTx, input: NewRun, debounce: NewRunDebounce): Cr
 	let existing: RunRow | undefined;
 	for (const r of tx.db.runs.values()) {
 		if (r.status === "queued" && r.taskId === taskId && r.debounceKey === key) existing = r;
+	}
+	if (
+		debounce.releaseDue === true &&
+		existing &&
+		existing.runAfter !== null &&
+		existing.runAfter <= tx.now
+	) {
+		// Decision 24 (mirrors the SQL store; Postgres transport only, review 5 item B2): a due pending run no longer absorbs triggers; its key
+		// is released (nothing else changes) and this trigger opens a new window below.
+		updateRun(tx, existing, { debounceKey: null });
+		existing = undefined;
 	}
 	if (existing) {
 		const nextAfter = tx.now + debounce.delayMs;
@@ -465,6 +477,44 @@ export function createRunStore(exec: Exec): RunStore {
 			});
 		},
 
+		recheckConcurrencyLimit(runId, executionId, options) {
+			return exec.run((tx): RecheckConcurrencyLimitResult => {
+				const row = tx.db.runs.get(uuid(runId));
+				const execId = uuid(executionId);
+				if (row?.status !== "running" || row.executionId !== execId) {
+					return { kind: "lost" };
+				}
+				if (options.limit !== undefined && row.concurrencyKey !== null) {
+					let running = 0;
+					for (const r of tx.db.runs.values()) {
+						if (
+							r.id !== row.id &&
+							r.status === "running" &&
+							r.queue === row.queue &&
+							r.concurrencyKey === row.concurrencyKey
+						) {
+							running++;
+						}
+					}
+					if (running >= options.limit) {
+						updateRun(tx, row, {
+							status: "queued",
+							executionId: null,
+							runAfter: tx.now + concurrencyLimitedDelayMs(row.concurrencyWaits),
+							concurrencyWaits: row.concurrencyWaits + 1,
+							updatedAt: tx.now,
+						});
+						return { kind: "limited" };
+					}
+				}
+				const next = updateRun(tx, row, {
+					concurrencyWaits: 0,
+					startedAt: row.startedAt ?? tx.now,
+				});
+				return { kind: "ok", run: mapRun(next) };
+			});
+		},
+
 		async heartbeat(runId, executionId, timeoutMs) {
 			if (exec.kind === "tx") {
 				throw new Error("heartbeat must not run inside a StoreTx (SET LOCAL would leak)");
@@ -521,14 +571,17 @@ export function createRunStore(exec: Exec): RunStore {
 			});
 		},
 
-		release(owner) {
+		release(owner, options) {
 			return exec.run(tx => {
 				const row = owned(tx, uuid(owner.runId), uuid(owner.executionId));
 				if (!row) return { kind: "lost" };
 				const next = updateRun(tx, row, {
 					status: "queued",
 					executionId: null,
-					runAfter: tx.now,
+					runAfter: options?.backoff
+						? tx.now + concurrencyLimitedDelayMs(row.concurrencyWaits)
+						: tx.now,
+					...(options?.backoff ? { concurrencyWaits: row.concurrencyWaits + 1 } : {}),
 					enqueueSeq: row.enqueueSeq + 1,
 					updatedAt: tx.now,
 				});

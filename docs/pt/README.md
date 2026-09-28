@@ -1,10 +1,12 @@
 # Documentação do minitrigger (pt-BR)
 
 `minitrigger` é uma biblioteca TypeScript para execução durável de tasks e workflows, construída
-sobre **BullMQ + Redis + Postgres** e instalada como uma dependência comum no seu próprio projeto.
-Não há plataforma, deploy separado ou dashboard: você aponta a biblioteca para um Postgres e um
-Redis que já roda, define tasks no seu próprio código, e o Postgres é a fonte da verdade de cada
-run — se o Redis for perdido (um `FLUSHALL`, por exemplo), nenhuma run é perdida, só atrasada.
+sobre **BullMQ + Redis + Postgres** (transporte padrão) e instalada como uma dependência comum no
+seu próprio projeto. Não há plataforma, deploy separado ou dashboard: você aponta a biblioteca para
+um Postgres (e, no modo padrão, um Redis) que já roda, define tasks no seu próprio código, e o
+Postgres é a fonte da verdade de cada run — no modo padrão, se o Redis for perdido (um `FLUSHALL`,
+por exemplo), nenhuma run é perdida, só atrasada. Desde a 0.4.0, `transport: "postgres"` roda o
+engine inteiro só em cima do Postgres, sem Redis nenhum — ver [14. Modo Postgres](14-modo-postgres.md).
 
 Esta documentação é um guia em português complementar ao README (inglês, na raiz do repositório),
 que continua sendo a referência oficial para toda assinatura de API, opção de configuração e
@@ -36,6 +38,7 @@ Leia nesta ordem se é a primeira vez que você usa o minitrigger:
 | [11. Produção](11-producao.md) | Dimensionamento de pool, PgBouncer, shutdown gracioso, upgrades de schema, retenção, líder/reconciler. |
 | [12. Troubleshooting](12-troubleshooting.md) | Sintomas comuns e causa raiz: runs presas, erros de determinismo, deploy gradual, outbox, schedules, filas. |
 | [13. Referência da API](13-referencia-api.md) | Referência compacta de `Engine`, `TriggerOptions`, `StepApi`, `TaskContext`, erros e config. |
+| [14. Modo Postgres](14-modo-postgres.md) | `transport: "postgres"` (decisão 28): quando usar, o que não está disponível, conexões, PgBouncer, sem líder, guarda de modo misto, autovacuum de `system_jobs`, diferenças de comportamento. |
 
 ## Material complementar
 

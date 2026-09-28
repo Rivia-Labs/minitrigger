@@ -15,11 +15,9 @@
  * lost after the claim is recovered by the reconciler from `run_after` (decision 1).
  */
 
-import { createHash } from "node:crypto";
-import { Client, type ClientConfig, escapeIdentifier, type Notification } from "pg";
+import { Client, type ClientConfig } from "pg";
 import type { EngineLogger } from "./config.js";
-import { leaderClientConfig } from "./leader.js";
-import { validateSqlIdentifier } from "./utils/identifiers.js";
+import { channelName, createPgListener } from "./pg/listener.js";
 
 /** Rows claimed per `claimOutbox` statement; a full batch triggers another one right away. */
 export const OUTBOX_BATCH_SIZE = 500;
@@ -29,25 +27,19 @@ export const OUTBOX_BATCH_SIZE = 500;
  * sweep is one probe of a partial index that is normally empty.
  */
 export const OUTBOX_POLL_INTERVAL_MS = 2_000;
-const RECONNECT_MIN_MS = 500;
-const RECONNECT_MAX_MS = 30_000;
-const CONNECT_TIMEOUT_MS = 10_000;
 const CLOSE_TIMEOUT_MS = 5_000;
 const WARN_THROTTLE_MS = 10_000;
-/** Postgres channel names are identifiers: at most NAMEDATALEN - 1 = 63 bytes. */
-const MAX_CHANNEL_BYTES = 63;
 
 /**
  * The NOTIFY channel of `schema`: `mt_outbox_s_<schema>` when it fits in 63 bytes, else
  * `mt_outbox_h_<first 48 hex chars of sha256(schema)>`. The `s_`/`h_` markers keep the two forms
  * from ever colliding. Schema-scoped (like the reconciler), so two engines on different schemas
- * never dispatch each other's runs.
+ * never dispatch each other's runs. Delegates to {@link channelName} (`src/pg/listener.ts`), which
+ * returns byte-for-byte what this function returned before Task 4 (production channel names never
+ * change).
  */
 export function outboxChannel(schema: string): string {
-	validateSqlIdentifier("schema", schema);
-	const plain = `mt_outbox_s_${schema}`;
-	if (Buffer.byteLength(plain) <= MAX_CHANNEL_BYTES) return plain;
-	return `mt_outbox_h_${createHash("sha256").update(schema).digest("hex").slice(0, 48)}`;
+	return channelName("outbox", schema);
 }
 
 export interface OutboxListenerOptions {
@@ -90,142 +82,30 @@ export interface OutboxListener {
 export function createOutboxListener(options: OutboxListenerOptions): OutboxListener {
 	const { channel, logger, dispatchBatch } = options;
 	const pollIntervalMs = options.pollIntervalMs ?? OUTBOX_POLL_INTERVAL_MS;
-	const reconnectMinMs = options.reconnectMinMs ?? RECONNECT_MIN_MS;
-	const reconnectMaxMs = options.reconnectMaxMs ?? RECONNECT_MAX_MS;
-	const connectTimeoutMs = options.connectTimeoutMs ?? CONNECT_TIMEOUT_MS;
 	const closeTimeoutMs = options.closeTimeoutMs ?? CLOSE_TIMEOUT_MS;
-	const clientConfig = leaderClientConfig(options.clientConfig);
 
 	let closed = false;
 	let started = false;
-	let client: Client | undefined;
-	let listening = false;
 	let pollTimer: ReturnType<typeof setInterval> | undefined;
-	let reconnectTimer: ReturnType<typeof setTimeout> | undefined;
-	let reconnectAttempt = 0;
 	let sweeping: Promise<void> | undefined;
 	let sweepAgain = false;
 	const closing = new AbortController();
-	// One throttle per kind: a connection failure must not hide a sweep failure (or vice versa).
-	const lastWarnAt = { connection: 0, sweep: 0 };
+	let lastSweepWarnAt = 0;
 
-	function warn(
-		kind: keyof typeof lastWarnAt,
-		fields: Record<string, unknown>,
-		message: string
-	): void {
+	function warnSweepFailure(error: unknown): void {
 		const now = Date.now();
-		if (now - lastWarnAt[kind] < WARN_THROTTLE_MS) {
-			logger.debug(fields, message);
+		if (now - lastSweepWarnAt < WARN_THROTTLE_MS) {
+			logger.debug(
+				{ err: error, channel },
+				"outbox sweep failed; retrying on the next notification or poll"
+			);
 			return;
 		}
-		lastWarnAt[kind] = now;
-		logger.warn(fields, message);
-	}
-
-	function warnConnectFailure(error: unknown): void {
-		warn(
-			"connection",
+		lastSweepWarnAt = now;
+		logger.warn(
 			{ err: error, channel },
-			"outbox listener could not LISTEN; retrying (runs triggered with { tx } are still " +
-				`dispatched by the ${pollIntervalMs} ms poll)`
+			"outbox sweep failed; retrying on the next notification or poll"
 		);
-	}
-
-	function discard(c: Client): void {
-		if (client !== c) return;
-		client = undefined;
-		listening = false;
-		destroy(c);
-		scheduleReconnect();
-	}
-
-	function destroy(c: Client): void {
-		try {
-			c.connection.stream.destroy();
-		} catch {
-			// Already gone.
-		}
-	}
-
-	function scheduleReconnect(): void {
-		if (closed || reconnectTimer) return;
-		const base = Math.min(reconnectMaxMs, reconnectMinMs * 2 ** reconnectAttempt);
-		reconnectAttempt++;
-		const delay = base + Math.floor(Math.random() * Math.min(250, base));
-		reconnectTimer = setTimeout(() => {
-			reconnectTimer = undefined;
-			connect().catch(error => warnConnectFailure(error));
-		}, delay);
-		reconnectTimer.unref();
-	}
-
-	async function connect(): Promise<void> {
-		if (closed || client) return;
-		let c: Client;
-		try {
-			c = new Client(clientConfig);
-			options.onClientCreated?.(c);
-		} catch (error) {
-			// A synchronous throw (bad config, hook) must never escape as an unhandled rejection
-			// of `start()`/the reconnect timer: warn and retry with the same backoff.
-			warnConnectFailure(error);
-			scheduleReconnect();
-			return;
-		}
-		client = c;
-		c.on("error", error => {
-			if (client !== c) return;
-			warn("connection", { err: error, channel }, "outbox listener connection error; reconnecting");
-			discard(c);
-		});
-		c.on("end", () => {
-			if (client !== c) return;
-			warn("connection", { channel }, "outbox listener connection ended; reconnecting");
-			discard(c);
-		});
-		c.on("notification", (message: Notification) => {
-			if (client === c && message.channel === channel) sweep();
-		});
-		let timer: ReturnType<typeof setTimeout> | undefined;
-		const connecting = (async () => {
-			await c.connect();
-			// LISTEN before the catch-up sweep below, so nothing committed in between is missed.
-			await c.query(`LISTEN ${escapeIdentifier(channel)}`);
-		})();
-		// Settles after a timeout too (the socket is destroyed); never an unhandled rejection.
-		connecting.catch(() => {});
-		try {
-			await Promise.race([
-				connecting,
-				new Promise<never>((_, reject) => {
-					timer = setTimeout(
-						() =>
-							reject(new Error(`outbox listener connect timed out after ${connectTimeoutMs}ms`)),
-						connectTimeoutMs
-					);
-					timer.unref();
-				}),
-			]);
-		} catch (error) {
-			clearTimeout(timer);
-			if (client === c) {
-				warnConnectFailure(error);
-				discard(c);
-			} else {
-				destroy(c);
-			}
-			return;
-		}
-		clearTimeout(timer);
-		if (closed || client !== c) {
-			if (client === c) client = undefined;
-			await endBounded(c);
-			return;
-		}
-		listening = true;
-		reconnectAttempt = 0;
-		sweep();
 	}
 
 	function sweep(): void {
@@ -244,32 +124,38 @@ export function createOutboxListener(options: OutboxListenerOptions): OutboxList
 					while (more && !closed) more = await dispatchBatch(closing.signal);
 				} while (sweepAgain && !closed);
 			} catch (error) {
-				warn(
-					"sweep",
-					{ err: error, channel },
-					"outbox sweep failed; retrying on the next notification or poll"
-				);
+				warnSweepFailure(error);
 			} finally {
 				sweeping = undefined;
 			}
 		})();
 	}
 
-	async function endBounded(c: Client): Promise<void> {
-		let timer: ReturnType<typeof setTimeout> | undefined;
-		const ended = await Promise.race([
-			c.end().then(
-				() => true,
-				() => true
-			),
-			new Promise<boolean>(resolve => {
-				timer = setTimeout(() => resolve(false), closeTimeoutMs);
-				timer.unref();
-			}),
-		]);
-		clearTimeout(timer);
-		if (!ended) destroy(c);
-	}
+	const listener = createPgListener({
+		clientConfig: options.clientConfig,
+		channels: [channel],
+		logger,
+		// A single channel: every notification is this one, so the payload/channel are irrelevant
+		// (the outbox NOTIFY payload has always been empty -- the sweep re-reads the flag column).
+		onNotification: () => sweep(),
+		// LISTEN before the catch-up sweep, so nothing committed in between is missed.
+		onConnected: () => sweep(),
+		closeTimeoutMs,
+		...(options.reconnectMinMs !== undefined ? { reconnectMinMs: options.reconnectMinMs } : {}),
+		...(options.reconnectMaxMs !== undefined ? { reconnectMaxMs: options.reconnectMaxMs } : {}),
+		...(options.connectTimeoutMs !== undefined
+			? { connectTimeoutMs: options.connectTimeoutMs }
+			: {}),
+		...(options.onClientCreated
+			? {
+					createClient: (config: ClientConfig) => {
+						const c = new Client(config);
+						options.onClientCreated?.(c);
+						return c;
+					},
+				}
+			: {}),
+	});
 
 	return {
 		async start() {
@@ -277,25 +163,20 @@ export function createOutboxListener(options: OutboxListenerOptions): OutboxList
 			started = true;
 			pollTimer = setInterval(sweep, pollIntervalMs);
 			pollTimer.unref();
-			await connect();
-			// Catch-up even when LISTEN failed (connect() already swept when it succeeded).
-			if (!listening) sweep();
+			await listener.start();
+			// Catch-up even when LISTEN failed (a successful connect already swept via onConnected).
+			if (!listener.isListening()) sweep();
 		},
 		sweep,
-		isListening: () => listening,
+		isListening: () => listener.isListening(),
 		async close() {
 			if (closed) return;
 			closed = true;
 			closing.abort();
 			clearInterval(pollTimer);
-			clearTimeout(reconnectTimer);
-			reconnectTimer = undefined;
-			const c = client;
-			client = undefined;
-			listening = false;
 			const running = sweeping;
 			await Promise.all([
-				c ? endBounded(c) : undefined,
+				listener.close(),
 				running
 					? Promise.race([
 							running,

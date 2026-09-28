@@ -1,6 +1,8 @@
 export {
 	afterResolution,
+	CLAIM_FAILURE_LOG_INTERVAL_MS,
 	childTaskSpec,
+	createLogThrottle,
 	type EnqueueDeps,
 	type ExecutorDeps,
 	enqueue,

@@ -1,4 +1,4 @@
-import { DelayedError, type Job } from "bullmq";
+import type { Job } from "bullmq";
 import type { ResolvedConfig } from "../config.js";
 import type { ProcessSystemFn, Transport } from "../queue/transport.js";
 import type { Registry } from "../registry.js";
@@ -7,6 +7,20 @@ import type { CanceledRun, Store } from "../store/types.js";
 import { afterResolution } from "./execute-run.js";
 import type { ActiveExecutions } from "./execution.js";
 import type { RunNotifier } from "./notify.js";
+
+/**
+ * The `not_due` re-delay signal of a `-system` handler: thrown right after `job.moveToDelayed(...)`,
+ * it means "already rescheduled in place, not a failure". Library-owned (not BullMQ's `DelayedError`)
+ * so this file never loads `bullmq` at runtime: the BullMQ worker (`src/queue/transport.ts`)
+ * converts it into `DelayedError`, the Postgres `-system` worker (`src/pg/workers.ts`) and the
+ * test engine treat it as "leave the job where `moveToDelayed` put it".
+ */
+export class SystemJobDelayed extends Error {
+	override name = "SystemJobDelayed";
+	constructor() {
+		super("system job re-delayed in place");
+	}
+}
 
 /** Names of the jobs on the internal `${prefix}-system` queue (decision 8). */
 export type SystemJobName = "waitpoint-expire" | "reconcile" | "retention" | "schedule-tick";
@@ -80,7 +94,7 @@ export function createSystemDispatcher(deps: SystemDeps): ProcessSystemFn {
  * Audit item (d): system jobs use `removeOnFail: true` and nobody listens to the worker's `failed`
  * event, so an unexpected failure of `waitpoint-expire` or `retention` would vanish silently. Logs
  * it (`error`, with the job's identifying fields) and rethrows so BullMQ still records the failure.
- * `DelayedError` is the documented re-delay signal of `not_due`, not a failure.
+ * `SystemJobDelayed` is the re-delay signal of `not_due`, not a failure.
  */
 async function logFailure(
 	logger: ResolvedConfig["logger"],
@@ -91,7 +105,7 @@ async function logFailure(
 	try {
 		await fn();
 	} catch (error) {
-		if (!(error instanceof DelayedError)) {
+		if (!(error instanceof SystemJobDelayed)) {
 			logger.error({ ...fields, err: error, job }, `system job "${job}" failed`);
 		}
 		throw error;
@@ -169,8 +183,8 @@ async function scheduleTick(deps: SystemDeps, data: unknown, job: Job): Promise<
  * waitpoint whose `expires_at <= now()` (DB clock); anything else is a no-op.
  *
  * `not_due` (BullMQ's clock fired before the DB's): the job is moved back to `delayed` IN PLACE
- * with `job.moveToDelayed(Date.now() + delayMs, job.token)` + `DelayedError` (the documented
- * BullMQ pattern), keeping the same jobId. Re-adding `wp-${id}-expire` from inside the handler
+ * with `job.moveToDelayed(Date.now() + delayMs, job.token)` + `SystemJobDelayed` (converted into
+ * BullMQ's `DelayedError` by the BullMQ worker: the documented BullMQ pattern), keeping the same jobId. Re-adding `wp-${id}-expire` from inside the handler
  * would be silently dropped (the id still belongs to this active job, api-notes §1.6), and a
  * different id would escape the resolvers' removal. `delayMs` comes from the DB (decision 17);
  * only the absolute timestamp BullMQ needs is based on the local clock.
@@ -192,7 +206,7 @@ async function expireWaitpoint(deps: SystemDeps, data: unknown, job: Job): Promi
 				"waitpoint expiry fired early; re-delayed"
 			);
 			await job.moveToDelayed(Date.now() + Math.max(1, result.delayMs), job.token);
-			throw new DelayedError();
+			throw new SystemJobDelayed();
 		case "expired":
 			await cancelLocally(deps, result.canceledChildren);
 			// The waitpoint's own job is this one (active): nothing to remove for it.

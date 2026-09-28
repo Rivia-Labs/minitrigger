@@ -4,7 +4,6 @@
  * rest of the engine only ever reads a fully-defaulted {@link ResolvedConfig}.
  */
 
-import type { Redis } from "ioredis";
 import type { Pool } from "pg";
 import { ConfigError } from "./errors.js";
 import type { LogLevel } from "./store/types.js";
@@ -12,6 +11,23 @@ import type { AnyTask } from "./task.js";
 import { type Duration, parseDuration } from "./utils/duration.js";
 import { describeOffendingValue } from "./utils/error-format.js";
 import { validateSqlIdentifier } from "./utils/identifiers.js";
+
+/** `"bullmq"` (default) uses Redis + BullMQ as the transport; `"postgres"` needs no Redis at all. */
+export type TransportKind = "bullmq" | "postgres";
+
+/**
+ * Structural subset of the `ioredis` `Redis` instance the engine needs for an injected connection
+ * (decision 14): declared here rather than imported, so the public types never depend on
+ * `ioredis` being installed at all (it becomes an optional peer once the Postgres transport
+ * exists). A real `Redis` instance satisfies this structurally; `src/queue/connections.ts` (the
+ * only place this crosses back into a real `Redis`, since that's the only module the BullMQ
+ * backend needs it in) casts it back internally.
+ */
+export interface RedisLike {
+	duplicate(options?: object): RedisLike;
+	publish(channel: string, message: string): Promise<number>;
+	on(event: string, listener: (...args: unknown[]) => void): unknown;
+}
 
 /**
  * A log method compatible with both `console` (`(...data) => void`) and pino
@@ -40,28 +56,48 @@ export interface EngineLimits {
 	maxProgressBytes?: number;
 }
 
-export interface EngineConfig {
+/**
+ * Decision 26 (transactional trigger / outbox): tuning for the dedicated LISTEN/NOTIFY
+ * dispatcher of `trigger(..., { tx })` runs. Only meaningful with `transport: "bullmq"` (the
+ * default): in Postgres mode the transactional trigger already writes straight into the `runs`
+ * row the claim reads, so there is no separate outbox to dispatch (decision 28).
+ */
+export interface OutboxConfig {
+	/**
+	 * How often every started engine sweeps for committed `{ tx }` runs even without a
+	 * notification (bounds the dispatch latency when a notification is lost). Default 2 000 ms.
+	 */
+	pollIntervalMs?: number;
+	/** Rows claimed per `claimOutbox` statement; a full batch triggers another one right away. Default 500. */
+	batchSize?: number;
+	/** Upper bound of the dedicated LISTEN client's reconnect backoff. Default 30 000 ms, minimum 500 ms. */
+	reconnectMaxMs?: number;
+	/**
+	 * `false` skips the `pg_notify` call in the `trigger(..., { tx })` insert statement (the run
+	 * is still flagged `outbox_pending` for the poll sweep): trades near-instant dispatch for
+	 * avoiding the commit-time NOTIFY lock (Postgres serializes commits that notify). Default
+	 * `true`.
+	 */
+	notify?: boolean;
+}
+
+/** Fields shared by both transports (spec §3.10). */
+export interface CommonConfig {
 	/**
 	 * Connection string (the engine creates, and on `stop()` closes, its own `pg.Pool`), or an
 	 * existing pool (never closed by the engine). With an injected pool, make sure
 	 * `pool.max >= total worker concurrency + 5`; a dedicated pool for the lib is recommended.
 	 */
 	postgres: string | { pool: Pool };
-	/**
-	 * Connection string, or an existing ioredis instance. An injected instance is only used for
-	 * non-blocking producers; workers/subscribers get `duplicate()`s (decision 14).
-	 */
-	redis: string | { connection: Redis };
 	/** Postgres schema (decision 15). Default `"minitrigger"`. */
 	schema?: string;
-	/** BullMQ key prefix (decision 15). Default `"minitrigger"`. */
-	prefix?: string;
 	tasks: readonly AnyTask[];
 	/** Only used when the engine creates the pool (string `postgres`). */
 	pool?: {
 		/**
 		 * Default: the total `concurrency` of every task queue + 5 (the README's sizing guide), at
-		 * least 10. `start()` warns when an explicit value is below that for the queues it starts.
+		 * least 10 (Postgres mode also adds `systemConcurrency`, decision 14). `start()` warns when
+		 * an explicit value is below that for the queues it starts.
 		 */
 		max?: number;
 		/**
@@ -113,28 +149,6 @@ export interface EngineConfig {
 		/** Rows handled per reconciler case per tick. Default 100. */
 		batchSize?: number;
 	};
-	/**
-	 * Decision 26 (transactional trigger / outbox): tuning for the dedicated LISTEN/NOTIFY
-	 * dispatcher of `trigger(..., { tx })` runs.
-	 */
-	outbox?: {
-		/**
-		 * How often every started engine sweeps for committed `{ tx }` runs even without a
-		 * notification (bounds the dispatch latency when a notification is lost). Default 2 000 ms.
-		 */
-		pollIntervalMs?: number;
-		/** Rows claimed per `claimOutbox` statement; a full batch triggers another one right away. Default 500. */
-		batchSize?: number;
-		/** Upper bound of the dedicated LISTEN client's reconnect backoff. Default 30 000 ms, minimum 500 ms. */
-		reconnectMaxMs?: number;
-		/**
-		 * `false` skips the `pg_notify` call in the `trigger(..., { tx })` insert statement (the run
-		 * is still flagged `outbox_pending` for the poll sweep): trades near-instant dispatch for
-		 * avoiding the commit-time NOTIFY lock (Postgres serializes commits that notify). Default
-		 * `true`.
-		 */
-		notify?: boolean;
-	};
 	limits?: EngineLimits;
 	/** `ctx.logger` (Phase 7): persisted to `run_logs` in batches and mirrored to `logger`. */
 	logging?: {
@@ -149,10 +163,70 @@ export interface EngineConfig {
 	logger?: EngineLogger;
 }
 
+/**
+ * Default transport (spec §3.10): Redis + BullMQ. `R` (review 5 item B3) lets a caller keep its
+ * own connection type when reading the config back, e.g. `BullmqEngineConfig<Redis>` so that
+ * `config.redis.connection` is an ioredis `Redis` again, as in 0.3.x.
+ */
+export interface BullmqTransportConfig<R extends RedisLike = RedisLike> {
+	transport?: "bullmq";
+	/**
+	 * Connection string, or an existing ioredis `Redis` instance (not a `Cluster`, checked when
+	 * the backend loads). An injected instance is only used for non-blocking producers;
+	 * workers/subscribers get `duplicate()`s (decision 14).
+	 */
+	redis: string | { connection: R };
+	/** BullMQ key prefix (decision 15). Default `"minitrigger"`. */
+	prefix?: string;
+	outbox?: OutboxConfig;
+	polling?: never;
+}
+
+/**
+ * Postgres-only transport (spec §3.10, decision 28): no Redis, no BullMQ. `prefix`/`redis`/
+ * `outbox` are rejected at runtime (a `ConfigError`, never silently ignored): `prefix` has no
+ * meaning without Redis keys (NOTIFY channels derive from `schema` instead), and `outbox` has no
+ * effect because the transactional trigger already writes straight to the queue.
+ */
+export interface PostgresTransportConfig {
+	transport: "postgres";
+	/**
+	 * Adaptive poll fallback for a missed `NOTIFY` (wake, status, cancel). Default 1 000/50 ms;
+	 * minimum 100/0 ms.
+	 */
+	polling?: { intervalMs?: number; jitterMs?: number };
+	redis?: never;
+	prefix?: never;
+	outbox?: never;
+}
+
+/**
+ * Engine configuration (spec §3.10): a discriminated union on `transport` so the compiler
+ * rejects the wrong combination (`redis`/`prefix`/`outbox` with `transport: "postgres"`, or
+ * `polling` with `transport: "bullmq"`/omitted) at the type level; `resolveConfig` repeats the
+ * same checks at runtime for plain JS callers or a cast.
+ */
+export type EngineConfig = BullmqEngineConfig | PostgresEngineConfig;
+
+/**
+ * One arm of {@link EngineConfig} (review 5 item B3): an object type (not a union), so it works
+ * where 0.3.x code used `EngineConfig` itself -- `interface X extends BullmqEngineConfig`,
+ * `Omit<BullmqEngineConfig, "tasks">` + spread, `Partial<BullmqEngineConfig>`, a required
+ * `config.redis`. `BullmqEngineConfig<Redis>` also types `config.redis.connection` as `Redis`.
+ */
+export type BullmqEngineConfig<R extends RedisLike = RedisLike> = CommonConfig &
+	BullmqTransportConfig<R>;
+
+/** The `transport: "postgres"` arm of {@link EngineConfig}; see {@link BullmqEngineConfig}. */
+export type PostgresEngineConfig = CommonConfig & PostgresTransportConfig;
+
 export interface ResolvedConfig {
 	postgres: string | { pool: Pool };
-	redis: string | { connection: Redis };
+	transport: TransportKind;
+	/** `undefined` with `transport: "postgres"` (redis is not used with that transport). */
+	redis: string | { connection: RedisLike } | undefined;
 	schema: string;
+	/** With `transport: "postgres"`, equals `schema` (shared code that needs a name; never sent to Redis). */
 	prefix: string;
 	tasks: readonly AnyTask[];
 	/** `undefined`: the engine derives it from the task queues' concurrency (see `EngineConfig.pool`). */
@@ -169,6 +243,8 @@ export interface ResolvedConfig {
 	schedules: { pruneDeclarative: boolean };
 	reconciler: { intervalMs: number; graceMs: number; batchSize: number };
 	outbox: { pollIntervalMs: number; batchSize: number; reconnectMaxMs: number; notify: boolean };
+	/** Adaptive poll fallback (`transport: "postgres"` only; defaulted either way). */
+	polling: { intervalMs: number; jitterMs: number };
 	limits: Required<EngineLimits>;
 	logging: { minLevel: LogLevel; mirror: boolean };
 	systemConcurrency: number;
@@ -186,6 +262,9 @@ export const MAX_TIMER_MS = 2_147_483_647;
 
 /** Item 6: below this, the outbox listener's poll fallback becomes a busy-loop against Postgres. */
 export const MIN_OUTBOX_POLL_INTERVAL_MS = 100;
+
+/** Below this, the Postgres transport's poll fallback becomes a busy-loop against Postgres. */
+export const MIN_POLLING_INTERVAL_MS = 100;
 
 /**
  * Review 3: lowest `outbox.reconnectMaxMs`, the outbox listener's first reconnect delay
@@ -218,6 +297,7 @@ export const DEFAULTS = {
 	schedules: { pruneDeclarative: false },
 	reconciler: { intervalMs: 15_000, graceMs: 30_000, batchSize: 100 },
 	outbox: { pollIntervalMs: 2_000, batchSize: 500, reconnectMaxMs: 30_000, notify: true },
+	polling: { intervalMs: 1_000, jitterMs: 50 },
 	systemConcurrency: 5,
 	logging: { minLevel: "info", mirror: true },
 	limits: {
@@ -241,6 +321,21 @@ export const defaultLogger: EngineLogger = {
 	error: (fields, message) => console.error(`[minitrigger] ${message}`, fields),
 };
 
+/**
+ * Escape hatch for the `transport` discriminated union: every field that differs across branches
+ * (`redis`/`prefix`/`outbox`/`polling`/`transport` itself) is validated by hand below against the
+ * resolved `transport`, so a single permissive alias is simpler than fighting the compiler over
+ * which union member is active (no `any` involved -- every field keeps its real, if broadened,
+ * type).
+ */
+type PermissiveConfig = CommonConfig & {
+	transport?: TransportKind;
+	redis?: string | { connection: RedisLike };
+	prefix?: string;
+	outbox?: OutboxConfig;
+	polling?: { intervalMs?: number; jitterMs?: number };
+};
+
 /** Validates `config` and returns it with every default applied. Throws {@link ConfigError}. */
 export function resolveConfig(config: EngineConfig): ResolvedConfig {
 	if (config === null || typeof config !== "object") {
@@ -249,17 +344,67 @@ export function resolveConfig(config: EngineConfig): ResolvedConfig {
 				describeOffendingValue(config)
 		);
 	}
-	validateConnection("postgres", config.postgres, "pool");
-	validateConnection("redis", config.redis, "connection");
-	if (!Array.isArray(config.tasks)) {
+	const c = config as PermissiveConfig;
+	validateConnection("postgres", c.postgres, "pool");
+	if (!Array.isArray(c.tasks)) {
 		throw new ConfigError(
 			"config.tasks must be an array of tasks created with defineTask(), got " +
-				describeOffendingValue(config.tasks)
+				describeOffendingValue(c.tasks)
 		);
 	}
 
-	const schema = validateSqlIdentifier("schema", config.schema ?? DEFAULTS.schema);
-	const prefix = validateSqlIdentifier("prefix", config.prefix ?? DEFAULTS.prefix);
+	const transport = c.transport ?? "bullmq";
+	if (transport !== "bullmq" && transport !== "postgres") {
+		throw new ConfigError(
+			`transport must be "bullmq" or "postgres", got ${describeOffendingValue(transport)}`
+		);
+	}
+	if (transport === "bullmq") {
+		if (c.redis === undefined) {
+			throw new ConfigError('redis is required with transport "bullmq"');
+		}
+		validateConnection("redis", c.redis, "connection");
+		if (c.polling !== undefined) {
+			throw new ConfigError('polling is only used with transport "postgres"');
+		}
+	} else {
+		if (c.redis !== undefined) {
+			throw new ConfigError(
+				'redis is not used with transport "postgres"; remove it or set transport: "bullmq"'
+			);
+		}
+		if (c.prefix !== undefined) {
+			throw new ConfigError(
+				'prefix is not used with transport "postgres"; NOTIFY channels derive from schema'
+			);
+		}
+		if (c.outbox !== undefined) {
+			throw new ConfigError(
+				'outbox is not used with transport "postgres"; trigger(..., { tx }) already writes to the queue'
+			);
+		}
+	}
+
+	const schema = validateSqlIdentifier("schema", c.schema ?? DEFAULTS.schema);
+	const prefix =
+		transport === "postgres"
+			? schema
+			: validateSqlIdentifier("prefix", c.prefix ?? DEFAULTS.prefix);
+
+	const polling = {
+		intervalMs: intInRange(
+			"polling.intervalMs",
+			c.polling?.intervalMs ?? DEFAULTS.polling.intervalMs,
+			MIN_POLLING_INTERVAL_MS,
+			MAX_TIMER_MS
+		),
+		jitterMs: nonNegativeIntInRange(
+			"polling.jitterMs",
+			c.polling?.jitterMs ?? DEFAULTS.polling.jitterMs,
+			0,
+			MAX_TIMER_MS
+		),
+	};
 
 	const poolMax =
 		config.pool?.max === undefined ? undefined : positiveInt("pool.max", config.pool.max);
@@ -428,11 +573,12 @@ export function resolveConfig(config: EngineConfig): ResolvedConfig {
 	}
 
 	return {
-		postgres: config.postgres,
-		redis: config.redis,
+		postgres: c.postgres,
+		transport,
+		redis: transport === "bullmq" ? c.redis : undefined,
 		schema,
 		prefix,
-		tasks: config.tasks,
+		tasks: c.tasks,
 		poolMax,
 		poolConnectionTimeoutMs,
 		heartbeatIntervalMs,
@@ -446,11 +592,31 @@ export function resolveConfig(config: EngineConfig): ResolvedConfig {
 		schedules,
 		reconciler,
 		outbox,
+		polling,
 		limits,
 		logging,
 		systemConcurrency,
 		logger,
 	};
+}
+
+/**
+ * README "Pool sizing": total worker concurrency + `DEFAULTS.poolHeadroom`, never below
+ * `DEFAULTS.poolMax`. With `transport: "postgres"` the `-system` worker also runs against this
+ * pool instead of its own BullMQ worker, so `systemConcurrency` is added too; with `transport:
+ * "bullmq"` the formula is unchanged (decision 14). Used both by `createEngine`'s own derivation
+ * (when `pool.max` is not given) and by the Postgres backend's `warnPoolSizing`, so the two never
+ * disagree.
+ */
+export function derivePoolMax(
+	queues: readonly { concurrency: number }[],
+	systemConcurrency: number,
+	transport: TransportKind
+): number {
+	const concurrency = queues.reduce((sum, q) => sum + q.concurrency, 0);
+	const headroom =
+		transport === "postgres" ? systemConcurrency + DEFAULTS.poolHeadroom : DEFAULTS.poolHeadroom;
+	return Math.max(DEFAULTS.poolMax, concurrency + headroom);
 }
 
 /** Decision 9: a key must not outlive the runs it points to (retention would delete them first). */
@@ -560,6 +726,15 @@ function nonNegativeInt(name: string, value: number): number {
 		throw new ConfigError(
 			`${name} must be a non-negative integer, got ${describeOffendingValue(value)}`
 		);
+	}
+	return value;
+}
+
+/** A non-negative integer, additionally bounded to `[min, max]` (both inclusive; unlike {@link intInRange}, allows 0). */
+function nonNegativeIntInRange(name: string, value: number, min: number, max: number): number {
+	nonNegativeInt(name, value);
+	if (value < min || value > max) {
+		throw new ConfigError(`${name} must be between ${min} and ${max}, got ${value}`);
 	}
 	return value;
 }

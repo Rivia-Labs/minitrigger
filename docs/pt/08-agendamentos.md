@@ -7,7 +7,9 @@
 await engine.schedules.upsert({
 	id: "daily",
 	task: myTask,
-	cron: "0 9 * * *",         // 5-7 campos separados por espaço; um 6º campo "segundos" é aceito
+	cron: "0 9 * * *",         // 5 ou 6 campos separados por espaço (um campo de segundos no
+	                           // início é opcional; 7 campos são rejeitados desde a 0.4.0 — ver
+	                           // "Upgrade 0.3.0 para 0.4.0" em 11. Produção)
 	timezone: "America/Belem", // fuso IANA opcional; omitido = padrão do BullMQ (baseado em UTC)
 	payload: { url: "..." },   // obrigatório (tipado como o payload de myTask) a menos que myTask não tenha payload
 });

@@ -9,7 +9,7 @@ import { randomUUID } from "node:crypto";
 import { Queue } from "bullmq";
 import { escapeIdentifier } from "pg";
 import { afterEach, describe, expect, it } from "vitest";
-import type { EngineConfig, EngineLogger } from "../../src/config.js";
+import type { BullmqTransportConfig, CommonConfig, EngineLogger } from "../../src/config.js";
 import { createEngine, type Engine } from "../../src/engine.js";
 import { migrate } from "../../src/migrations/migrate.js";
 import { type AnyTask, defineTask } from "../../src/task.js";
@@ -31,7 +31,10 @@ const testLogger: EngineLogger = {
 const engines: Engine[] = [];
 const cleanups: Array<() => Promise<void>> = [];
 
-function makeEngine(tasks: AnyTask[], overrides: Partial<EngineConfig> = {}): Engine {
+function makeEngine(
+	tasks: AnyTask[],
+	overrides: Partial<CommonConfig> & Partial<BullmqTransportConfig> = {}
+): Engine {
 	const engine = createEngine({
 		postgres: ns.databaseUrl,
 		redis: ns.redisUrl,

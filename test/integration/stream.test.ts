@@ -1,7 +1,7 @@
 /** Phase 7: `ctx.stream(name, source)` + `engine.runs.readStream(runId, name)`. */
 import { randomUUID } from "node:crypto";
 import { afterEach, beforeAll, describe, expect, it } from "vitest";
-import type { EngineConfig, EngineLogger } from "../../src/config.js";
+import type { BullmqTransportConfig, CommonConfig, EngineLogger } from "../../src/config.js";
 import { createEngine, type Engine } from "../../src/engine.js";
 import { type AnyTask, defineTask } from "../../src/task.js";
 import { useTestNamespace, waitFor } from "../helpers/namespace.js";
@@ -12,7 +12,10 @@ const silent: EngineLogger = { debug() {}, info() {}, warn() {}, error() {} };
 const engines: Engine[] = [];
 const sleep = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms));
 
-function makeEngine(tasks: AnyTask[], overrides: Partial<EngineConfig> = {}): Engine {
+function makeEngine(
+	tasks: AnyTask[],
+	overrides: Partial<CommonConfig> & Partial<BullmqTransportConfig> = {}
+): Engine {
 	const engine = createEngine({
 		postgres: ns.databaseUrl,
 		redis: ns.redisUrl,

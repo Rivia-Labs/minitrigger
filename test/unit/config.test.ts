@@ -1,6 +1,14 @@
 import { describe, expect, it } from "vitest";
-import { DAY_MS, type EngineConfig, resolveConfig } from "../../src/config.js";
+import {
+	type BullmqTransportConfig,
+	type CommonConfig,
+	DAY_MS,
+	derivePoolMax,
+	type EngineConfig,
+	resolveConfig,
+} from "../../src/config.js";
 import { ConfigError } from "../../src/errors.js";
+import type { AnyTask } from "../../src/task.js";
 
 const base: EngineConfig = {
 	postgres: "postgres://localhost/db",
@@ -189,9 +197,12 @@ describe("resolveConfig", () => {
 		{ reconciler: { batchSize: 1.5 } },
 		{ retention: { intervalMs: 0 } },
 		{ retention: { batchSize: 0 } },
-	] as Partial<EngineConfig>[])("rejects invalid numeric option %j", override => {
-		expect(() => resolveConfig({ ...base, ...override })).toThrow(ConfigError);
-	});
+	] as (Partial<CommonConfig> & Partial<BullmqTransportConfig>)[])(
+		"rejects invalid numeric option %j",
+		override => {
+			expect(() => resolveConfig({ ...base, ...override })).toThrow(ConfigError);
+		}
+	);
 
 	it.each([
 		{ heartbeatIntervalMs: 2_147_483_648, stallTimeoutMs: 2_147_483_649 },
@@ -200,7 +211,7 @@ describe("resolveConfig", () => {
 		{ shutdownTimeoutMs: 2_147_483_648 },
 		{ reconciler: { intervalMs: 2_147_483_648 } },
 		{ retention: { intervalMs: 2_147_483_648 } },
-	] as Partial<EngineConfig>[])(
+	] as (Partial<CommonConfig> & Partial<BullmqTransportConfig>)[])(
 		"rejects a timer-fed value above 2^31-1 ms (setTimeout would overflow and fire at once) %j",
 		override => {
 			expect(() => resolveConfig({ ...base, ...override })).toThrow(ConfigError);
@@ -221,9 +232,9 @@ describe("resolveConfig", () => {
 
 	it("rejects missing connections, tasks and malformed loggers", () => {
 		expect(() => resolveConfig({ ...base, postgres: "" })).toThrow(ConfigError);
-		expect(() => resolveConfig({ ...base, redis: {} as unknown as EngineConfig["redis"] })).toThrow(
-			ConfigError
-		);
+		expect(() =>
+			resolveConfig({ ...base, redis: {} as unknown as BullmqTransportConfig["redis"] })
+		).toThrow(ConfigError);
 		expect(() =>
 			resolveConfig({ ...base, tasks: undefined as unknown as EngineConfig["tasks"] })
 		).toThrow(ConfigError);
@@ -247,7 +258,9 @@ describe("resolveConfig", () => {
 			resolveConfig({ ...base, postgres: 42 as unknown as EngineConfig["postgres"] })
 		).toThrow(/config\.postgres must be a non-empty connection string or \{ pool: .* got 42/);
 		// An object shape is described structurally, never `String(value)` ("[object Object]").
-		expect(() => resolveConfig({ ...base, redis: {} as unknown as EngineConfig["redis"] })).toThrow(
+		expect(() =>
+			resolveConfig({ ...base, redis: {} as unknown as BullmqTransportConfig["redis"] })
+		).toThrow(
 			/config\.redis must be a non-empty connection string or \{ connection: .* got an object/
 		);
 	});
@@ -274,7 +287,7 @@ describe("resolveConfig", () => {
 
 		const fakeRedis = { duplicate: () => {} };
 		expect(() =>
-			resolveConfig({ ...base, redis: fakeRedis as unknown as EngineConfig["redis"] })
+			resolveConfig({ ...base, redis: fakeRedis as unknown as BullmqTransportConfig["redis"] })
 		).toThrow(
 			/config\.redis looks like a raw ioredis Redis instance \(has \.duplicate\(\)\).*wrap.*\{ connection: <that instance> \}/
 		);
@@ -293,5 +306,72 @@ describe("resolveConfig", () => {
 		expect(() => resolveConfig({ ...base, idempotencyKeyTtl: "0ms" })).toThrow(
 			/idempotencyKeyTtl must resolve to more than 0 ms, got 0 ms \(parsed from "0ms"\)/
 		);
+	});
+});
+
+describe("transport", () => {
+	const base = { postgres: "postgres://x", schema: "s", tasks: [] as AnyTask[] };
+
+	it("defaults to bullmq and requires redis there", () => {
+		const resolved = resolveConfig({ ...base, redis: "redis://r", prefix: "p" });
+		expect(resolved.transport).toBe("bullmq");
+		expect(() => resolveConfig({ ...base, prefix: "p" } as unknown as EngineConfig)).toThrow(
+			/redis is required with transport "bullmq"/
+		);
+	});
+
+	it("postgres mode rejects redis, prefix and outbox at runtime", () => {
+		const pg = { ...base, transport: "postgres" as const };
+		expect(() => resolveConfig({ ...pg, redis: "redis://r" } as unknown as EngineConfig)).toThrow(
+			ConfigError
+		);
+		expect(() => resolveConfig({ ...pg, prefix: "p" } as unknown as EngineConfig)).toThrow(
+			/prefix is not used with transport "postgres"/
+		);
+		expect(() =>
+			resolveConfig({ ...pg, outbox: { batchSize: 10 } } as unknown as EngineConfig)
+		).toThrow(/outbox is not used with transport "postgres"/);
+		const resolved = resolveConfig(pg);
+		expect(resolved.redis).toBeUndefined();
+		expect(resolved.prefix).toBe("s");
+		expect(resolved.polling).toEqual({ intervalMs: 1_000, jitterMs: 50 });
+	});
+
+	it("postgres mode validates polling bounds", () => {
+		const pg = { ...base, transport: "postgres" as const };
+		expect(() => resolveConfig({ ...pg, polling: { intervalMs: 50 } })).toThrow(
+			/polling.intervalMs/
+		);
+		expect(() => resolveConfig({ ...pg, polling: { jitterMs: -1 } })).toThrow(/polling.jitterMs/);
+	});
+
+	it("postgres mode accepts a zero jitter", () => {
+		const pg = { ...base, transport: "postgres" as const };
+		expect(resolveConfig({ ...pg, polling: { jitterMs: 0 } }).polling.jitterMs).toBe(0);
+	});
+
+	it("polling is rejected with transport bullmq", () => {
+		expect(() =>
+			resolveConfig({
+				...base,
+				redis: "redis://r",
+				polling: { intervalMs: 500 },
+			} as unknown as EngineConfig)
+		).toThrow(/polling is only used with transport "postgres"/);
+	});
+
+	it("rejects an unknown transport", () => {
+		expect(() => resolveConfig({ ...base, transport: "kafka" } as unknown as EngineConfig)).toThrow(
+			ConfigError
+		);
+	});
+
+	it("derived pool size includes systemConcurrency only in postgres mode", () => {
+		const queues = [{ concurrency: 20 }];
+		expect(derivePoolMax(queues, 5, "bullmq")).toBe(25);
+		expect(derivePoolMax(queues, 5, "postgres")).toBe(30);
+		// Floor never drops below DEFAULTS.poolMax (10), regardless of transport.
+		expect(derivePoolMax([], 0, "bullmq")).toBe(10);
+		expect(derivePoolMax([], 0, "postgres")).toBe(10);
 	});
 });
