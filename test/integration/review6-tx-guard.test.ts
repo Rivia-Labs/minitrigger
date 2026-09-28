@@ -11,7 +11,7 @@
  */
 import { randomUUID } from "node:crypto";
 import { escapeIdentifier, Pool, type PoolClient } from "pg";
-import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import type { EngineConfig } from "../../src/config.js";
 import { createEngine, type Engine } from "../../src/engine.js";
 import { ConfigError, MinitriggerError } from "../../src/errors.js";
@@ -22,6 +22,7 @@ const nsMatch = useTestNamespace();
 const nsForeign = useTestNamespace();
 const nsNoMeta = useTestNamespace();
 const nsL1 = useTestNamespace();
+const nsPriv = useTestNamespace();
 
 const engines: Engine[] = [];
 const pools: Pool[] = [];
@@ -37,7 +38,7 @@ const t = (ns: TestNamespace, table: string) =>
 	`${escapeIdentifier(ns.schema)}.${escapeIdentifier(table)}`;
 
 beforeAll(async () => {
-	for (const ns of [nsMatch, nsForeign, nsNoMeta, nsL1]) {
+	for (const ns of [nsMatch, nsForeign, nsNoMeta, nsL1, nsPriv]) {
 		const engine = createEngine({
 			transport: "postgres",
 			postgres: ns.databaseUrl,
@@ -217,3 +218,59 @@ describe("review 6 L1: lifecycle re-checked after the awaited guard", () => {
 		expect((error as Error).message).not.toMatch(/Cannot use a pool/);
 	});
 });
+
+describe.each(["bullmq", "postgres"] as const)(
+	"review 6 fix round 1 (%s): least-privilege tx role",
+	transport => {
+		const role = `mt_r6_${randomUUID().replaceAll("-", "").slice(0, 12)}`;
+		const password = randomUUID();
+
+		beforeAll(async () => {
+			const s = escapeIdentifier(nsPriv.schema);
+			const r = escapeIdentifier(role);
+			await nsPriv.pool.query(`CREATE ROLE ${r} LOGIN PASSWORD '${password}'`);
+			await nsPriv.pool.query(`GRANT USAGE ON SCHEMA ${s} TO ${r}`);
+			// What the tx path needs (INSERT ... RETURNING), and nothing on schema_meta.
+			await nsPriv.pool.query(
+				`GRANT SELECT, INSERT, UPDATE ON ${t(nsPriv, "runs")}, ${t(nsPriv, "idempotency_keys")} TO ${r}`
+			);
+			await markTransport(nsPriv, transport);
+		});
+
+		afterAll(async () => {
+			const r = escapeIdentifier(role);
+			await nsPriv.pool.query(`DROP OWNED BY ${r}`).catch(() => undefined);
+			await nsPriv.pool.query(`DROP ROLE IF EXISTS ${r}`).catch(() => undefined);
+		});
+
+		it("no SELECT on schema_meta: the tx trigger succeeds and the transaction stays usable", async () => {
+			const url = new URL(nsPriv.databaseUrl);
+			url.username = role;
+			url.password = password;
+			const pool = new Pool({ connectionString: url.toString(), max: 1 });
+			pool.on("error", () => {});
+			pools.push(pool);
+			const client = await pool.connect();
+			try {
+				await client.query("BEGIN");
+				// The role really cannot read the marker (checked in a savepoint, not to abort the tx).
+				await client.query("SAVEPOINT probe");
+				await expect(
+					client.query(`SELECT value FROM ${t(nsPriv, "schema_meta")}`)
+				).rejects.toMatchObject({ code: "42501" });
+				await client.query("ROLLBACK TO SAVEPOINT probe");
+
+				const engine = engineFor(transport, nsPriv, pool);
+				const { id } = await fast(engine.trigger(task, undefined, { tx: client }));
+				await expect(client.query("SELECT 1 AS one")).resolves.toMatchObject({
+					rows: [{ one: 1 }],
+				});
+				const commit = await client.query("COMMIT");
+				expect(commit.command).toBe("COMMIT");
+				expect(await runExists(nsPriv, id)).toBe(true);
+			} finally {
+				client.release();
+			}
+		});
+	}
+);

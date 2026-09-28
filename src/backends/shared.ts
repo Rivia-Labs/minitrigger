@@ -188,9 +188,18 @@ export function createSchemaTransportGuard(
 	 * injected pool would otherwise wait for `connectionTimeoutMillis` (forever without one). Two
 	 * statements that cannot fail on a missing table (a failed statement would abort the caller's
 	 * transaction): `to_regclass` first, the key only when the table exists. No `SET`.
+	 * Review 6 fix round 1: the first statement also checks the caller's role may read the table
+	 * (`has_table_privilege` only runs once `to_regclass` found it, so it cannot raise on a missing
+	 * table): a least-privilege role without SELECT on `schema_meta` would get 42501 on the read,
+	 * which aborts the caller's transaction. No privilege = an absent marker (write allowed,
+	 * re-read after the same 30 s).
 	 */
 	async function readViaTx(tx: SqlQueryable): Promise<void> {
-		const exists = await tx.query("SELECT to_regclass($1::text) IS NOT NULL AS present", [table]);
+		const exists = await tx.query(
+			`SELECT CASE WHEN to_regclass($1::text) IS NULL THEN false
+			 ELSE has_table_privilege($1::text, 'SELECT') END AS present`,
+			[table]
+		);
 		const present = (exists.rows[0] as { present?: unknown } | undefined)?.present;
 		if (present !== true && present !== "t") {
 			record(null);
