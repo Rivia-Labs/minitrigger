@@ -1880,9 +1880,10 @@ mode.
 
 Postgres is this mode's only dependency, so its reachability plays the role of Redis's `PING` in
 BullMQ mode: with the database unreachable, `start()` rejects with a `MinitriggerError` ("cannot
-reach Postgres", the driver error as `cause`) after a few `pool.connectionTimeoutMs` at most,
-instead of hanging; nothing is left running, and `start()` can be called again once the database
-is back. `stop()` resolves within its usual bounds with the database gone, whether `start()`
+reach Postgres", the driver error as `cause`) instead of hanging — within a few
+`pool.connectionTimeoutMs` with a pool the engine creates, or with an injected pool that sets
+`connectionTimeoutMillis` (without it, nothing bounds the connection attempt); nothing is left
+running, and `start()` can be called again once the database is back. `stop()` resolves within its usual bounds with the database gone, whether `start()`
 failed or the engine was running (a run it could not hand back stays `running` until another
 engine's stall recovery).
 
