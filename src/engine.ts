@@ -866,9 +866,9 @@ export function createEngineCore(
 	 * `tokens.complete`, keep their best-effort enqueue; a stopping engine never starts a load).
 	 */
 	async function loadBackendForWrite(): Promise<void> {
-		// The mode guard first: a mismatch is refused before the (BullMQ) backend opens anything.
-		await backend.beforeWrite?.();
+		// Load first: a missing peer fails before any Postgres query (the guard below reads one).
 		if (backend.load && !lifecycle.isShuttingDown()) await backend.load();
+		await backend.beforeWrite?.();
 	}
 	/**
 	 * Ends every open `runs.subscribe` iteration: quietly on `stop()`, or with the given error
