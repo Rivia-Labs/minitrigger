@@ -27,6 +27,7 @@ import { createSqlTxRunStore } from "../store/sql/index.js";
 import type { Json } from "../store/types.js";
 import { createStreams } from "../streams.js";
 import {
+	assertPostgresReachable,
 	assertSchemaTransport,
 	dedicatedClientConfig,
 	warnPoolSizing,
@@ -188,6 +189,14 @@ export function createBullmqBackend(ctx: BackendContext): BackendRuntime {
 		// `checkEnvironment` itself calls `logger.warn` per warning; nothing else to do with the
 		// returned report here.
 		await assertRedisReachable(connections.shared());
+		step.assertNotAbandoned();
+		// Same step as the Postgres backend: an unreachable database is a bounded
+		// `MinitriggerError` (driver error as `cause`), never the raw `pg` error.
+		await assertPostgresReachable(
+			pool,
+			dedicatedClientConfig(resolved, pool).connectionTimeoutMillis ??
+				resolved.poolConnectionTimeoutMs
+		);
 		step.assertNotAbandoned();
 		await checkEnvironment({
 			pool,

@@ -4,9 +4,9 @@
  * a dynamic `import()`) must be able to use them without pulling Redis in.
  */
 
-import type { ClientConfig, Pool } from "pg";
+import type { ClientConfig, Pool, PoolClient } from "pg";
 import { DEFAULTS, derivePoolMax, type ResolvedConfig } from "../config.js";
-import { ConfigError } from "../errors.js";
+import { ConfigError, MinitriggerError } from "../errors.js";
 import type { ResolvedQueue } from "../registry.js";
 import type { SqlStore } from "../store/sql/index.js";
 import type { BackendContext } from "./types.js";
@@ -28,6 +28,68 @@ export async function withTimeout(promise: Promise<unknown>, ms: number): Promis
 	} finally {
 		clearTimeout(timer);
 	}
+}
+
+/**
+ * First Postgres step of `start()` in both transports (decision 28(h), review 4 item 2): an
+ * unreachable database is transient infrastructure, a `MinitriggerError` with the driver error as
+ * `cause` -- never the raw `pg` error nor `ConfigError` -- and `start()` can be called again.
+ *
+ * Bounded by its own timer (`timeoutMs`: the same bound as the dedicated clients,
+ * {@link dedicatedClientConfig}), whatever the pool: an injected `pg.Pool` without
+ * `connectionTimeoutMillis` would otherwise wait for a host that accepts TCP but never answers
+ * until the OS TCP timeout. A connect that completes after the bound leaves no state: its client
+ * is destroyed (`release(true)`), never returned to the pool, and a query still in flight when
+ * the bound fires gets its client destroyed too.
+ */
+export async function assertPostgresReachable(pool: Pool, timeoutMs: number): Promise<void> {
+	let timedOut = false;
+	let client: PoolClient | undefined;
+	let released = false;
+	const discard = (c: PoolClient, error?: Error) => {
+		if (released) return;
+		released = true;
+		c.release(error ?? true);
+	};
+	const probe = (async () => {
+		const acquired = await pool.connect();
+		if (timedOut) {
+			discard(acquired);
+			return;
+		}
+		client = acquired;
+		try {
+			await acquired.query("SELECT 1");
+		} catch (error) {
+			discard(acquired, error instanceof Error ? error : new Error(String(error)));
+			throw error;
+		}
+		if (timedOut) discard(acquired);
+		else if (!released) {
+			released = true;
+			acquired.release();
+		}
+	})();
+	let reached: boolean;
+	try {
+		reached = await withTimeout(probe, timeoutMs);
+	} catch (error) {
+		const reason = error instanceof Error ? error.message : String(error);
+		throw new MinitriggerError(
+			`cannot reach Postgres (${reason}); check config.postgres (host, port, credentials) ` +
+				"and that Postgres accepts connections, then call start() again",
+			{ cause: error }
+		);
+	}
+	if (reached) return;
+	timedOut = true;
+	probe.catch(() => {});
+	if (client !== undefined) discard(client);
+	throw new MinitriggerError(
+		`cannot reach Postgres within ${timeoutMs} ms (config.pool.connectionTimeoutMs, or the ` +
+			"injected pool's connectionTimeoutMillis); check config.postgres and that Postgres " +
+			"answers, then call start() again"
+	);
 }
 
 /**
