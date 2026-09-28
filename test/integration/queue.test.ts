@@ -123,7 +123,7 @@ describe("createTransport", () => {
 
 		await t.enqueueRun({ queue: a, runId: randomUUID(), seq: 1 });
 		await t.enqueueRun({ queue: b, runId: randomUUID(), seq: 1 });
-		await t.enqueueSystem("reconcile", { tick: 1 });
+		await t.enqueueSystem("retention", { tick: 1 });
 
 		await waitFor(() => receivedA.length > 0, { timeoutMs: 3_000 });
 		await waitFor(() => receivedSystem.length > 0, { timeoutMs: 3_000 });

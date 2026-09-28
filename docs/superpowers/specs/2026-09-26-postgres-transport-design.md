@@ -22,8 +22,9 @@ Entra:
 - `transport: "bullmq" | "postgres"` na config (padrão `"bullmq"`).
 - Fila = linhas de `runs`; claim com `FOR UPDATE SKIP LOCKED`; wake por `LISTEN/NOTIFY`; poll
   adaptativo como rede de segurança.
-- Tabela `system_jobs` (migration 009) para `waitpoint-expire`, `retention`, `schedule-tick` e
-  `reconcile`, com o dispatcher atual (`src/executor/system.ts`) intocado.
+- Tabela `system_jobs` (migration 009) para `waitpoint-expire`, `retention` e `schedule-tick`,
+  com o dispatcher atual (`src/executor/system.ts`) intocado. (O reconciler não é um job: o líder
+  o roda inline no próprio timer.)
 - Ticks de cron calculados na aplicação com `cron-parser` (única dependência direta nova).
 - Pub/sub (status, cancel) por `NOTIFY`, payload só com identificador, sempre relido do banco.
 - `globalConcurrency` em SQL, exato (claim serializado por fila com advisory lock quando há
@@ -355,7 +356,6 @@ memória. Toda escrita do worker sobre a linha é condicionada a `job_id = $1 AN
   solto), calculada com o `cron`/`timezone` gravados na linha. Reentrega do mesmo tick (crash
   entre criar a run e regravar a linha) cai na chave e vira no-op.
 - `retention-<janela>`: o líder faz `INSERT ... ON CONFLICT DO NOTHING`.
-- `reconcile`: mantido para paridade do dispatcher.
 
 ### 3.6 Schedules
 

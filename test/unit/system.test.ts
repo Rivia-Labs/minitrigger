@@ -196,3 +196,18 @@ describe("createSystemDispatcher: schedule-tick", () => {
 		await expect(dispatch("schedule-tick", { scheduleId: "daily" }, job)).rejects.toThrow();
 	});
 });
+
+describe("createSystemDispatcher: unknown jobs", () => {
+	it("has no `reconcile` job: the name is logged as unknown and dropped like any other", async () => {
+		// The reconciler runs inline on the leader's timer; no released version (v0.1.0-v0.3.0)
+		// ever enqueued a `reconcile` job, so the dispatcher keeps no special case for it.
+		const { deps, logger } = baseDeps();
+		const dispatch = createSystemDispatcher(deps);
+
+		await expect(dispatch("reconcile", {}, fakeJob())).resolves.toBeUndefined();
+
+		expect(logger.calls).toEqual([
+			{ level: "warn", fields: { job: "reconcile" }, message: "unknown system job ignored" },
+		]);
+	});
+});

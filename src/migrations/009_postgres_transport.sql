@@ -6,7 +6,7 @@
 -- not run this file outside of that runner.
 --
 -- `system_jobs` replaces the BullMQ `${prefix}-system` queue in the Postgres transport
--- (waitpoint-expire | retention | schedule-tick | reconcile). A claimed job gets
+-- (waitpoint-expire | retention | schedule-tick). A claimed job gets
 -- `locked_until = now() + lockMs` and a fresh `locked_by` token; every later write on the row is
 -- fenced by `job_id AND locked_by` (src/store/sql/system-jobs.ts).
 --

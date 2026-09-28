@@ -23,7 +23,7 @@ export class SystemJobDelayed extends Error {
 }
 
 /** Names of the jobs on the internal `${prefix}-system` queue (decision 8). */
-export type SystemJobName = "waitpoint-expire" | "reconcile" | "retention" | "schedule-tick";
+export type SystemJobName = "waitpoint-expire" | "retention" | "schedule-tick";
 
 export interface SystemDeps {
 	/**
@@ -57,8 +57,9 @@ export interface SystemDeps {
 
 /**
  * Dispatcher for the `-system` worker: `waitpoint-expire` (Phase 5), `retention` (Phase 6) and
- * `schedule-tick` (Phase 8, `src/schedules.ts#processScheduleTick`). `reconcile` is not a job (the
- * leader runs the reconciler inline on its own timer, see `engine.ts`): acknowledged as a no-op.
+ * `schedule-tick` (Phase 8, `src/schedules.ts#processScheduleTick`). The reconciler is not a job:
+ * the leader runs it inline on its own timer (see `engine.ts`), and no released version ever
+ * enqueued one, so any other name is logged as unknown and dropped.
  * Handlers never throw for expected conditions (BullMQ jobs use `attempts: 1`).
  *
  * `retention` is enqueued only by the leader, once per `retention.intervalMs` window (deterministic
@@ -81,9 +82,6 @@ export function createSystemDispatcher(deps: SystemDeps): ProcessSystemFn {
 				return logFailure(logger, "retention", {}, () => retention(deps));
 			case "schedule-tick":
 				return scheduleTick(deps, data, job);
-			case "reconcile":
-				logger.debug({ job: name, data }, "system job has no handler yet; ignored");
-				return;
 			default:
 				logger.warn({ job: name }, "unknown system job ignored");
 		}

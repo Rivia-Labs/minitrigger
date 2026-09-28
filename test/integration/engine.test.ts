@@ -534,7 +534,7 @@ describeTransports("engine", transport => {
 
 			if (transport === "bullmq") {
 				const system = rawQueue(`${ns.prefix}-system`);
-				await system.add("reconcile", {}, { jobId: `probe-${shortId()}`, removeOnComplete: true });
+				await system.add("retention", {}, { jobId: `probe-${shortId()}`, removeOnComplete: true });
 				await waitFor(async () => {
 					const counts = await system.getJobCounts("waiting", "active", "completed", "failed");
 					return Object.values(counts).every(n => n === 0);
