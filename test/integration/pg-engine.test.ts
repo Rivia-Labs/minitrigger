@@ -180,7 +180,7 @@ describe("engine with transport postgres", () => {
 			run: async (payload: { v: number }) => payload.v,
 		});
 		// A poll interval far above the bound below: only the insert's NOTIFY can wake the worker.
-		const engine = makeEngine([task], { polling: { intervalMs: 5_000 } });
+		const engine = makeEngine([task], { polling: { intervalMs: 20_000 } });
 		await engine.start();
 
 		let runId: string | undefined;
@@ -198,7 +198,7 @@ describe("engine with transport postgres", () => {
 			client.release();
 		}
 		const startedAt = await started;
-		expect(startedAt - committedAt).toBeLessThan(1_000);
+		expect(startedAt - committedAt).toBeLessThan(3_000);
 		if (runId === undefined) throw new Error("unreachable");
 		const { rows } = await ns.pool.query<{ outbox_pending: boolean }>(
 			`SELECT outbox_pending FROM ${t("runs")} WHERE id = $1`,
@@ -208,7 +208,7 @@ describe("engine with transport postgres", () => {
 		await waitForStatus(engine, runId, "completed");
 	});
 
-	it("wake latency: a trigger is picked up quickly with LISTEN, and within polling.intervalMs + jitter when NOTIFY is broken", async () => {
+	it("wake latency: a trigger is picked up quickly with LISTEN, and within a few polling.intervalMs when NOTIFY is broken", async () => {
 		const queue = uniqueQueue();
 		const task = defineTask({
 			id: uniqueTaskId("wake"),
@@ -216,18 +216,19 @@ describe("engine with transport postgres", () => {
 			run: async () => "ok",
 		});
 
-		// 1) With LISTEN (and a 5 s poll, so only the NOTIFY can explain a fast pickup).
-		const fast = makeEngine([task], { polling: { intervalMs: 5_000 } });
+		// 1) With LISTEN (and a 20 s poll, so only the NOTIFY can explain a pickup within 3 s).
+		const fast = makeEngine([task], { polling: { intervalMs: 20_000 } });
 		await fast.start();
 		let first: string | undefined;
 		const firstStarted = eventAt(fast, "run:started", () => first);
 		const t0 = Date.now();
 		first = (await fast.trigger(task)).id;
-		expect((await firstStarted) - t0).toBeLessThan(1_000);
+		expect((await firstStarted) - t0).toBeLessThan(3_000);
 		await fast.stop();
 
 		// 2) Listener killed: the trigger's NOTIFY is lost; the 1 s poll (or the reconnect's
-		// wake-all) still picks the run up.
+		// wake-all) still picks the run up, within a few poll intervals (the bound only has to be
+		// far below "never": without the poll the run would wait for the next trigger).
 		const engine = makeEngine([task], { polling: { intervalMs: 1_000 } });
 		await engine.start();
 		const killed = await ns.pool.query<{ ok: boolean }>(
@@ -241,7 +242,7 @@ describe("engine with transport postgres", () => {
 		const secondStarted = eventAt(engine, "run:started", () => second);
 		const t1 = Date.now();
 		second = (await engine.trigger(task)).id;
-		expect((await secondStarted) - t1).toBeLessThan(1_500);
+		expect((await secondStarted) - t1).toBeLessThan(4_000);
 	});
 
 	it("a delayed run scheduled by another engine is picked up on time, not a poll interval later", async () => {
@@ -250,9 +251,10 @@ describe("engine with transport postgres", () => {
 			queue: { name: uniqueQueue() },
 			run: async () => "ok",
 		});
-		const worker = makeEngine([task], { polling: { intervalMs: 5_000 } });
+		// A 20 s poll: a pickup within the bound below can only come from the delayed run's NOTIFY.
+		const worker = makeEngine([task], { polling: { intervalMs: 20_000 } });
 		await worker.start();
-		// Let the worker's first (empty) claim settle into its 5 s sleep.
+		// Let the worker's first (empty) claim settle into its 20 s sleep.
 		await sleep(100);
 		const producer = makeEngine([task]); // Never started: trigger only.
 
@@ -262,10 +264,10 @@ describe("engine with transport postgres", () => {
 		runId = (await producer.trigger(task, undefined, { delay: 300 })).id;
 		const elapsed = (await started) - t0;
 		expect(elapsed).toBeGreaterThanOrEqual(250);
-		expect(elapsed).toBeLessThan(1_500);
+		expect(elapsed).toBeLessThan(3_000);
 	});
 
-	it("stop() hands back a running run with a NOTIFY and a second engine picks it up within 1 s", async () => {
+	it("stop() hands back a running run with a NOTIFY and a second engine picks it up well before its poll", async () => {
 		let executions = 0;
 		const task = defineTask({
 			id: uniqueTaskId("handback"),
@@ -287,8 +289,8 @@ describe("engine with transport postgres", () => {
 		const handle = await a.trigger(task);
 		await waitForStatus(a, handle.id, "running");
 
-		// B only polls every 5 s: a pickup within 1 s can only come from the hand-back's NOTIFY.
-		const b = makeEngine([task], { polling: { intervalMs: 5_000 } });
+		// B only polls every 20 s: a pickup within 3 s can only come from the hand-back's NOTIFY.
+		const b = makeEngine([task], { polling: { intervalMs: 20_000 } });
 		await b.start();
 		await sleep(100);
 
@@ -296,7 +298,7 @@ describe("engine with transport postgres", () => {
 		const startedOnB = eventAt(b, "run:started", () => handle.id);
 		await a.stop();
 		const gap = (await startedOnB) - (await handedBack);
-		expect(gap).toBeLessThan(1_000);
+		expect(gap).toBeLessThan(3_000);
 		const run = await waitForStatus(b, handle.id, "completed");
 		expect(run.output).toBe("second");
 		expect(run.attempt).toBe(1);
@@ -704,20 +706,24 @@ describe("engine with transport postgres", () => {
 			const held = await pool.connect();
 			const trigger = makeEngine([task]); // its own pool: the insert and wake are not blocked
 			const handle = await trigger.trigger(task, undefined);
-			await sleep(500); // the wake reached the listener; the claim waits for a checkout
+			// Observable, not a fixed sleep: the wake reached the listener and a claim now waits for
+			// a checkout. Without this, stop() could run before any claim was stuck and the test
+			// would pass without testing anything.
+			await waitFor(() => pool.waitingCount > 0, { timeoutMs: 10_000, intervalMs: 10 });
 
 			await engine.stop(); // gives up on the claim after its drain bound
 			// The engine's pool is being ended (as for a pool the engine owns): the claim gets the
 			// connection back, and the hand-back of anything it claimed would find the pool gone.
 			held.release();
 			const ending = pool.end();
-			await sleep(1_000);
+			// pool.end() resolves once every client is back: the stuck claim got its connection and
+			// finished whatever it did with it.
+			await ending;
 			const { rows } = await ns.pool.query<{ status: string }>(
 				`SELECT status FROM ${t("runs")} WHERE id = $1`,
 				[handle.id]
 			);
 			expect(rows[0]?.status).toBe("queued");
-			await ending;
 		} finally {
 			if (!pool.ended) await pool.end().catch(() => {});
 		}

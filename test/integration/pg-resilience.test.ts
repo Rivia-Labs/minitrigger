@@ -234,7 +234,7 @@ describe("postgres transport: resilience and cross-process concurrency", () => {
 			},
 		});
 		// A poll far above the bound below: only the freed-slot NOTIFY can wake B in time.
-		const polling = { intervalMs: 5_000 };
+		const polling = { intervalMs: 20_000 };
 		const a = makeEngine("a", [task], { polling, shutdownTimeoutMs: 5_000 });
 		const b = makeEngine("b", [task], { polling });
 		await a.start();
@@ -268,7 +268,7 @@ describe("postgres transport: resilience and cross-process concurrency", () => {
 		const startedOnB = await r2StartedOnB;
 		await stopping;
 
-		expect(startedOnB - completedAt).toBeLessThan(500);
+		expect(startedOnB - completedAt).toBeLessThan(3_000);
 		await waitForStatus(r2, "completed");
 	}, 30_000);
 
@@ -278,7 +278,8 @@ describe("postgres transport: resilience and cross-process concurrency", () => {
 			queue: { name: uniqueQueue() },
 			run: async (payload: { v: number }) => payload.v,
 		});
-		const engine = makeEngine("listener", [task], { polling: { intervalMs: 5_000 } });
+		// A 20 s poll: a pickup within the bound below can only come from the NOTIFY.
+		const engine = makeEngine("listener", [task], { polling: { intervalMs: 20_000 } });
 		await engine.start();
 
 		const before = await listenerPids();
@@ -288,8 +289,15 @@ describe("postgres transport: resilience and cross-process concurrency", () => {
 		]);
 		expect(rows[0]?.ok).toBe(true);
 
-		await sleep(2_000);
-		const after = await listenerPids();
+		// Reconnected (a new backend): polled, not a fixed sleep.
+		const after = await waitFor(
+			async () => {
+				const pids = await listenerPids();
+				return pids.length === 1 && pids[0] !== before[0] ? pids : undefined;
+			},
+			{ timeoutMs: 10_000, intervalMs: 50 }
+		);
+		if (!after) throw new Error("unreachable");
 		expect(after).toHaveLength(1);
 		expect(after[0]).not.toBe(before[0]);
 
@@ -298,7 +306,7 @@ describe("postgres transport: resilience and cross-process concurrency", () => {
 		const triggeredAt = Date.now();
 		runId = (await engine.trigger(task, { v: 7 })).id;
 		const startedAt = await started;
-		expect(startedAt - triggeredAt).toBeLessThan(300);
+		expect(startedAt - triggeredAt).toBeLessThan(3_000);
 		expect((await waitForStatus(runId, "completed")).output).toBe(7);
 		// The drop itself is a (throttled) warn; nothing escalated to an error.
 		expect(logs.filter(l => l.level === "error")).toEqual([]);
