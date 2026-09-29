@@ -5,3 +5,4 @@ coverage
 .env
 dist-test
 .superpowers/
+graphify-out/
