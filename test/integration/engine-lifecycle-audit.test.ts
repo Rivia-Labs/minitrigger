@@ -383,7 +383,7 @@ describeTransports("engine-lifecycle-audit", transport => {
 	});
 
 	describe.skipIf(transport !== "bullmq")("start() with Redis unreachable", () => {
-		it("rejects with an actionable ConfigError instead of hanging, and stop() still resolves", async () => {
+		it("rejects with an actionable MinitriggerError (not ConfigError) instead of hanging, and stop() still resolves", async () => {
 			// A port nothing listens on: with `maxRetriesPerRequest: null` every command would wait in
 			// ioredis' offline queue forever without the PING guard.
 			const server = net.createServer();
@@ -394,7 +394,10 @@ describeTransports("engine-lifecycle-audit", transport => {
 			const engine = makeEngine([simpleTask("down")], { redis: `redis://127.0.0.1:${port}` });
 			await engine.migrate();
 			const started = Date.now();
-			await expect(engine.start()).rejects.toThrow(/cannot reach Redis/);
+			const error = await engine.start().catch((e: unknown) => e);
+			expect(error).toBeInstanceOf(MinitriggerError);
+			expect(error).not.toBeInstanceOf(ConfigError);
+			expect((error as Error).message).toMatch(/cannot reach Redis/);
 			expect(Date.now() - started).toBeLessThan(10_000);
 			await engine.stop();
 		}, 30_000);

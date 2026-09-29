@@ -122,7 +122,10 @@ Ver [04. Tasks e steps](04-tasks-e-steps.md#ctx-segundo-argumento-de-run),
 | `ExecutionLostError` | O processo em execução perdeu a posse da run (cancelada, expirada, roubada pelo reconciliador, devolvida no shutdown) — lançado em chamadas de step em voo; nenhuma escrita adicional acontece. |
 | `TaskNotRegisteredError` | `engine.trigger`/um schedule referenciou uma task não registrada neste engine, ou um worker adquiriu uma run de uma task que não conhece (retentável, ex. durante um deploy gradual). `step.trigger*` aceita uma task filha não registrada — outro processo que a registre a executa. |
 
-Todos os erros acima estendem `MinitriggerError`. Ver [12. Troubleshooting](12-troubleshooting.md).
+Todos os erros acima estendem `MinitriggerError`. Um `MinitriggerError` puro (nenhuma das
+subclasses) vindo do `start()` indica infraestrutura transitória: Redis ou Postgres inacessível, ou
+o subscriber de pub/sub que nunca ficou pronto. Ao contrário de um `ConfigError`, vale tentar
+`start()` de novo quando a dependência voltar. Ver [12. Troubleshooting](12-troubleshooting.md).
 
 ## Config options
 

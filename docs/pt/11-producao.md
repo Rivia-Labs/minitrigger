@@ -19,7 +19,8 @@ isoladamente também, por exemplo num health check ou antes de `migrate()` num s
 ## `start()` limita as esperas por Redis
 
 Primeiro um `PING` na conexão compartilhada (timeout de 5 s) antes de qualquer outra coisa — um
-Redis totalmente inacessível falha rápido em vez de travar. Depois disso, abre (ou reaproveita) a
+Redis totalmente inacessível falha rápido em vez de travar, com `MinitriggerError` ("cannot reach
+Redis", com o erro do `PING` em `cause` quando houver; antes da 0.4.1 era `ConfigError`). Depois disso, abre (ou reaproveita) a
 conexão dedicada de pub/sub e espera o `SUBSCRIBE` dela ficar pronto — também limitado a 5 s. A
 conexão compartilhada funcionar não é suficiente: uma conexão NOVA (o subscriber) ainda pode nunca
 ficar pronta (Redis recusando conexões novas por `maxclients`, ou caindo bem depois daquele
