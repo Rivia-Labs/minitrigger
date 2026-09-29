@@ -1,8 +1,8 @@
 /**
  * Child process for `test/integration/worker-close-spin.test.ts`.
  *
- * BullMQ's `Worker.retryIfFailed` retries connection errors forever and skips its delay once the
- * worker is closing, so a job whose `moveToCompleted`/`moveToFailed` fails with a connection error
+ * BullMQ's `Worker.retryIfFailed` (before 6.3.10) retries connection errors forever and skips its
+ * delay once the worker is closing, so a job whose `moveToCompleted`/`moveToFailed` fails with a connection error
  * during/after `Worker.close()` spins in a zero-delay loop that starves the event loop (timers never
  * fire). That would hang a vitest worker for good (its own timeouts are timers too), so the
  * scenarios run here, in a plain `node` process the test can kill, and report over stdout:

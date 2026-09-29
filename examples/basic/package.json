@@ -10,7 +10,7 @@
   },
   "dependencies": {
     "@rivia-labs/minitrigger": "file:../..",
-    "bullmq": "^6.3.0",
+    "bullmq": "^6.3.10",
     "ioredis": "^5.11.1",
     "pg": "^8.13.0"
   },

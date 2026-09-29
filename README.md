@@ -124,7 +124,7 @@ update it whenever you bump to a newer commit/tag. Full reproduction and reasoni
 
 | Package | Range |
 |---|---|
-| `bullmq` | `^6.3.0` (optional peer — only needed with `transport: "bullmq"`, the default; see below) |
+| `bullmq` | `^6.3.10` (optional peer — only needed with `transport: "bullmq"`, the default; see below) |
 | `ioredis` | `^5.11.1` (not 6.x — BullMQ 6.3.x is tested against 5.11.1; the 6.x RESP3 default isn't handled by its adapter; optional peer, same condition as `bullmq`) |
 | `pg` | `^8.13.0` |
 | `@types/pg` | `^8.11.0` (optional peer — only needed because the public types reference `pg.Pool`) |
@@ -1982,6 +1982,19 @@ it("keeps the thumbnails that worked and notifies followers", async () => {
 - **What this does *not* test:** replay, memoization across attempts, suspension, non-determinism
   detection, real waitpoint timeouts, or anything else that depends on durability. Use
   `createTestEngine` for that; use `runTask` for the logic a task computes given its inputs.
+
+## Upgrading to 0.4.1
+
+- **`bullmq` peer range is now `^6.3.10`** (was `^6.3.0`). BullMQ 6.3.10 fixes a bug in
+  `Worker.retryIfFailed` (taskforcesh/bullmq#4831): a job finishing while or after its worker
+  closed, with Redis down or its connections already closed, retried its Redis call in a
+  zero-delay loop, pinning the CPU and keeping the process from exiting. minitrigger used to patch
+  that private method; the patch is gone, so upgrade `bullmq` along with this release
+  (`pnpm add bullmq@^6.3.10`). Nothing else changes, and `transport: "postgres"` doesn't use BullMQ.
+- **`start()` with Redis unreachable rejects with a `MinitriggerError`** (was `ConfigError`), like
+  "cannot reach Postgres": it is a transient outage, worth retrying. The `PING` error is its
+  `cause` when there is one. Code that catches `ConfigError` around `start()` to detect a dead
+  Redis should catch `MinitriggerError` (or match the "cannot reach Redis" message) instead.
 
 ## Upgrading to 0.4.0
 
