@@ -150,7 +150,7 @@
   },
   "peerDependencies": {
     "@types/pg": "^8.11.0",
-    "bullmq": "^6.3.0",
+    "bullmq": "^6.3.10",
     "ioredis": "^5.11.1",
     "pg": "^8.13.0"
   },
@@ -160,7 +160,7 @@
     "@prisma/client": "7.10.0",
     "@types/node": "^24.13.6",
     "@types/pg": "8.23.1",
-    "bullmq": "^6.3.8",
+    "bullmq": "^6.3.10",
     "drizzle-orm": "^0.45.3",
     "ioredis": "^5.11.1",
     "knex": "^3.3.0",

@@ -50,7 +50,7 @@ const PKG_NAME = "@rivia-labs/minitrigger";
 const ADAPTERS = { typeorm: "typeormTx", knex: "knexTx", drizzle: "drizzleTx", prisma: "prismaTx" };
 
 const PEER_VERSIONS = {
-	bullmq: "^6.3.0",
+	bullmq: "^6.3.10",
 	ioredis: "^5.11.1",
 	pg: "^8.13.0",
 };

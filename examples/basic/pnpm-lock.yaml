@@ -10,10 +10,10 @@ importers:
     dependencies:
       '@rivia-labs/minitrigger':
         specifier: file:../..
-        version: file:../..(@types/pg@8.23.1)(bullmq@6.3.8(ioredis@5.11.1)(pg@8.23.0))(ioredis@5.11.1)(pg@8.23.0)
+        version: file:../..(@types/pg@8.23.1)(bullmq@6.3.10(ioredis@5.11.1)(pg@8.23.0))(ioredis@5.11.1)(pg@8.23.0)
       bullmq:
-        specifier: ^6.3.0
-        version: 6.3.8(ioredis@5.11.1)(pg@8.23.0)
+        specifier: ^6.3.10
+        version: 6.3.10(ioredis@5.11.1)(pg@8.23.0)
       ioredis:
         specifier: ^5.11.1
         version: 5.11.1
@@ -71,11 +71,15 @@ packages:
     engines: {node: '>=22'}
     peerDependencies:
       '@types/pg': ^8.11.0
-      bullmq: ^6.3.0
+      bullmq: ^6.3.10
       ioredis: ^5.11.1
       pg: ^8.13.0
     peerDependenciesMeta:
       '@types/pg':
+        optional: true
+      bullmq:
+        optional: true
+      ioredis:
         optional: true
 
   '@types/node@24.13.6':
@@ -84,8 +88,8 @@ packages:
   '@types/pg@8.23.1':
     resolution: {integrity: sha512-fKVHpikPdg4GKks3JuLEhvwSyvwzF23hnabPy6DD8ljVbC7+6J5dQzdv4arV6jqq57djnMgs1HKBxX4P8aBI3A==}
 
-  bullmq@6.3.8:
-    resolution: {integrity: sha512-09zcOQ1uycyCK2C9iY2Pm+/JPa/gIXiZqGBUiIlO1v3VshwBgarmAgWRTWDL/IAvI8NFE1zqrkdKFgRfXHHM5A==}
+  bullmq@6.3.10:
+    resolution: {integrity: sha512-Z+dKyOJ3PazCGMGBCIKW8BeCh6THfwLsQu6W4YG0CWPvVhI4DdEKi1IN7o/Xjln9a9KL8NSTgpY+uPFc2s2hog==}
     engines: {node: '>=14.17.0'}
     peerDependencies:
       bullmq-otel: '>=2.0.0'
@@ -259,13 +263,14 @@ snapshots:
   '@msgpackr-extract/msgpackr-extract-win32-x64@3.0.4':
     optional: true
 
-  '@rivia-labs/minitrigger@file:../..(@types/pg@8.23.1)(bullmq@6.3.8(ioredis@5.11.1)(pg@8.23.0))(ioredis@5.11.1)(pg@8.23.0)':
+  '@rivia-labs/minitrigger@file:../..(@types/pg@8.23.1)(bullmq@6.3.10(ioredis@5.11.1)(pg@8.23.0))(ioredis@5.11.1)(pg@8.23.0)':
     dependencies:
-      bullmq: 6.3.8(ioredis@5.11.1)(pg@8.23.0)
-      ioredis: 5.11.1
+      cron-parser: 5.10.1
       pg: 8.23.0
     optionalDependencies:
       '@types/pg': 8.23.1
+      bullmq: 6.3.10(ioredis@5.11.1)(pg@8.23.0)
+      ioredis: 5.11.1
 
   '@types/node@24.13.6':
     dependencies:
@@ -277,7 +282,7 @@ snapshots:
       pg-protocol: 1.16.0
       pg-types: 2.2.0
 
-  bullmq@6.3.8(ioredis@5.11.1)(pg@8.23.0):
+  bullmq@6.3.10(ioredis@5.11.1)(pg@8.23.0):
     dependencies:
       cron-parser: 5.10.1
       msgpackr: 2.1.0

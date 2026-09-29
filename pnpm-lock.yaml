@@ -129,8 +129,8 @@ importers:
         specifier: 8.23.1
         version: 8.23.1
       bullmq:
-        specifier: ^6.3.8
-        version: 6.3.8(ioredis@5.11.1)(pg@8.23.0)
+        specifier: ^6.3.10
+        version: 6.3.10(ioredis@5.11.1)(pg@8.23.0)
       drizzle-orm:
         specifier: ^0.45.3
         version: 0.45.3(@electric-sql/pglite@0.4.3)(@prisma/client@7.10.0(prisma@7.10.0(@types/react@19.3.0)(react-dom@19.3.0(react@19.3.0))(react@19.3.0)(typescript@6.0.3))(typescript@6.0.3))(@types/pg@8.23.1)(knex@3.3.0(mysql2@3.15.3)(pg@8.23.0))(mysql2@3.15.3)(pg@8.23.0)(postgres@3.4.9)(prisma@7.10.0(@types/react@19.3.0)(react-dom@19.3.0(react@19.3.0))(react@19.3.0)(typescript@6.0.3))
@@ -970,8 +970,8 @@ packages:
   better-result@2.10.0:
     resolution: {integrity: sha512-oQhh0y1qo2/ZKdAAEvHZAqKKiHOFU5k/bW96fE2ScgQOVkJRiHwB+nOS1SgFsYqRlxMDWvefXi9Q3px7QvgNDw==}
 
-  bullmq@6.3.8:
-    resolution: {integrity: sha512-09zcOQ1uycyCK2C9iY2Pm+/JPa/gIXiZqGBUiIlO1v3VshwBgarmAgWRTWDL/IAvI8NFE1zqrkdKFgRfXHHM5A==}
+  bullmq@6.3.10:
+    resolution: {integrity: sha512-Z+dKyOJ3PazCGMGBCIKW8BeCh6THfwLsQu6W4YG0CWPvVhI4DdEKi1IN7o/Xjln9a9KL8NSTgpY+uPFc2s2hog==}
     engines: {node: '>=14.17.0'}
     peerDependencies:
       bullmq-otel: '>=2.0.0'
@@ -2778,7 +2778,7 @@ snapshots:
 
   better-result@2.10.0: {}
 
-  bullmq@6.3.8(ioredis@5.11.1)(pg@8.23.0):
+  bullmq@6.3.10(ioredis@5.11.1)(pg@8.23.0):
     dependencies:
       cron-parser: 5.10.1
       msgpackr: 2.1.0

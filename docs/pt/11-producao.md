@@ -177,6 +177,19 @@ da linha (a fonte para `engine.runs.subscribe`).
 reenfileira toda run a partir de Postgres dentro de aproximadamente
 `reconciler.graceMs + reconciler.intervalMs`.
 
+## Upgrade 0.4.0 para 0.4.1
+
+- **A faixa do peer `bullmq` agora é `^6.3.10`** (era `^6.3.0`). O BullMQ 6.3.10 corrige um bug no
+  `Worker.retryIfFailed` (taskforcesh/bullmq#4831): um job terminando durante ou depois do
+  fechamento do worker, com o Redis fora ou as conexões já fechadas, repetia a chamada ao Redis
+  num laço sem espera, com a CPU em 100% e o processo sem conseguir sair. O minitrigger remendava
+  esse método privado; o remendo saiu, então atualize o `bullmq` junto com esta versão
+  (`pnpm add bullmq@^6.3.10`). Nada mais muda, e `transport: "postgres"` não usa o BullMQ.
+- **`start()` com o Redis inacessível rejeita com `MinitriggerError`** (era `ConfigError`), como o
+  "cannot reach Postgres": é uma queda transitória, que vale tentar de novo. O erro do `PING` vai
+  em `cause` quando houver. Código que captura `ConfigError` em volta do `start()` para detectar
+  um Redis fora deve capturar `MinitriggerError` (ou casar a mensagem "cannot reach Redis").
+
 ## Upgrade 0.3.0 para 0.4.0
 
 - **Novo: `transport: "postgres"`** (decisão 28) — opt-in; `transport: "bullmq"` continua o padrão e

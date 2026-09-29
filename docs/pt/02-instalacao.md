@@ -15,7 +15,7 @@ publicado.)
 
 | Pacote | Faixa de versão | Por quê |
 |---|---|---|
-| `bullmq` | `^6.3.0` | Peer opcional — só necessário com `transport: "bullmq"` (o padrão); ver [14. Modo Postgres](14-modo-postgres.md). |
+| `bullmq` | `^6.3.10` | Peer opcional — só necessário com `transport: "bullmq"` (o padrão); ver [14. Modo Postgres](14-modo-postgres.md). |
 | `ioredis` | `^5.11.1` | Peer opcional, mesma condição do `bullmq`. **Não use 6.x**: o BullMQ 6.3.x é testado contra o `ioredis` 5.11.1, e o adapter dele não trata o RESP3, que é o padrão do `ioredis` 6.x. |
 | `pg` | `^8.13.0` | — |
 | `@types/pg` | `^8.11.0` | Peer opcional — só necessário porque os tipos públicos referenciam `pg.Pool`. |

@@ -50,7 +50,7 @@ them. Respect these ranges (do not let the package manager silently resolve outs
 
 | Package | Range | Why |
 |---|---|---|
-| `bullmq` | `^6.3.0` | Only for `transport: "bullmq"` (the default). |
+| `bullmq` | `^6.3.10` | Only for `transport: "bullmq"` (the default). |
 | `ioredis` | `^5.11.1` | Only for `transport: "bullmq"`. **Not 6.x** — BullMQ 6.3.x is tested against ioredis 5.11.1; ioredis 6's RESP3 default isn't handled by BullMQ's adapter. |
 | `pg` | `^8.13.0` | Always required, both transports. |
 | `@types/pg` | `^8.11.0` | Optional peer — only needed because minitrigger's public types reference `pg.Pool`. |

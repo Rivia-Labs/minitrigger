@@ -248,74 +248,6 @@ async function bounded(promise: Promise<unknown>, ms: number): Promise<void> {
 	clearTimeout(timer);
 }
 
-/**
- * Thrown (internally) by {@link guardRetryLoopOnClose} instead of re-running a BullMQ Redis call
- * once the worker is closing. Its message must NOT look like a connection error (no
- * `"Connection is closed."`, no `ECONNREFUSED`): BullMQ's `isNotConnectionError` must classify it
- * as a regular error so `retryIfFailed` stops retrying.
- */
-class WorkerClosedError extends Error {
-	override name = "WorkerClosedError";
-	constructor() {
-		super("minitrigger: BullMQ worker is closing; not retrying its Redis call");
-	}
-}
-
-/** The non-public BullMQ `Worker` members {@link guardRetryLoopOnClose} relies on. */
-interface WorkerRetryInternals {
-	retryIfFailed?: (fn: () => Promise<unknown>, opts: unknown) => Promise<unknown>;
-	closing?: unknown;
-	closed?: unknown;
-}
-
-/**
- * Works around a BullMQ bug (verified against bullmq 6.3.8 and 6.3.9, `dist/cjs/classes/worker.js`
- * `Worker.retryIfFailed`): it retries a failing call forever when the error is a *connection*
- * error (`maxRetries` defaults to `Infinity`), and it skips its `delayInMs` pause once the worker
- * is `closing`/`closed`. So a job whose processor returns while or after the worker closes and
- * whose `moveToCompleted`/`moveToFailed` then fails with a connection error ("Connection is
- * closed." because `closeWorkers` already closed the connections, or `ECONNREFUSED` with Redis
- * down) re-runs that call in a zero-delay loop: the process spins at 100% CPU, timers never fire
- * and it never exits. Same for the fetch loop (`_getNextJob`) and a scheduler's next-iteration
- * upsert.
- *
- * `retryIfFailed` is private API, hence the guarded cast: if a future BullMQ drops or renames
- * it, this silently does nothing. The wrapper lets the FIRST attempt of every call through
- * untouched and leaves retries alone while the worker is running (BullMQ keeps its delay then,
- * so a Redis blip mid-run still recovers). Only a retry once our transport or the worker is
- * closing throws {@link WorkerClosedError}, a non-connection error, which makes `retryIfFailed`
- * rethrow (or return, with `onlyEmitError`) and ends the loop.
- *
- * Abandoning that BullMQ call is safe (decision 1: BullMQ is only transport): the job stays
- * active in Redis until its lock expires and the stalled check of a live worker moves it back to
- * `wait`, where its redelivery is a no-op `acquire` (stale `enqueue_seq`, decision 5). The run
- * itself was already settled in Postgres (completed/failed/suspended) or handed back (`queued`,
- * decision 20), and a lost re-enqueue is recovered by the reconciler.
- */
-function guardRetryLoopOnClose(worker: Worker, transportClosing: () => boolean): void {
-	const internals = worker as unknown as WorkerRetryInternals;
-	const original = internals.retryIfFailed;
-	if (typeof original !== "function") return;
-	internals.retryIfFailed = function guardedRetryIfFailed(
-		this: unknown,
-		fn: () => Promise<unknown>,
-		opts: unknown
-	): Promise<unknown> {
-		let attempts = 0;
-		const guarded = (): Promise<unknown> => {
-			attempts++;
-			if (
-				attempts > 1 &&
-				(transportClosing() || Boolean(internals.closing) || Boolean(internals.closed))
-			) {
-				return Promise.reject(new WorkerClosedError());
-			}
-			return fn();
-		};
-		return original.call(this, guarded, opts);
-	};
-}
-
 /** Minimum interval between two `warn`s for errors of the same `Queue`/`Worker`. */
 const ERROR_LOG_INTERVAL_MS = 10_000;
 
@@ -585,7 +517,6 @@ export function createTransport(options: CreateTransportOptions): Transport {
 				}
 			);
 			logErrors(worker, "worker", qc.name);
-			guardRetryLoopOnClose(worker, () => closing);
 			workers.push(worker);
 
 			// Global concurrency lives in Redis and outlives this process: a queue that no longer
@@ -621,7 +552,6 @@ export function createTransport(options: CreateTransportOptions): Transport {
 			}
 		);
 		logErrors(systemWorker, "worker", sysQueueName);
-		guardRetryLoopOnClose(systemWorker, () => closing);
 		workers.push(systemWorker);
 	}
 

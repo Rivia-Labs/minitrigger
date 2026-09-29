@@ -110,7 +110,7 @@ os registros da quinta revisão externa e desta rodada de pontos deixados ficam 
 ### Parte 2 (2026-09-25, depois do v0.1.0)
 
 - Issue #1 (progresso por run, decisão 23, migration 004) e issue #2 (debounce e concurrency key, decisões 24/25, migration 005) implementadas. Debounce sempre trailing (`mode` removido por decisão do dono); runs limitadas por concurrency key esperam com backoff de 1 s até 30 s, sem ordem FIFO.
-- Bug do BullMQ 6.3.8/6.3.9 contornado (laço sem espera ao fechar o worker); reportado em taskforcesh/bullmq#4831.
+- Bug do BullMQ 6.3.8/6.3.9 contornado (laço sem espera ao fechar o worker); reportado em taskforcesh/bullmq#4831. Corrigido no BullMQ 6.3.10 (2026-09-29): peer passou a `^6.3.10` e o contorno foi removido.
 - Segunda revisão externa aplicada (debounce preso no deadline, corrida do líder no close, tipo do `progress.set`, limite da espera por steps em voo e itens baixos); notas no `CLAUDE.md`.
 - ✅ **v0.2.0 publicado** (GitHub Release com o `.tgz`). Migrations 001–005 congeladas: mudanças de schema só em migrations novas.
   **Antes de rodar `engine.migrate()` num deploy existente com uma tabela `runs` grande, ler

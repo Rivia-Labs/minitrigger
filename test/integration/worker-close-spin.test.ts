@@ -3,7 +3,9 @@
  * delay once the worker is closing (bullmq 6.3.8/6.3.9). A job whose processor returns while or
  * after `closeWorkers` closes the workers/connections, and whose move to completed/failed then
  * fails with a connection error, used to spin in a zero-delay loop: 100% CPU, timers starved, the
- * process never exits. Fixed by `guardRetryLoopOnClose` in `src/queue/transport.ts`.
+ * process never exits. Fixed upstream in bullmq 6.3.10 (taskforcesh/bullmq#4831), now the peer
+ * floor; minitrigger's own workaround (`guardRetryLoopOnClose`) was removed then. Kept as a
+ * regression test: against 6.3.9 without the workaround, two of these scenarios hang.
  *
  * The spin starves the event loop, so it would also starve vitest's own timeouts and hang the
  * suite. Each scenario therefore runs in a child process (`test/helpers/child/
