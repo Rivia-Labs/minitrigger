@@ -64,8 +64,8 @@ you, release assets need GitHub authentication; download the tarball with the Gi
 with access to the repo) and add it from disk:
 
 ```bash
-gh release download v0.4.0 -R igorabreu29/minitrigger -p "*.tgz"
-pnpm add ./rivia-labs-minitrigger-0.4.0.tgz bullmq ioredis pg
+gh release download v0.4.1 -R igorabreu29/minitrigger -p "*.tgz"
+pnpm add ./rivia-labs-minitrigger-0.4.1.tgz bullmq ioredis pg
 pnpm add -D @types/pg   # optional, only needed if you use TypeScript
 ```
 
@@ -98,7 +98,7 @@ Needs git access to the repo (SSH key or a credential helper for HTTPS) — only
 repository is private; a public repo needs no auth for this.
 
 ```bash
-pnpm add github:igorabreu29/minitrigger#v0.4.0 bullmq ioredis pg
+pnpm add github:igorabreu29/minitrigger#v0.4.1 bullmq ioredis pg
 ```
 
 `dist/` is `.gitignore`d and only produced by minitrigger's own `prepare` script, and pnpm 10+
