@@ -1,4 +1,4 @@
-import { ConfigError } from "../errors.js";
+import { ConfigError, MinitriggerError } from "../errors.js";
 
 /** The minimal shape `checkRedisEvictionPolicy` needs -- easy to satisfy with a fake in tests. */
 export interface RedisConfigClient {
@@ -76,7 +76,9 @@ export const REDIS_PING_TIMEOUT_MS = 5_000;
  * `maxRetriesPerRequest: null`, commands to an unreachable Redis wait in ioredis' offline queue
  * forever, so without this `start()` would hang instead of reporting the problem. Unlike the
  * decision-22 checks, an unreachable Redis is not "a check that can't run": nothing works without
- * it, so it throws.
+ * it, so it throws. It throws a `MinitriggerError`, not a `ConfigError`: an outage is transient
+ * infrastructure, and callers that treat `ConfigError` as fatal must still retry `start()` (same as
+ * "cannot reach Postgres" in `backends/shared.ts`). The rejection from `PING`, if any, is the `cause`.
  */
 export async function assertRedisReachable(
 	client: { ping(): Promise<unknown> },
@@ -91,16 +93,21 @@ export async function assertRedisReachable(
 		const result = await Promise.race([
 			client.ping().then(
 				() => "ok" as const,
-				(error: unknown) => (error instanceof Error ? error : new Error(String(error)))
+				(error: unknown) => ({ error })
 			),
 			timeout,
 		]);
 		if (result === "ok") return;
 		const reason =
-			result === "timeout" ? `no reply to PING within ${timeoutMs} ms` : result.message;
-		throw new ConfigError(
+			result === "timeout"
+				? `no reply to PING within ${timeoutMs} ms`
+				: result.error instanceof Error
+					? result.error.message
+					: String(result.error);
+		throw new MinitriggerError(
 			`cannot reach Redis (${reason}); check config.redis (host, port, credentials, TLS) and ` +
-				"that Redis is running, then call start() again"
+				"that Redis is running, then call start() again",
+			result === "timeout" ? undefined : { cause: result.error }
 		);
 	} finally {
 		clearTimeout(timer);

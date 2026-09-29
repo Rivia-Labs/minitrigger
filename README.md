@@ -1145,7 +1145,10 @@ A task/step function that returns `void` (or `undefined`) has that output stored
 | `ExecutionLostError` | The executing process lost ownership of the run (canceled, timed out, stolen by the reconciler, handed back on shutdown) — thrown into in-flight step calls; no further writes happen. |
 | `TaskNotRegisteredError` | `engine.trigger` / a schedule referenced a task that isn't registered on this engine, or a worker acquired a run of a task it doesn't know (retryable, e.g. during a rolling deploy). `step.trigger*` accepts an unregistered child task: another process that registers it runs the child. |
 
-All of the above extend `MinitriggerError`.
+All of the above extend `MinitriggerError`. A plain `MinitriggerError` (none of the subclasses)
+from `start()` means transient infrastructure: Redis or Postgres unreachable, or the pub/sub
+subscriber never became ready. Unlike a `ConfigError`, it is worth retrying `start()` once the
+dependency is back.
 
 ## API reference
 
@@ -2316,7 +2319,9 @@ concern is specific to 005's two new indexes.
   same function (`checkEnvironment`, exported from the package root along with its types) can be
   called standalone too, e.g. in a health check or before `migrate()` in a deploy script.
 - **`start()` bounds its Redis waits.** It first `PING`s the shared connection (5 s timeout) before
-  doing anything else, so a fully unreachable Redis fails fast instead of hanging. It then opens
+  doing anything else, so a fully unreachable Redis fails fast instead of hanging, with a
+  `MinitriggerError` ("cannot reach Redis", the `PING` error as `cause` when there is one; before
+  0.4.1 this was a `ConfigError`). It then opens
   (or reuses) the dedicated pub/sub subscriber connection and waits for its `SUBSCRIBE` to become
   ready — also bounded to 5 s. The shared connection working is not enough: a *new* connection
   (the subscriber) can still fail to become ready (Redis refusing new connections over
