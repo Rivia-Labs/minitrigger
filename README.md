@@ -59,9 +59,9 @@ pnpm add -D @types/pg   # optional, only needed if you use TypeScript
 ### Alternative: `.tgz` from GitHub Releases
 
 Useful for pinning to an exact artifact without going through the registry (e.g. vendoring it, or
-installing from a private mirror). If the repository (`Rivia-Labs/minitrigger`) is private for
-you, release assets need GitHub authentication; download the tarball with the GitHub CLI (logged in
-with access to the repo) and add it from disk:
+installing from a private mirror). The repository (`Rivia-Labs/minitrigger`) is public, so the
+release assets need no authentication; download the tarball (the GitHub CLI is shown here, but a
+plain browser or `curl` download from the release page works too) and add it from disk:
 
 ```bash
 gh release download v0.4.1 -R Rivia-Labs/minitrigger -p "*.tgz"
