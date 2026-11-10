@@ -71,9 +71,9 @@ pnpm add -D @types/pg
 ### Alternativa: `.tgz` de GitHub Releases
 
 Útil para fixar um artefato exato sem passar pelo registry (por exemplo, vendorizar, ou instalar de
-um mirror privado). Se o repositório for privado para você, os assets de release exigem
-autenticação do GitHub — baixe o tarball com o GitHub CLI (logado com acesso ao repo) e adicione a
-partir do disco:
+um mirror privado). O repositório (`Rivia-Labs/minitrigger`) é público, então os assets de release
+não exigem autenticação — baixe o tarball (aqui com o GitHub CLI, mas o navegador ou o `curl` na
+página da release também servem) e adicione a partir do disco:
 
 ```bash
 gh release download v0.4.1 -R Rivia-Labs/minitrigger -p "*.tgz"
