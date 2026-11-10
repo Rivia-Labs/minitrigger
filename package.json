@@ -1,6 +1,6 @@
 {
   "name": "@rivia-labs/minitrigger",
-  "version": "0.4.1",
+  "version": "0.4.2",
   "description": "Durable tasks and workflows for Node.js on BullMQ + Redis + Postgres, as an installable library.",
   "keywords": [
     "durable-execution",
