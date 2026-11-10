@@ -76,7 +76,7 @@ autenticação do GitHub — baixe o tarball com o GitHub CLI (logado com acesso
 partir do disco:
 
 ```bash
-gh release download v0.4.1 -R igorabreu29/minitrigger -p "*.tgz"
+gh release download v0.4.1 -R Rivia-Labs/minitrigger -p "*.tgz"
 pnpm add ./rivia-labs-minitrigger-0.4.1.tgz bullmq ioredis pg
 pnpm add -D @types/pg
 ```
@@ -105,7 +105,7 @@ enquanto/se o repositório for privado; um repositório público não precisa de
 isso.
 
 ```bash
-pnpm add github:igorabreu29/minitrigger#v0.4.1 bullmq ioredis pg
+pnpm add github:Rivia-Labs/minitrigger#v0.4.1 bullmq ioredis pg
 ```
 
 O `dist/` está no `.gitignore` e só é produzido pelo script `prepare` do próprio minitrigger, e o
@@ -116,8 +116,8 @@ add github:...` falha com `ERR_PNPM_GIT_DEP_PREPARE_NOT_ALLOWED` até você habi
 ```yaml
 # pnpm-workspace.yaml do seu projeto
 allowBuilds:
-  "@rivia-labs/minitrigger@github.com/igorabreu29/minitrigger#<commit-resolvido>": true # v0.3.0+
-  # minitrigger@github.com/igorabreu29/minitrigger#<commit-resolvido>: true # só para tags até v0.2.0
+  "@rivia-labs/minitrigger@github.com/Rivia-Labs/minitrigger#<commit-resolvido>": true # v0.3.0+
+  # minitrigger@github.com/Rivia-Labs/minitrigger#<commit-resolvido>: true # só para tags até v0.2.0
   msgpackr-extract: true # acelerador nativo opcional do ioredis; bloqueado pelo mesmo mecanismo
 ```
 

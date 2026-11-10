@@ -19,7 +19,7 @@ Each skill is self-contained.
 This repository is also a plugin marketplace:
 
 ```bash
-/plugin marketplace add igorabreu29/minitrigger
+/plugin marketplace add Rivia-Labs/minitrigger
 /plugin install minitrigger@minitrigger
 ```
 

@@ -59,12 +59,12 @@ pnpm add -D @types/pg   # optional, only needed if you use TypeScript
 ### Alternative: `.tgz` from GitHub Releases
 
 Useful for pinning to an exact artifact without going through the registry (e.g. vendoring it, or
-installing from a private mirror). If the repository (`igorabreu29/minitrigger`) is private for
+installing from a private mirror). If the repository (`Rivia-Labs/minitrigger`) is private for
 you, release assets need GitHub authentication; download the tarball with the GitHub CLI (logged in
 with access to the repo) and add it from disk:
 
 ```bash
-gh release download v0.4.1 -R igorabreu29/minitrigger -p "*.tgz"
+gh release download v0.4.1 -R Rivia-Labs/minitrigger -p "*.tgz"
 pnpm add ./rivia-labs-minitrigger-0.4.1.tgz bullmq ioredis pg
 pnpm add -D @types/pg   # optional, only needed if you use TypeScript
 ```
@@ -98,7 +98,7 @@ Needs git access to the repo (SSH key or a credential helper for HTTPS) — only
 repository is private; a public repo needs no auth for this.
 
 ```bash
-pnpm add github:igorabreu29/minitrigger#v0.4.1 bullmq ioredis pg
+pnpm add github:Rivia-Labs/minitrigger#v0.4.1 bullmq ioredis pg
 ```
 
 `dist/` is `.gitignore`d and only produced by minitrigger's own `prepare` script, and pnpm 10+
@@ -108,8 +108,8 @@ blocks a git dependency's lifecycle scripts by default — so a plain `pnpm add 
 ```yaml
 # your project's pnpm-workspace.yaml
 allowBuilds:
-  "@rivia-labs/minitrigger@github.com/igorabreu29/minitrigger#<resolved-commit>": true # v0.3.0+
-  # minitrigger@github.com/igorabreu29/minitrigger#<resolved-commit>: true # only for tags up to v0.2.0
+  "@rivia-labs/minitrigger@github.com/Rivia-Labs/minitrigger#<resolved-commit>": true # v0.3.0+
+  # minitrigger@github.com/Rivia-Labs/minitrigger#<resolved-commit>: true # only for tags up to v0.2.0
   msgpackr-extract: true # ioredis's optional native accelerator; blocked by the same pnpm mechanism
 ```
 

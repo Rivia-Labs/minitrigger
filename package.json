@@ -19,11 +19,11 @@
   ],
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/igorabreu29/minitrigger.git"
+    "url": "git+https://github.com/Rivia-Labs/minitrigger.git"
   },
-  "homepage": "https://github.com/igorabreu29/minitrigger#readme",
+  "homepage": "https://github.com/Rivia-Labs/minitrigger#readme",
   "bugs": {
-    "url": "https://github.com/igorabreu29/minitrigger/issues"
+    "url": "https://github.com/Rivia-Labs/minitrigger/issues"
   },
   "license": "MIT",
   "type": "module",
